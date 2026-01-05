@@ -1,0 +1,6 @@
+.env
+*.sif
+postgres_*.sif
+__pycache__/
+*.pyc
+.nfs*

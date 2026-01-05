@@ -1,0 +1,22 @@
+Bootstrap: docker
+From: python:3.11-slim
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        && rm -rf /var/lib/apt/lists/*
+
+    pip install --no-cache-dir \
+        kalshi_python_sync \
+        psycopg[binary] \
+        python-dateutil \
+        python-dotenv \
+        websockets \
+        cryptography
+
+%environment
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    cd /app
+    exec python -m src.main
