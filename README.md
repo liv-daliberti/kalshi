@@ -211,6 +211,73 @@ Set `SERVICE_HEALTH_PORT` in a service env to expose `/healthz`.
 
 ---
 
+## Deploying on Azure App Service + Azure Database for PostgreSQL
+
+This repo was built for HPC + Apptainer, but it can run on Azure App Service
+with a managed Postgres instance. The simplest Azure setup is **one App Service
+per process** (REST, WS, worker, portal, etc.), each pointing at the same
+Postgres database. This avoids having to supervise multiple long-running
+processes in a single web app.
+
+### 1) Create the Postgres server
+
+Use **Azure Database for PostgreSQL – Flexible Server** (recommended) and
+ensure the App Service can reach it:
+
+- If you're using VNet integration, allow the VNet/subnet in Postgres.
+- Otherwise, allow the App Service outbound IPs in the Postgres firewall.
+
+Grab the connection details (host, db name, username, password).
+
+### 2) Configure App Service environment variables
+
+In **App Service → Configuration**, set the required env vars:
+
+- `DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require`
+- `KALSHI_API_KEY_ID=...`
+- `KALSHI_PRIVATE_KEY_PEM_PATH=/home/site/wwwroot/secrets/kalshi.pem`
+- `KALSHI_WS_ENABLE=1` (if running WS ingestion)
+
+Optional (recommended) defaults:
+
+- `STRIKE_PERIODS=hour,day`
+- `DISCOVERY_EVENT_STATUSES=open`
+- `BACKFILL_EVENT_STATUSES=open,closed,settled`
+- `SERVICE_HEALTH_PORT=$PORT` (App Service expects a listener on `$PORT`)
+
+**Private key file:** store the PEM in Azure Key Vault or an Azure Files mount
+and mount it into the App Service at the path you set in
+`KALSHI_PRIVATE_KEY_PEM_PATH`.
+
+### 3) Choose which process this App Service runs
+
+Set the App Service **Startup Command** (Linux) to one of:
+
+- REST discovery/backfill: `python -m src.services.rest_service`
+- WebSocket ingestion: `python -m src.services.ws_service`
+- Worker (optional): `python -m src.services.worker_service`
+- Portal UI: `python -m src.services.portal_service`
+
+For the REST/WS/worker services, keep **Health Check** pointing at `/healthz`
+and ensure `SERVICE_HEALTH_PORT` is set to `$PORT`.
+
+### 4) Initialize the database schema
+
+Run the migrator once (via App Service SSH console or a temporary job):
+
+```bash
+python -m src.services.migrator
+```
+
+After schema creation, keep `DB_INIT_SCHEMA=0`.
+
+### 5) Verify logs and health
+
+Use **Log Stream** in App Service to confirm each service is running and
+check `/healthz` for the process you deployed.
+
+---
+
 ## Work queue (RabbitMQ + Postgres)
 
 For multi-worker scaling, you can enable a DB-backed work queue with RabbitMQ
