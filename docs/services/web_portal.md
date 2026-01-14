@@ -17,7 +17,7 @@
 
 ## Runtime
 - Entrypoint: `python -m src.services.portal_service`
-- Optional: `gunicorn -w 2 -b 0.0.0.0:8123 src.web_portal:app`
+- Optional: `gunicorn --factory -w 2 -b 0.0.0.0:8123 src.web_portal.app:create_app`
 
 ## Health thresholds
 - `WEB_PORTAL_DISCOVERY_STALE_SECONDS`

@@ -13,6 +13,7 @@ from typing import Any
 
 import psycopg  # pylint: disable=import-error
 from flask import (  # pylint: disable=import-error
+    Flask,
     jsonify,
     redirect,
     render_template,
@@ -21,7 +22,6 @@ from flask import (  # pylint: disable=import-error
 )
 
 from src.core.time_utils import infer_strike_period_from_times
-from .app import create_app
 from .auth_utils import is_authenticated, require_password
 from .category_utils import build_category_filters
 from .config import (
@@ -69,7 +69,6 @@ from .snapshot_utils import (
     fetch_live_snapshot,
 )
 
-app = create_app()
 logger = logging.getLogger(__name__)
 
 _MARKET_METADATA_EXPORTS = (
@@ -95,10 +94,8 @@ _PORTAL_DATA_CACHE_LOCK = threading.Lock()
 _PORTAL_SNAPSHOT_REFRESH_THREAD_STARTED = False
 _PORTAL_SNAPSHOT_REFRESH_THREAD_LOCK = threading.Lock()
 _PORTAL_SNAPSHOT_QUERY_WARNED = False
-_maybe_prewarm_db_pool()
 
 
-@app.context_processor
 def inject_queue_stream_enabled() -> dict[str, bool]:
     """Expose queue stream flags to templates."""
     return {
@@ -107,7 +104,13 @@ def inject_queue_stream_enabled() -> dict[str, bool]:
     }
 
 
-
+def register_routes(app: Flask) -> None:
+    """Register portal routes and request hooks on the Flask app."""
+    _maybe_prewarm_db_pool()
+    app.context_processor(inject_queue_stream_enabled)
+    app.before_request(ensure_snapshot_polling)
+    app.before_request(enforce_login)
+    app.add_url_rule("/", "index", index, methods=["GET"])
 
 def _human_join(items: list[str]) -> str:
     """Join a list into a human-friendly phrase."""
@@ -414,14 +417,12 @@ def normalize_status(active_status: str | None, open_time, close_time) -> tuple[
     return "Inactive", "inactive"
 
 
-@app.before_request
 def ensure_snapshot_polling():
     """Kick off background snapshot polling when enabled."""
     _start_snapshot_polling()
     _start_portal_db_snapshot_refresh()
 
 
-@app.before_request
 def enforce_login():
     """Redirect unauthenticated users to the login page.
 
@@ -707,7 +708,6 @@ def _portal_context(
     }
 
 
-@app.get("/")
 def index():
     """Render the main portal view.
 
@@ -780,6 +780,8 @@ def main() -> None:
     host = os.getenv("WEB_PORTAL_HOST", "0.0.0.0")
     threads = _env_int("WEB_PORTAL_THREADS", 1, minimum=1)
     threaded = _env_bool("WEB_PORTAL_THREADED", threads > 1)
+    from .app import create_app
+    app = create_app()
     app.run(host=host, port=port, threaded=threaded)
 
 

@@ -394,7 +394,7 @@ Run with gunicorn (recommended for shared access):
 
 ```bash
 python -m pip install gunicorn
-gunicorn -w 2 -b 0.0.0.0:8123 src.web_portal:app
+gunicorn --factory -w 2 -b 0.0.0.0:8123 src.web_portal.app:create_app
 ```
 
 Gunicorn will automatically load `gunicorn.conf.py` from this directory, which
@@ -402,7 +402,7 @@ sets a longer timeout and uses thread workers to avoid sync worker timeouts.
 Override defaults with environment variables if needed, for example:
 
 ```bash
-WEB_PORTAL_TIMEOUT=180 WEB_PORTAL_THREADS=8 gunicorn -w 2 -b 0.0.0.0:8123 src.web_portal:app
+WEB_PORTAL_TIMEOUT=180 WEB_PORTAL_THREADS=8 gunicorn --factory -w 2 -b 0.0.0.0:8123 src.web_portal.app:create_app
 ```
 
 ---

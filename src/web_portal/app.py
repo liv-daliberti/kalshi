@@ -45,4 +45,6 @@ def create_app() -> Flask:
     app = Flask(__name__, template_folder=TEMPLATE_DIR)
     app.secret_key = os.getenv("WEB_PORTAL_SECRET_KEY", os.urandom(24))
     register_blueprints(app)
+    from . import register_routes
+    register_routes(app)
     return app
