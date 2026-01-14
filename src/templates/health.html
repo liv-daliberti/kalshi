@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Kalshi Portal Health</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Space+Grotesk:wght@400;500;600;700&display=swap");
+
+      :root {
+        --ink: #1c2a2d;
+        --ink-muted: #4f5f66;
+        --ink-soft: #74818a;
+        --accent: #e06b2f;
+        --accent-2: #d4a054;
+        --surface: #f9f2e6;
+        --surface-2: #fffdf7;
+        --border: #e6d6c1;
+        --shadow: rgba(18, 23, 32, 0.14);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Space Grotesk", "Trebuchet MS", sans-serif;
+        color: var(--ink);
+        background: radial-gradient(circle at 20% 10%, #fff3da 0%, #f7efe3 40%, #efe4d6 100%);
+        min-height: 100vh;
+      }
+
+      body::before,
+      body::after {
+        content: "";
+        position: fixed;
+        z-index: -1;
+        opacity: 0.9;
+        pointer-events: none;
+      }
+
+      body::before {
+        width: 520px;
+        height: 520px;
+        top: -220px;
+        right: -180px;
+        background: radial-gradient(circle at 35% 35%, rgba(224, 107, 47, 0.4), transparent 70%);
+      }
+
+      body::after {
+        width: 460px;
+        height: 460px;
+        bottom: -220px;
+        left: -140px;
+        background: radial-gradient(circle at 40% 40%, rgba(212, 160, 84, 0.35), transparent 68%);
+      }
+
+      .page {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 84px 24px 60px;
+      }
+
+      .top-nav {
+        position: fixed;
+        top: 20px;
+        left: 24px;
+        display: flex;
+        gap: 10px;
+        z-index: 20;
+      }
+
+      .nav-pill {
+        text-decoration: none;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--ink);
+        border: 1px solid var(--border);
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: white;
+        box-shadow: 0 8px 16px var(--shadow);
+      }
+
+      .nav-pill.portal-link {
+        background: var(--accent-2);
+        border-color: rgba(212, 160, 84, 0.45);
+        color: #442d14;
+      }
+
+      .nav-pill.opportunities-link {
+        background: var(--accent);
+        color: white;
+        border-color: rgba(224, 107, 47, 0.4);
+      }
+
+      .hero {
+        display: flex;
+        justify-content: space-between;
+        gap: 24px;
+        align-items: flex-end;
+        margin-bottom: 24px;
+        animation: floatIn 0.8s ease both;
+      }
+
+      .eyebrow {
+        text-transform: uppercase;
+        letter-spacing: 0.2em;
+        font-size: 12px;
+        color: var(--ink-soft);
+      }
+
+      h1 {
+        font-family: "Fraunces", "Georgia", serif;
+        font-size: 38px;
+        margin: 12px 0 8px;
+      }
+
+      .subtitle {
+        color: var(--ink-muted);
+        max-width: 520px;
+        line-height: 1.5;
+        margin: 0;
+      }
+
+      .meta-row {
+        font-size: 13px;
+        color: var(--ink-soft);
+        display: flex;
+        gap: 18px;
+        flex-wrap: wrap;
+      }
+
+      .status-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        gap: 18px;
+        animation: fadeUp 0.7s ease both;
+      }
+
+      .status-card {
+        background: linear-gradient(150deg, rgba(255, 255, 255, 0.92), rgba(249, 242, 230, 0.9));
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 18px 20px;
+        box-shadow: 0 16px 28px var(--shadow);
+      }
+
+      .card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 10px;
+      }
+
+      .status-card h2 {
+        font-family: "Fraunces", "Georgia", serif;
+        font-size: 20px;
+        margin: 0;
+      }
+
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        padding: 6px 12px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        border: 1px solid transparent;
+      }
+
+      .status-ok {
+        background: rgba(46, 125, 111, 0.16);
+        color: #175b52;
+        border-color: rgba(46, 125, 111, 0.4);
+      }
+
+      .status-warn {
+        background: rgba(224, 107, 47, 0.16);
+        color: #8a3f1b;
+        border-color: rgba(224, 107, 47, 0.4);
+      }
+
+      .status-error {
+        background: rgba(191, 48, 32, 0.16);
+        color: #7c1e13;
+        border-color: rgba(191, 48, 32, 0.4);
+      }
+
+      .status-summary {
+        margin: 0 0 12px;
+        color: var(--ink-muted);
+        font-size: 14px;
+        line-height: 1.5;
+      }
+
+      .status-details {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: grid;
+        gap: 8px;
+        color: var(--ink);
+        font-size: 13px;
+      }
+
+      .status-details li {
+        padding-left: 14px;
+        position: relative;
+      }
+
+      .status-details li::before {
+        content: "";
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--accent);
+        position: absolute;
+        left: 0;
+        top: 6px;
+      }
+
+      @keyframes floatIn {
+        from {
+          opacity: 0;
+          transform: translateY(12px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      @keyframes fadeUp {
+        from {
+          opacity: 0;
+          transform: translateY(16px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      @media (max-width: 720px) {
+        .top-nav {
+          top: 16px;
+          left: 16px;
+          flex-direction: column;
+          align-items: flex-start;
+        }
+
+        .hero {
+          flex-direction: column;
+          align-items: flex-start;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        * {
+          animation: none !important;
+          transition: none !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    {% if logged_in %}
+    <nav class="top-nav">
+      <a class="nav-pill logout" href="/logout">Logout</a>
+      <a class="nav-pill portal-link" href="/">Portal</a>
+      <a class="nav-pill opportunities-link" href="/opportunities">Opportunities</a>
+    </nav>
+    {% endif %}
+    <div class="page">
+      <header class="hero">
+        <div>
+          <div class="eyebrow">System Status</div>
+          <h1>Application Health</h1>
+          <p class="subtitle">
+            Live checks across the database, snapshot polling, and Kalshi connectivity.
+          </p>
+        </div>
+        <div class="meta-row">
+          <div>Updated {{ refreshed_at }}</div>
+          <div>Logged in {{ "Yes" if logged_in else "No" }}</div>
+        </div>
+      </header>
+
+      <section class="status-grid">
+        {% for card in status_cards %}
+        <article class="status-card">
+          <div class="card-header">
+            <h2>{{ card.title }}</h2>
+            <span class="status-pill status-{{ card.level }}">{{ card.label }}</span>
+          </div>
+          <p class="status-summary">{{ card.summary }}</p>
+          {% if card.details %}
+          <ul class="status-details">
+            {% for detail in card.details %}
+            <li>{{ detail }}</li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+        </article>
+        {% endfor %}
+      </section>
+    </div>
+    {% include "queue_stream.html" %}
+  </body>
+</html>

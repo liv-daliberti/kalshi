@@ -1,0 +1,22 @@
+[Unit]
+Description=Kalshi REST discovery/backfill
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/kalshi_ingestor
+EnvironmentFile=/etc/kalshi_ingestor/rest.env
+Environment=SERVICE_GUARDRAILS=1
+Environment=DB_INIT_SCHEMA=0
+Environment=LOG_DIR=/var/log/kalshi_ingestor
+Environment=LOG_STDOUT=1
+ExecStart=/opt/kalshi_ingestor/.venv/bin/python -m src.services.rest_service
+Restart=on-failure
+CPUQuota=50%
+MemoryMax=1G
+IOWeight=100
+TasksMax=256
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

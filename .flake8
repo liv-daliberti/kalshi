@@ -1,0 +1,13 @@
+[flake8]
+max-line-length = 100
+jobs = 1
+extend-ignore = E203,W503
+exclude =
+    .git,
+    .pylint,
+    __pycache__,
+    apptainer,
+    kalshi_ingestor.sif,
+    kalshi_pgdata,
+    log,
+    postgres_16.sif

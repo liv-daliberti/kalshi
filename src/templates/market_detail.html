@@ -1,0 +1,1182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Kalshi Market Detail</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Space+Grotesk:wght@400;500;600;700&display=swap");
+
+      :root {
+        --ink: #1c2a2d;
+        --ink-muted: #4f5f66;
+        --ink-soft: #74818a;
+        --accent: #e06b2f;
+        --surface: #f9f2e6;
+        --surface-2: #fffdf7;
+        --surface-3: #f0e4d4;
+        --border: #e6d6c1;
+        --shadow: rgba(18, 23, 32, 0.14);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Space Grotesk", "Trebuchet MS", sans-serif;
+        color: var(--ink);
+        background: radial-gradient(circle at 20% 10%, #fff3da 0%, #f7efe3 40%, #efe4d6 100%);
+        min-height: 100vh;
+      }
+
+      .page {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 36px 24px 60px;
+      }
+
+      .back-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--ink);
+        text-decoration: none;
+        border: 1px solid var(--border);
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: white;
+      }
+
+      .kalshi-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--ink);
+        text-decoration: none;
+        border: 1px solid var(--border);
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: white;
+        margin-left: 8px;
+      }
+
+      .hero {
+        margin-top: 18px;
+        display: flex;
+        justify-content: space-between;
+        gap: 24px;
+        align-items: flex-start;
+        flex-wrap: wrap;
+      }
+
+      .eyebrow {
+        text-transform: uppercase;
+        letter-spacing: 0.2em;
+        font-size: 12px;
+        color: var(--ink-soft);
+      }
+
+      h1 {
+        font-family: "Fraunces", "Georgia", serif;
+        font-size: 38px;
+        margin: 12px 0 8px;
+      }
+
+      .subtitle {
+        color: var(--ink-muted);
+        max-width: 600px;
+        line-height: 1.5;
+      }
+
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        padding: 6px 14px;
+        font-size: 12px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        border: 1px solid transparent;
+      }
+
+      .status-open {
+        background: rgba(46, 163, 132, 0.15);
+        color: #19684f;
+        border-color: rgba(46, 163, 132, 0.35);
+      }
+
+      .status-paused {
+        background: rgba(212, 160, 84, 0.18);
+        color: #8b5b12;
+        border-color: rgba(212, 160, 84, 0.4);
+      }
+
+      .status-scheduled {
+        background: rgba(46, 120, 163, 0.16);
+        color: #1a4b68;
+        border-color: rgba(46, 120, 163, 0.35);
+      }
+
+      .status-closed {
+        background: rgba(32, 122, 191, 0.18);
+        color: #0b4b7e;
+        border-color: rgba(32, 122, 191, 0.35);
+      }
+
+      .status-inactive,
+      .status-unknown {
+        background: rgba(116, 129, 138, 0.16);
+        color: #4f5f66;
+        border-color: rgba(116, 129, 138, 0.3);
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 18px;
+        margin-top: 28px;
+      }
+
+      .card {
+        background: var(--surface-2);
+        border-radius: 18px;
+        border: 1px solid var(--border);
+        padding: 18px 20px;
+        box-shadow: 0 16px 28px var(--shadow);
+      }
+
+      .card h2 {
+        font-family: "Fraunces", "Georgia", serif;
+        margin: 0 0 12px;
+        font-size: 20px;
+      }
+
+      .card-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      .snapshot-actions {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      .snapshot-button {
+        border: 1px solid var(--border);
+        background: white;
+        color: var(--ink);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        padding: 6px 12px;
+        border-radius: 999px;
+        cursor: pointer;
+      }
+
+      .snapshot-button.active {
+        background: var(--accent);
+        color: #fff;
+        border-color: rgba(224, 107, 47, 0.6);
+      }
+
+      .snapshot-button[disabled] {
+        opacity: 0.6;
+        cursor: wait;
+      }
+
+      .snapshot-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--ink-soft);
+      }
+
+      .snapshot-toggle input {
+        accent-color: var(--accent);
+      }
+
+      .snapshot-status {
+        font-size: 12px;
+        color: var(--ink-soft);
+      }
+
+      .snapshot-status.error {
+        color: #b24a2a;
+      }
+
+      dl {
+        margin: 0;
+        display: grid;
+        gap: 12px;
+      }
+
+      .row {
+        display: grid;
+        gap: 6px;
+      }
+
+      dt {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--ink-soft);
+      }
+
+      dd {
+        margin: 0;
+        font-size: 14px;
+        color: var(--ink);
+      }
+
+      .rules-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        gap: 18px;
+        margin-top: 24px;
+      }
+
+      .rules-summary {
+        margin-top: 24px;
+      }
+
+      .rules-text {
+        white-space: pre-wrap;
+        color: var(--ink-muted);
+        line-height: 1.6;
+        font-size: 14px;
+        margin-top: 12px;
+      }
+
+      .chart-card {
+        margin-top: 24px;
+      }
+
+      .chart-wrap {
+        width: 100%;
+        height: 320px;
+        position: relative;
+      }
+
+      canvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+
+      .chart-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 10px;
+        font-size: 12px;
+        color: var(--ink-soft);
+      }
+
+      .chart-meta span {
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: var(--surface-3);
+        border: 1px solid var(--border);
+      }
+
+      .candle-tooltip {
+        position: absolute;
+        min-width: 150px;
+        padding: 8px 10px;
+        background: rgba(18, 24, 27, 0.92);
+        color: #f3f6f8;
+        border-radius: 10px;
+        font-size: 12px;
+        line-height: 1.35;
+        box-shadow: 0 10px 24px rgba(8, 12, 14, 0.35);
+        pointer-events: none;
+        opacity: 0;
+        transform: translateY(-4px);
+        transition: opacity 120ms ease, transform 120ms ease;
+        z-index: 2;
+      }
+
+      .candle-tooltip.is-visible {
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      pre {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        padding: 14px;
+        border-radius: 14px;
+        white-space: pre-wrap;
+        font-size: 13px;
+        color: var(--ink-muted);
+        font-family: "Space Grotesk", "Courier New", monospace;
+      }
+
+      .data-block {
+        margin-top: 12px;
+      }
+
+      .block-title {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--ink-soft);
+        margin-bottom: 6px;
+      }
+
+      .na {
+        color: var(--ink-soft);
+        font-size: 13px;
+        padding: 10px 12px;
+        background: var(--surface-3);
+        border-radius: 12px;
+        border: 1px solid var(--border);
+      }
+
+      .predictions-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+
+      .predictions-table th {
+        text-align: left;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        font-size: 11px;
+        color: var(--ink-soft);
+        padding-bottom: 8px;
+      }
+
+      .predictions-table td {
+        padding: 10px 0;
+        border-top: 1px solid var(--border);
+        vertical-align: top;
+      }
+
+      .prediction-meta {
+        color: var(--ink-soft);
+        font-size: 12px;
+        margin-top: 4px;
+      }
+
+      .alert {
+        border: 1px solid rgba(224, 107, 47, 0.45);
+        background: rgba(255, 239, 226, 0.9);
+        padding: 16px 18px;
+        border-radius: 14px;
+        margin-top: 20px;
+        box-shadow: 0 10px 20px var(--shadow);
+      }
+
+      .closed-alert {
+        margin-top: 16px;
+        padding: 18px 20px;
+        border-radius: 16px;
+        background: #b71c1c;
+        color: #fff5f5;
+        border: 1px solid rgba(153, 10, 10, 0.7);
+        box-shadow: 0 12px 24px rgba(183, 28, 28, 0.25);
+      }
+
+      .closed-alert .label {
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+        font-size: 11px;
+        color: rgba(255, 237, 237, 0.85);
+      }
+
+      .closed-alert .outcome {
+        margin-top: 8px;
+        font-size: 20px;
+        font-weight: 600;
+      }
+
+      @media (max-width: 720px) {
+        h1 {
+          font-size: 30px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <a class="back-link" href="/">Back to markets</a>
+      {% if market and (market.market_url or market.event_url) %}
+      <a class="kalshi-link" href="{{ market.market_url or market.event_url }}" target="_blank" rel="noopener">View on Kalshi</a>
+      {% endif %}
+
+      {% if error %}
+      <div class="alert">{{ error }}</div>
+      {% endif %}
+
+      {% if market %}
+      <div class="hero">
+        <div>
+          <div class="eyebrow">Market Detail</div>
+          <h1>{{ market.market_title }}</h1>
+          {% if market.market_subtitle %}
+          <div class="subtitle">{{ market.market_subtitle }}</div>
+          {% endif %}
+        </div>
+        <div class="status-pill {{ market.status_class }}">{{ market.status_label }}</div>
+      </div>
+      {% if market.is_closed %}
+      <div class="closed-alert">
+        <div class="label">Outcome</div>
+        <div class="outcome">{{ market.outcome_label }}</div>
+      </div>
+      {% endif %}
+
+      <section class="grid">
+        <div class="card">
+          <h2>Event</h2>
+          <dl>
+            {% for label, value in market.event_fields %}
+            <div class="row">
+              <dt>{{ label }}</dt>
+              <dd>{{ value }}</dd>
+            </div>
+            {% endfor %}
+          </dl>
+        </div>
+        <div class="card">
+          <h2>Market</h2>
+          <dl>
+            {% for label, value in market.market_fields %}
+            <div class="row">
+              <dt>{{ label }}</dt>
+              <dd>{{ value }}</dd>
+            </div>
+            {% endfor %}
+          </dl>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <h2>Live Snapshot</h2>
+            <div class="snapshot-actions">
+              <button class="snapshot-button" id="snapshotButton" type="button">
+                Fetch snapshot
+              </button>
+              <button class="snapshot-button" id="backfillButton" type="button">
+                Backfill candles
+              </button>
+              <label class="snapshot-toggle" title="Force a full backfill and ignore cursors.">
+                <input type="checkbox" id="forceBackfillToggle" />
+                <span>Full backfill</span>
+              </label>
+              <button class="snapshot-button" id="autoBackfillButton" type="button" aria-pressed="false">
+                Auto-update candles
+              </button>
+              <div class="snapshot-status" id="snapshotStatus">Ready</div>
+              <div class="snapshot-status" id="backfillStatus">Backfill idle</div>
+            </div>
+          </div>
+          <dl>
+            {% for field in market.stats_fields %}
+            <div class="row">
+              <dt>{{ field.label }}</dt>
+              <dd data-field="{{ field.key }}">{{ field.value }}</dd>
+            </div>
+            {% endfor %}
+          </dl>
+        </div>
+        <div class="card">
+          {% if market.prediction_limit and market.prediction_limit <= 1 %}
+          <h2>Latest Agent Prediction</h2>
+          {% else %}
+          <h2>Agent Predictions</h2>
+          {% endif %}
+          {% if market.predictions and market.predictions | length > 0 %}
+          <table class="predictions-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Yes</th>
+                <th>Confidence</th>
+                <th>Agent</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for prediction in market.predictions %}
+              <tr>
+                <td>{{ prediction.ts }}</td>
+                <td>{{ prediction.yes_prob }}</td>
+                <td>{{ prediction.confidence }}</td>
+                <td>
+                  <div>{{ prediction.agent }}</div>
+                  {% if prediction.rationale %}
+                  <div class="prediction-meta">{{ prediction.rationale }}</div>
+                  {% endif %}
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+          {% else %}
+          <div class="na">No predictions available.</div>
+          {% endif %}
+        </div>
+      </section>
+
+      <section class="card rules-summary">
+        <h2>Rules Summary</h2>
+        <div class="rules-text"><strong>{{ market.market_title }}</strong></div>
+        <div class="rules-text">{{ market.rules_primary }}</div>
+        {% if market.rules_secondary and market.rules_secondary != "N/A" %}
+        <div class="rules-text">{{ market.rules_secondary }}</div>
+        {% endif %}
+      </section>
+
+      <section class="rules-grid">
+        <div class="card">
+          <h2>Rules (Primary)</h2>
+          <pre>{{ market.rules_primary }}</pre>
+        </div>
+        <div class="card">
+          <h2>Rules (Secondary)</h2>
+          <pre>{{ market.rules_secondary }}</pre>
+        </div>
+      </section>
+
+      <section class="card chart-card">
+        <h2>Candles Over Time</h2>
+        {% if market.candles and market.candles | length > 0 %}
+        <div class="chart-wrap">
+          <canvas id="candleChart"></canvas>
+          <div class="candle-tooltip" id="candleTooltip"></div>
+        </div>
+        <div class="chart-meta">
+          <span>Times: UTC (candle end)</span>
+          {% if market.candle_interval_minutes %}
+          <span>Interval: {{ market.candle_interval_minutes }}m</span>
+          {% endif %}
+          <span>Candles: {{ market.candles | length }}</span>
+        </div>
+        {% else %}
+        <div class="na">No candle data available.</div>
+        {% endif %}
+      </section>
+
+      <section class="card">
+        <h2>Additional Data</h2>
+        {% for label, value in market.extra_fields %}
+        <div class="data-block">
+          <div class="block-title">{{ label }}</div>
+          {% if value == "N/A" %}
+          <div class="na">N/A</div>
+          {% else %}
+          <pre>{{ value }}</pre>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </section>
+      {% else %}
+      <div class="alert">No market detail found.</div>
+      {% endif %}
+    </div>
+    {% if market and market.candles and market.candles | length > 0 %}
+    <script>
+      const rawCandleData = {{ market.candles_json | safe }};
+      const candleData = Array.isArray(rawCandleData) ? rawCandleData : [];
+      const canvas = document.getElementById("candleChart");
+      const ctx = canvas.getContext("2d");
+      const container = canvas.parentElement;
+      const dpr = window.devicePixelRatio || 1;
+      const candleIntervalMinutes = {{ market.candle_interval_minutes | tojson }};
+      const marketOpenTs = {{ market.market_open_ts | tojson }};
+      const marketCloseTs = {{ market.market_close_ts | tojson }};
+      const tooltip = document.getElementById("candleTooltip");
+
+      const timeFormatter = new Intl.DateTimeFormat("en-US", {
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone: "UTC",
+      });
+      const dateFormatter = new Intl.DateTimeFormat("en-US", {
+        month: "short",
+        day: "numeric",
+        timeZone: "UTC",
+      });
+      const tooltipFormatter = new Intl.DateTimeFormat("en-US", {
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone: "UTC",
+      });
+
+      const marketOpenMs = marketOpenTs ? Date.parse(marketOpenTs) : NaN;
+      const marketCloseMs = marketCloseTs ? Date.parse(marketCloseTs) : NaN;
+      let plotPoints = [];
+      let plotCandleWidth = 6;
+
+      function formatPrice(value, digits = 2) {
+        if (!Number.isFinite(value)) {
+          return "";
+        }
+        return value.toFixed(digits);
+      }
+
+      function parseCandleTs(value) {
+        if (value === null || value === undefined) {
+          return NaN;
+        }
+        if (typeof value === "number") {
+          if (!Number.isFinite(value)) {
+            return NaN;
+          }
+          return value < 1e12 ? value * 1000 : value;
+        }
+        const parsed = Date.parse(String(value));
+        return Number.isFinite(parsed) ? parsed : NaN;
+      }
+
+      function normalizeCandle(candle) {
+        const tsMs = parseCandleTs(candle.ts);
+        if (!Number.isFinite(tsMs)) {
+          return null;
+        }
+        const open = Number(candle.open);
+        const high = Number(candle.high);
+        const low = Number(candle.low);
+        const close = Number(candle.close);
+        const base = Number.isFinite(close)
+          ? close
+          : Number.isFinite(open)
+            ? open
+            : NaN;
+        if (!Number.isFinite(base)) {
+          return null;
+        }
+        return {
+          ...candle,
+          tsMs,
+          open: Number.isFinite(open) ? open : base,
+          high: Number.isFinite(high) ? high : base,
+          low: Number.isFinite(low) ? low : base,
+          close: Number.isFinite(close) ? close : base,
+        };
+      }
+
+      function resolveIntervalMs(points) {
+        if (Number.isFinite(candleIntervalMinutes) && candleIntervalMinutes > 0) {
+          return candleIntervalMinutes * 60 * 1000;
+        }
+        if (points.length < 2) {
+          return 0;
+        }
+        const sorted = points.map((c) => c.tsMs).sort((a, b) => a - b);
+        const diffs = [];
+        for (let i = 1; i < sorted.length; i += 1) {
+          const delta = sorted[i] - sorted[i - 1];
+          if (delta > 0) {
+            diffs.push(delta);
+          }
+        }
+        if (!diffs.length) {
+          return 0;
+        }
+        diffs.sort((a, b) => a - b);
+        return diffs[Math.floor(diffs.length / 2)];
+      }
+
+      function resizeCanvas() {
+        const width = container.clientWidth;
+        const height = container.clientHeight;
+        canvas.width = Math.floor(width * dpr);
+        canvas.height = Math.floor(height * dpr);
+        canvas.style.width = width + "px";
+        canvas.style.height = height + "px";
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        if (tooltip) {
+          tooltip.classList.remove("is-visible");
+        }
+        drawCandles();
+      }
+
+      function drawCandles() {
+        const width = container.clientWidth;
+        const height = container.clientHeight;
+        ctx.clearRect(0, 0, width, height);
+
+        const filtered = candleData
+          .map(normalizeCandle)
+          .filter(Boolean);
+        if (!filtered.length) {
+          plotPoints = [];
+          if (tooltip) {
+            tooltip.classList.remove("is-visible");
+          }
+          ctx.fillStyle = "#74818a";
+          ctx.fillText("No candle data", 12, 24);
+          return;
+        }
+
+        const lows = filtered.map((c) => c.low);
+        const highs = filtered.map((c) => c.high);
+        const minPrice = Math.min(...lows);
+        const maxPrice = Math.max(...highs);
+        const range = maxPrice - minPrice || 1;
+        const padding = {
+          top: 18,
+          right: 16,
+          bottom: 34,
+          left: 48,
+        };
+        const chartWidth = width - padding.left - padding.right;
+        const chartHeight = height - padding.top - padding.bottom;
+        const chartLeft = padding.left;
+        const chartBottom = height - padding.bottom;
+        const tsValues = filtered.map((c) => c.tsMs);
+        const minTs = Math.min(...tsValues);
+        const maxTs = Math.max(...tsValues);
+        const rangeMs = Math.max(1, maxTs - minTs);
+        const intervalMs = resolveIntervalMs(filtered);
+        const rawWidth = intervalMs
+          ? (intervalMs / rangeMs) * chartWidth * 0.9
+          : chartWidth / filtered.length * 0.6;
+        const candleWidth = Math.max(4, Math.min(18, rawWidth));
+        const span = Math.max(1, chartWidth - candleWidth);
+
+        function yFor(value) {
+          return padding.top + (maxPrice - value) / range * chartHeight;
+        }
+        function xFor(tsMs) {
+          if (rangeMs <= 1) {
+            return chartLeft + chartWidth / 2;
+          }
+          return chartLeft + ((tsMs - minTs) / rangeMs) * span + candleWidth / 2;
+        }
+
+        plotPoints = filtered.map((candle) => ({
+          ...candle,
+          x: xFor(candle.tsMs),
+        }));
+        plotCandleWidth = candleWidth;
+
+        const gridColor = "rgba(28, 42, 45, 0.08)";
+        const axisColor = "rgba(28, 42, 45, 0.35)";
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = gridColor;
+
+        const yTickCount = 5;
+        for (let i = 0; i <= yTickCount; i += 1) {
+          const value = minPrice + (range / yTickCount) * i;
+          const y = yFor(value);
+          ctx.beginPath();
+          ctx.moveTo(chartLeft, y);
+          ctx.lineTo(width - padding.right, y);
+          ctx.stroke();
+        }
+
+        plotPoints.forEach((candle) => {
+          const x = candle.x;
+          const openY = yFor(candle.open);
+          const closeY = yFor(candle.close);
+          const highY = yFor(candle.high);
+          const lowY = yFor(candle.low);
+          const isUp = candle.close >= candle.open;
+          ctx.strokeStyle = isUp ? "#2ea384" : "#e06b2f";
+          ctx.fillStyle = isUp ? "rgba(46, 163, 132, 0.35)" : "rgba(224, 107, 47, 0.35)";
+          ctx.lineWidth = 1.5;
+
+          ctx.beginPath();
+          ctx.moveTo(x, highY);
+          ctx.lineTo(x, lowY);
+          ctx.stroke();
+
+          const rectTop = Math.min(openY, closeY);
+          const rectHeight = Math.max(3, Math.abs(openY - closeY));
+          ctx.fillRect(x - candleWidth / 2, rectTop, candleWidth, rectHeight);
+          ctx.strokeRect(x - candleWidth / 2, rectTop, candleWidth, rectHeight);
+        });
+
+        function drawMarker(tsMs, label, color) {
+          if (!Number.isFinite(tsMs)) {
+            return;
+          }
+          if (tsMs < minTs || tsMs > maxTs) {
+            return;
+          }
+          const x = xFor(tsMs);
+          ctx.save();
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 1;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(x, padding.top);
+          ctx.lineTo(x, chartBottom);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = color;
+          ctx.textAlign = "center";
+          ctx.textBaseline = "bottom";
+          ctx.font = "11px \"Space Grotesk\", \"Trebuchet MS\", sans-serif";
+          ctx.fillText(label, x, padding.top - 4);
+          ctx.restore();
+        }
+
+        drawMarker(marketOpenMs, "Open", "rgba(79, 95, 102, 0.85)");
+        drawMarker(marketCloseMs, "Close", "rgba(224, 107, 47, 0.7)");
+
+        ctx.strokeStyle = axisColor;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(chartLeft, padding.top);
+        ctx.lineTo(chartLeft, chartBottom);
+        ctx.lineTo(width - padding.right, chartBottom);
+        ctx.stroke();
+
+        ctx.font = "11px \"Space Grotesk\", \"Trebuchet MS\", sans-serif";
+        ctx.fillStyle = "#4f5f66";
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+
+        for (let i = 0; i <= yTickCount; i += 1) {
+          const value = minPrice + (range / yTickCount) * i;
+          const y = yFor(value);
+          ctx.strokeStyle = axisColor;
+          ctx.beginPath();
+          ctx.moveTo(chartLeft - 6, y);
+          ctx.lineTo(chartLeft, y);
+          ctx.stroke();
+          const label = formatPrice(value);
+          if (label) {
+            ctx.fillText(label, chartLeft - 8, y);
+          }
+        }
+
+        const xTickCount = Math.min(5, filtered.length);
+        const showTime = rangeMs <= 36 * 60 * 60 * 1000;
+
+        function formatTsLabel(tsMs) {
+          if (!Number.isFinite(tsMs)) {
+            return "";
+          }
+          const dt = new Date(tsMs);
+          if (showTime) {
+            return timeFormatter.format(dt);
+          }
+          return dateFormatter.format(dt);
+        }
+
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.strokeStyle = axisColor;
+        for (let i = 0; i < xTickCount; i += 1) {
+          const ratio = xTickCount === 1 ? 0.5 : i / (xTickCount - 1);
+          const tsMs = minTs + rangeMs * ratio;
+          const x = chartLeft + span * ratio + candleWidth / 2;
+          ctx.beginPath();
+          ctx.moveTo(x, chartBottom);
+          ctx.lineTo(x, chartBottom + 6);
+          ctx.stroke();
+          const label = formatTsLabel(tsMs);
+          if (label) {
+            ctx.fillText(label, x, chartBottom + 8);
+          }
+        }
+      }
+
+      function formatTooltip(point) {
+        const tsLabel = tooltipFormatter.format(new Date(point.tsMs));
+        const openLabel = formatPrice(point.open, 4) || "-";
+        const highLabel = formatPrice(point.high, 4) || "-";
+        const lowLabel = formatPrice(point.low, 4) || "-";
+        const closeLabel = formatPrice(point.close, 4) || "-";
+        let html = `<div><strong>${tsLabel} UTC</strong></div>`;
+        html += `<div>O: ${openLabel} H: ${highLabel}</div>`;
+        html += `<div>L: ${lowLabel} C: ${closeLabel}</div>`;
+        if (point.volume !== null && point.volume !== undefined) {
+          html += `<div>Vol: ${point.volume.toLocaleString()}</div>`;
+        }
+        return html;
+      }
+
+      function handlePointer(event) {
+        if (!tooltip || !plotPoints.length) {
+          return;
+        }
+        const rect = canvas.getBoundingClientRect();
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        let nearest = null;
+        let minDist = Infinity;
+        plotPoints.forEach((point) => {
+          const dist = Math.abs(point.x - x);
+          if (dist < minDist) {
+            minDist = dist;
+            nearest = point;
+          }
+        });
+        const threshold = Math.max(10, plotCandleWidth * 1.2);
+        if (!nearest || minDist > threshold) {
+          tooltip.classList.remove("is-visible");
+          return;
+        }
+        tooltip.innerHTML = formatTooltip(nearest);
+        tooltip.classList.add("is-visible");
+        const tooltipWidth = tooltip.offsetWidth;
+        const tooltipHeight = tooltip.offsetHeight;
+        let left = x + 12;
+        let top = y + 12;
+        const maxLeft = rect.width - tooltipWidth - 8;
+        const maxTop = rect.height - tooltipHeight - 8;
+        left = Math.min(Math.max(8, left), maxLeft);
+        top = Math.min(Math.max(8, top), maxTop);
+        tooltip.style.left = `${left}px`;
+        tooltip.style.top = `${top}px`;
+      }
+
+      if (tooltip) {
+        canvas.addEventListener("mousemove", handlePointer);
+        canvas.addEventListener("mouseleave", () => {
+          tooltip.classList.remove("is-visible");
+        });
+      }
+
+      window.addEventListener("resize", resizeCanvas);
+      resizeCanvas();
+    </script>
+    {% endif %}
+    {% if market %}
+    <script>
+      const snapshotButton = document.getElementById("snapshotButton");
+      const snapshotStatus = document.getElementById("snapshotStatus");
+      {% if market.is_closed %}
+      const snapshotUrl = "{{ url_for('market.market_snapshot', ticker=market.market_ticker, include_closed=1) }}";
+      {% else %}
+      const snapshotUrl = "{{ url_for('market.market_snapshot', ticker=market.market_ticker) }}";
+      {% endif %}
+      const snapshotAutoRefresh = {{ "true" if market.snapshot_active else "false" }};
+      const backfillButton = document.getElementById("backfillButton");
+      const backfillStatus = document.getElementById("backfillStatus");
+      const backfillUrl = "{{ url_for('market.market_backfill', ticker=market.market_ticker) }}";
+      const forceBackfillToggle = document.getElementById("forceBackfillToggle");
+      const autoBackfillButton = document.getElementById("autoBackfillButton");
+      const autoBackfillIntervalSeconds = {{ market.candle_auto_refresh_seconds }};
+      const autoBackfillIntervalMs = Math.max(60, autoBackfillIntervalSeconds) * 1000;
+      const marketTicker = {{ market.market_ticker | tojson }};
+      const autoBackfillKey = `kalshi:autoBackfill:${marketTicker}`;
+      let autoBackfillTimer = null;
+      let backfillInFlight = false;
+
+      function setSnapshotStatus(message, isError = false) {
+        if (!snapshotStatus) {
+          return;
+        }
+        snapshotStatus.textContent = message;
+        snapshotStatus.classList.toggle("error", isError);
+      }
+
+      function setBackfillStatus(message, isError = false) {
+        if (!backfillStatus) {
+          return;
+        }
+        backfillStatus.textContent = message;
+        backfillStatus.classList.toggle("error", isError);
+      }
+
+      async function fetchSnapshot() {
+        if (!snapshotButton) {
+          return;
+        }
+        snapshotButton.disabled = true;
+        setSnapshotStatus("Fetching live snapshot...");
+        try {
+          const response = await fetch(snapshotUrl, {
+            headers: { Accept: "application/json" },
+          });
+          const contentType = response.headers.get("content-type") || "";
+          let data = null;
+          if (contentType.includes("application/json")) {
+            data = await response.json();
+          } else {
+            const text = await response.text();
+            if (!response.ok) {
+              throw new Error("Live snapshot request failed.");
+            }
+            throw new Error(text || "Live snapshot response was not JSON.");
+          }
+          if (!response.ok) {
+            const message = data && (data.error || data.message);
+            throw new Error(message || "Live snapshot request failed.");
+          }
+          if (data.error) {
+            throw new Error(data.error);
+          }
+          Object.entries(data).forEach(([key, value]) => {
+            if (value === undefined || value === null) {
+              return;
+            }
+            const target = document.querySelector(`[data-field="${key}"]`);
+            if (target) {
+              target.textContent = value;
+            }
+          });
+          if (data.db_saved === true) {
+            setSnapshotStatus("Snapshot saved to database.");
+          } else {
+            setSnapshotStatus("Snapshot updated.");
+          }
+        } catch (err) {
+          setSnapshotStatus(err.message || "Live snapshot failed.", true);
+        } finally {
+          snapshotButton.disabled = false;
+        }
+      }
+
+      function setAutoBackfillState(isActive) {
+        if (!autoBackfillButton) {
+          return;
+        }
+        autoBackfillButton.classList.toggle("active", isActive);
+        autoBackfillButton.setAttribute("aria-pressed", isActive ? "true" : "false");
+        autoBackfillButton.textContent = isActive
+          ? "Auto-update: On"
+          : "Auto-update: Off";
+      }
+
+      function getAutoBackfillEnabled() {
+        try {
+          return localStorage.getItem(autoBackfillKey) === "1";
+        } catch (err) {
+          return false;
+        }
+      }
+
+      function setAutoBackfillEnabled(enabled) {
+        try {
+          if (enabled) {
+            localStorage.setItem(autoBackfillKey, "1");
+          } else {
+            localStorage.removeItem(autoBackfillKey);
+          }
+        } catch (err) {
+          // Ignore localStorage failures.
+        }
+      }
+
+      function startAutoBackfill() {
+        if (autoBackfillTimer) {
+          clearInterval(autoBackfillTimer);
+          autoBackfillTimer = null;
+        }
+        if (!getAutoBackfillEnabled()) {
+          setAutoBackfillState(false);
+          setBackfillStatus("Backfill idle");
+          return;
+        }
+        setAutoBackfillState(true);
+        const minutes = Math.round(autoBackfillIntervalMs / 60000);
+        setBackfillStatus(`Auto-update enabled (every ${minutes} min).`);
+        runBackfill({ source: "auto" });
+        autoBackfillTimer = setInterval(() => {
+          runBackfill({ source: "auto" });
+        }, autoBackfillIntervalMs);
+      }
+
+      async function runBackfill(options = {}) {
+        if (!backfillButton || backfillInFlight) {
+          return;
+        }
+        backfillInFlight = true;
+        backfillButton.disabled = true;
+        const forceFull = options.source !== "auto"
+          && forceBackfillToggle
+          && forceBackfillToggle.checked;
+        if (forceFull && forceBackfillToggle) {
+          forceBackfillToggle.checked = false;
+        }
+        setBackfillStatus(
+          options.source === "auto"
+            ? "Auto-updating candles..."
+            : forceFull
+              ? "Backfilling candles (full history)..."
+              : "Backfilling candles..."
+        );
+        try {
+          const body = JSON.stringify({ force_full: forceFull });
+          const response = await fetch(backfillUrl, {
+            method: "POST",
+            headers: { "Accept": "application/json", "Content-Type": "application/json" },
+            body,
+          });
+          const text = await response.text();
+          let payload = {};
+          try {
+            payload = text ? JSON.parse(text) : {};
+          } catch (err) {
+            throw new Error(text || "Backfill response was not JSON.");
+          }
+          if (!response.ok) {
+            const message = payload.error || payload.message || "Backfill failed.";
+            throw new Error(message);
+          }
+          const inserted = Number(payload.inserted);
+          if (Number.isFinite(inserted)) {
+            if (inserted > 0) {
+              setBackfillStatus(`Backfilled ${inserted} candles. Reloading...`);
+              setTimeout(() => window.location.reload(), 700);
+              return;
+            }
+            setBackfillStatus("Backfill complete; no new candles.");
+          } else {
+            setBackfillStatus("Backfill complete.");
+          }
+        } catch (err) {
+          setBackfillStatus(err.message || "Backfill failed.", true);
+        } finally {
+          backfillInFlight = false;
+          backfillButton.disabled = false;
+        }
+      }
+
+      if (snapshotButton) {
+        snapshotButton.addEventListener("click", fetchSnapshot);
+      }
+
+      if (backfillButton) {
+        backfillButton.addEventListener("click", runBackfill);
+      }
+
+      if (autoBackfillButton) {
+        setAutoBackfillState(getAutoBackfillEnabled());
+        autoBackfillButton.addEventListener("click", () => {
+          const enabled = !getAutoBackfillEnabled();
+          setAutoBackfillEnabled(enabled);
+          startAutoBackfill();
+        });
+        if (getAutoBackfillEnabled()) {
+          startAutoBackfill();
+        }
+      }
+
+      if (snapshotAutoRefresh) {
+        setSnapshotStatus("Auto-refreshing every minute.");
+        fetchSnapshot();
+        setInterval(fetchSnapshot, 60000);
+      }
+    </script>
+    {% endif %}
+    {% include "queue_stream.html" %}
+  </body>
+</html>

@@ -1,0 +1,169 @@
+"""REST discovery/backfill/cleanup loops."""
+
+from __future__ import annotations
+
+import logging
+import time
+
+import psycopg  # pylint: disable=import-error
+
+from src.jobs.backfill import backfill_pass
+from src.jobs.backfill_config import build_backfill_config_from_settings
+from src.jobs.archive_closed import archive_closed_events, build_archive_closed_config
+from src.jobs.closed_cleanup import build_closed_cleanup_config, closed_cleanup_pass
+from src.db.db import ensure_schema_compatible, maybe_init_schema
+from src.core.env_utils import _env_float, _env_int
+from src.jobs.discovery import discovery_pass
+from src.kalshi.kalshi_sdk import make_client
+from src.core.loop_utils import LoopFailureContext, log_metric, schema_path
+from src.queue.work_queue import QueuePublisher
+
+logger = logging.getLogger(__name__)
+
+_SCHEMA_PATH = schema_path(__file__)
+
+
+def rest_discovery_loop(settings, private_key_pem: str) -> None:
+    """Run the REST discovery polling loop."""
+    client = make_client(settings.kalshi_host, settings.kalshi_api_key_id, private_key_pem)
+    conn = psycopg.connect(settings.database_url)
+    maybe_init_schema(conn, schema_path=_SCHEMA_PATH)
+    ensure_schema_compatible(conn)
+    failure_threshold = _env_int("REST_FAILURE_THRESHOLD", 5, minimum=1)
+    breaker_seconds = _env_float("REST_CIRCUIT_BREAKER_SECONDS", 60.0, minimum=1.0)
+    failure_ctx = LoopFailureContext(
+        name="rest.discovery",
+        failure_threshold=failure_threshold,
+        breaker_seconds=breaker_seconds,
+    )
+    while True:
+        start = time.monotonic()
+        try:
+            events, markets, active = discovery_pass(
+                conn,
+                client,
+                settings.strike_periods,
+                settings.discovery_event_statuses,
+            )
+            duration = time.monotonic() - start
+            failure_ctx.record_success(logger, "discovery recovered after %d failures")
+            log_metric(
+                logger,
+                "rest.discovery",
+                duration_s=round(duration, 2),
+                events=events,
+                markets=markets,
+                active=active,
+                errors_total=failure_ctx.error_total,
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception("discovery failed")
+            if failure_ctx.handle_exception(logger, start):
+                continue
+        elapsed = time.monotonic() - start
+        sleep_for = max(0.0, settings.discovery_seconds - elapsed)
+        time.sleep(sleep_for)
+
+
+def rest_backfill_loop(settings, private_key_pem: str, queue_cfg) -> None:
+    """Run the REST backfill polling loop."""
+    client = make_client(settings.kalshi_host, settings.kalshi_api_key_id, private_key_pem)
+    conn = psycopg.connect(settings.database_url)
+    maybe_init_schema(conn, schema_path=_SCHEMA_PATH)
+    ensure_schema_compatible(conn)
+    failure_threshold = _env_int("REST_FAILURE_THRESHOLD", 5, minimum=1)
+    breaker_seconds = _env_float("REST_CIRCUIT_BREAKER_SECONDS", 60.0, minimum=1.0)
+    failure_ctx = LoopFailureContext(
+        name="rest.backfill",
+        failure_threshold=failure_threshold,
+        breaker_seconds=breaker_seconds,
+    )
+    backfill_cfg = build_backfill_config_from_settings(settings)
+    queue_publisher = None
+    if queue_cfg.enabled and queue_cfg.rabbitmq.publish:
+        try:
+            queue_publisher = QueuePublisher(queue_cfg)
+            logger.info("Queue enabled: publishing to %s", queue_cfg.rabbitmq.queue_name)
+        except Exception:  # pylint: disable=broad-exception-caught
+            queue_publisher = None
+            logger.exception("Queue enabled but RabbitMQ unavailable; DB-only queue")
+
+    while True:
+        start = time.monotonic()
+        try:
+            stats = backfill_pass(
+                conn,
+                client,
+                backfill_cfg,
+                queue_cfg=queue_cfg,
+                publisher=queue_publisher,
+            )
+            duration = time.monotonic() - start
+            failure_ctx.record_success(logger, "backfill recovered after %d failures")
+            log_metric(
+                logger,
+                "rest.backfill",
+                duration_s=round(duration, 2),
+                events=stats[0],
+                markets=stats[1],
+                candles=stats[2],
+                errors_total=failure_ctx.error_total,
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception("backfill failed")
+            if failure_ctx.handle_exception(logger, start):
+                continue
+        time.sleep(settings.backfill_seconds)
+
+
+def rest_closed_cleanup_loop(settings, private_key_pem: str) -> None:
+    """Run the REST closed-market cleanup loop."""
+    client = make_client(settings.kalshi_host, settings.kalshi_api_key_id, private_key_pem)
+    conn = psycopg.connect(settings.database_url)
+    maybe_init_schema(conn, schema_path=_SCHEMA_PATH)
+    ensure_schema_compatible(conn)
+    failure_threshold = _env_int("REST_FAILURE_THRESHOLD", 5, minimum=1)
+    breaker_seconds = _env_float("REST_CIRCUIT_BREAKER_SECONDS", 60.0, minimum=1.0)
+    failure_ctx = LoopFailureContext(
+        name="rest.closed_cleanup",
+        failure_threshold=failure_threshold,
+        breaker_seconds=breaker_seconds,
+    )
+    cfg = build_closed_cleanup_config(settings)
+    archive_cfg = build_archive_closed_config(settings)
+    while True:
+        start = time.monotonic()
+        try:
+            events, markets, candles = closed_cleanup_pass(conn, client, cfg)
+            duration = time.monotonic() - start
+            failure_ctx.record_success(
+                logger,
+                "closed cleanup recovered after %d failures",
+            )
+            log_metric(
+                logger,
+                "rest.closed_cleanup",
+                duration_s=round(duration, 2),
+                events=events,
+                markets=markets,
+                candles=candles,
+                errors_total=failure_ctx.error_total,
+            )
+            if settings.backup_database_url:
+                try:
+                    with psycopg.connect(settings.backup_database_url) as backup_conn:
+                        stats = archive_closed_events(conn, backup_conn, settings, archive_cfg)
+                        if stats:
+                            log_metric(
+                                logger,
+                                "rest.archive_closed",
+                                events=stats.events,
+                                markets=stats.markets,
+                            )
+                except Exception:  # pylint: disable=broad-exception-caught
+                    logger.exception("archive closed failed")
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception("closed cleanup failed")
+            if failure_ctx.handle_exception(logger, start):
+                continue
+        time.sleep(settings.closed_cleanup_seconds)

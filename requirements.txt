@@ -1,0 +1,12 @@
+kalshi_python_sync
+orjson
+psycopg[binary]
+psycopg_pool
+pika
+python-dateutil
+python-dotenv
+websockets
+cryptography
+flask
+gunicorn
+openai>=1.0.0

@@ -1,22 +1,59 @@
 Bootstrap: docker
 From: python:3.11-slim
 
+%setup
+    set -e
+    if [ -f requirements.txt ]; then
+        req_src="requirements.txt"
+    elif [ -f ../requirements.txt ]; then
+        req_src="../requirements.txt"
+    else
+        echo "requirements.txt not found; run build from repo root or keep it next to the def file" >&2
+        exit 1
+    fi
+
+    req_rootfs="${APPTAINER_ROOTFS:-${SINGULARITY_ROOTFS:-}}"
+    if [ -z "$req_rootfs" ]; then
+        echo "APPTAINER_ROOTFS/SINGULARITY_ROOTFS not set; cannot stage requirements.txt" >&2
+        exit 1
+    fi
+
+    mkdir -p "$req_rootfs/opt"
+    cp "$req_src" "$req_rootfs/opt/requirements.txt"
+
 %post
     apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         && rm -rf /var/lib/apt/lists/*
 
-    pip install --no-cache-dir \
-        kalshi_python_sync \
-        psycopg[binary] \
-        python-dateutil \
-        python-dotenv \
-        websockets \
-        cryptography
+    pip install --no-cache-dir -r /opt/requirements.txt
 
 %environment
     export PYTHONUNBUFFERED=1
 
 %runscript
     cd /app
-    exec python -m src.main
+    if [ "$#" -gt 0 ]; then
+        exec "$@"
+    fi
+    case "${KALSHI_SERVICE:-}" in
+        rest)
+            exec python -m src.services.rest_service
+            ;;
+        ws)
+            exec python -m src.services.ws_service
+            ;;
+        worker)
+            exec python -m src.services.worker_service
+            ;;
+        rag)
+            exec python -m src.services.rag_service
+            ;;
+        portal)
+            exec python -m src.services.portal_service
+            ;;
+        migrator)
+            exec python -m src.services.migrator
+            ;;
+    esac
+    exec python -m src.services.main

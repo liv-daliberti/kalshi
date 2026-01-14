@@ -1,0 +1,16 @@
+[Unit]
+Description=Kalshi schema migrator
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/kalshi_ingestor
+EnvironmentFile=/etc/kalshi_ingestor/admin.env
+Environment=LOG_DIR=/var/log/kalshi_ingestor
+Environment=LOG_STDOUT=1
+ExecStart=/opt/kalshi_ingestor/.venv/bin/python -m src.services.migrator
+CPUQuota=50%
+MemoryMax=512M
+IOWeight=100
+TasksMax=128
+LimitNOFILE=65536

@@ -1,0 +1,78 @@
+{% if queue_stream_enabled %}
+<script>
+  (function () {
+    if (!("EventSource" in window)) {
+      return;
+    }
+    const streamUrl = "{{ url_for('stream.queue_stream') }}";
+    const minReloadMs = Number("{{ queue_stream_min_reload_ms }}") || 5000;
+    const reloadKey = "queueStreamLastReloadAt";
+    const quietWindowMs = 800;
+    let pendingRefresh = false;
+    let refreshTimer = null;
+    let quietTimer = null;
+    let lastReloadAt = 0;
+
+    try {
+      const stored = localStorage.getItem(reloadKey);
+      const parsed = stored ? Number(stored) : 0;
+      lastReloadAt = Number.isFinite(parsed) ? parsed : 0;
+    } catch (err) {
+      lastReloadAt = 0;
+    }
+
+    function markReload() {
+      lastReloadAt = Date.now();
+      try {
+        localStorage.setItem(reloadKey, String(lastReloadAt));
+      } catch (err) {
+        // Ignore storage errors.
+      }
+    }
+
+    function scheduleReload() {
+      if (refreshTimer) {
+        return;
+      }
+      const now = Date.now();
+      const waitMs = Math.max(minReloadMs - (now - lastReloadAt), 250);
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        if (document.hidden) {
+          return;
+        }
+        pendingRefresh = false;
+        markReload();
+        window.location.reload();
+      }, waitMs);
+    }
+
+    function requestRefresh() {
+      pendingRefresh = true;
+      if (quietTimer) {
+        clearTimeout(quietTimer);
+      }
+      quietTimer = setTimeout(() => {
+        quietTimer = null;
+        if (document.hidden) {
+          return;
+        }
+        scheduleReload();
+      }, quietWindowMs);
+    }
+
+    const source = new EventSource(streamUrl);
+    source.addEventListener("queue", requestRefresh);
+    source.addEventListener("ping", () => {});
+    source.addEventListener("error", () => {
+      // EventSource handles reconnects automatically.
+    });
+
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && pendingRefresh) {
+        scheduleReload();
+      }
+    });
+  })();
+</script>
+{% endif %}

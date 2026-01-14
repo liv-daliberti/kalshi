@@ -1,0 +1,1 @@
+"""Kalshi ingestor source package."""
