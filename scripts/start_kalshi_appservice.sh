@@ -8,6 +8,17 @@ cd "$APP_ROOT"
 LOG_DIR="/home/LogFiles/kalshi"
 mkdir -p "$LOG_DIR"
 
+if [ -z "${DATABASE_URL:-}" ]; then
+  echo "DATABASE_URL is not set; aborting startup." >&2
+  exit 1
+fi
+
+# Ensure DB schema exists before starting any services
+python -m src.services.migrator > "$LOG_DIR/migrator.log" 2>&1 || {
+  echo "Migrator failed; see $LOG_DIR/migrator.log" >&2
+  exit 1
+}
+
 # Internal services
 nohup env PORT=8001 SERVICE_HEALTH_PORT=8001 python -m src.services.rest_service \
   > "$LOG_DIR/rest.log" 2>&1 &
