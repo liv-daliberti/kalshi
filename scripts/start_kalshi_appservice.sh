@@ -26,7 +26,7 @@ done
 nohup env PORT=8004 SERVICE_HEALTH_PORT=8004 python -m src.services.rag_service \
   > "$LOG_DIR/rag.log" 2>&1 &
 
-# Portal (factory-based gunicorn)
-exec gunicorn --factory --bind 0.0.0.0:"${PORT:-8000}" --workers 2 --threads 4 --timeout 180 \
-  src.web_portal.app:create_app \
+# Portal
+exec gunicorn --bind 0.0.0.0:"${PORT:-8000}" --workers 2 --threads 4 --timeout 180 \
+  "src.web_portal.app:create_app()" \
   > "$LOG_DIR/portal.log" 2>&1
