@@ -70,7 +70,7 @@ flowchart LR
   GHA -.->|configure| FD
   USERS --> FD
   FD --> PORTAL
-  USERS -.->|direct (no Front Door)| PORTAL
+  USERS -.->|direct no Front Door| PORTAL
 
   %% Node styling
   classDef external fill:#f4efe6,stroke:#bcae97,color:#2b2418,stroke-width:1px;
