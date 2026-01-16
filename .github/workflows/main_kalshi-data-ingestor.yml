@@ -53,6 +53,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: python-app
+          path: ./artifact
 
       # This step requires AZURE_CREDENTIALS to contain the full JSON from:
       # az ad sp create-for-rbac --sdk-auth
@@ -151,3 +152,4 @@ jobs:
           app-name: "Kalshi-Data-Ingestor"
           slot-name: "Production"
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_8A914FC12C584EAEAAED9C60384BF3DD }}
+          package: ./artifact
