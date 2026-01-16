@@ -29,6 +29,7 @@ from src.core.env_utils import env_int
 from src.core.guardrails import assert_service_role
 from src.core.loop_utils import log_metric as _log_metric
 from src.jobs.event_filter import EventScanStats, accept_event
+from src.jobs.job_utils import log_item_error as _log_item_error
 from src.kalshi.kalshi_sdk import iter_events
 
 logger = logging.getLogger(__name__)
@@ -242,13 +243,15 @@ def _process_event(
             "discovery_pass: event upsert failed event_ticker=%s",
             event.get("event_ticker"),
         )
-        _log_metric(
+        _log_item_error(
             logger,
             "discovery.item_error",
             kind="event_upsert",
             event_ticker=event.get("event_ticker"),
+            market_ticker=None,
+            rollback=_safe_rollback,
+            conn=conn,
         )
-        _safe_rollback(conn)
         return 0, 0, 0
     markets = event.get("markets") or []
     market_updates = active_updates = 0
@@ -265,14 +268,15 @@ def _process_event(
                 event.get("event_ticker"),
                 market.get("ticker"),
             )
-            _log_metric(
+            _log_item_error(
                 logger,
                 "discovery.item_error",
                 kind="market_upsert",
                 event_ticker=event.get("event_ticker"),
                 market_ticker=market.get("ticker"),
+                rollback=_safe_rollback,
+                conn=conn,
             )
-            _safe_rollback(conn)
             continue
         else:
             market_updates += market_delta

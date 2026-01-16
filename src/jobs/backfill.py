@@ -25,6 +25,7 @@ from src.jobs.event_filter import EventScanStats, accept_event
 from src.core.guardrails import assert_service_role
 from src.core.loop_utils import log_metric as _log_metric
 from src.kalshi.kalshi_sdk import get_market_candlesticks, iter_events
+from src.jobs.job_utils import log_item_error as _log_item_error
 from src.queue.work_queue import QueueConfig, QueuePublisher, enqueue_job
 
 logger = logging.getLogger(__name__)
@@ -666,13 +667,15 @@ def _backfill_event(
             "backfill_pass: event upsert failed event_ticker=%s",
             event.get("event_ticker"),
         )
-        _log_metric(
+        _log_item_error(
             logger,
             "backfill.item_error",
             kind="event_upsert",
             event_ticker=event.get("event_ticker"),
+            market_ticker=None,
+            rollback=_safe_rollback,
+            conn=conn,
         )
-        _safe_rollback(conn)
         return 0, 0, 0
 
     series = event.get("series_ticker")
@@ -692,14 +695,15 @@ def _backfill_event(
                 event.get("event_ticker"),
                 market.get("ticker"),
             )
-            _log_metric(
+            _log_item_error(
                 logger,
                 "backfill.item_error",
                 kind="market_upsert",
                 event_ticker=event.get("event_ticker"),
                 market_ticker=market.get("ticker"),
+                rollback=_safe_rollback,
+                conn=conn,
             )
-            _safe_rollback(conn)
             continue
         counts.markets += 1
         market_ctx = MarketContext(series, market, context.strike_period)

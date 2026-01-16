@@ -12,6 +12,7 @@ from datetime import timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 
+from src.core.db_utils import safe_close
 from src.kalshi.kalshi_rate_limit import register_rest_rate_limit
 
 logger = logging.getLogger(__name__)
@@ -160,10 +161,7 @@ def _reset_db_rate_limit_conn() -> None:
     conn = getattr(_DB_RATE_LIMIT_LOCAL, "conn", None)
     if conn is None:
         return
-    try:
-        conn.close()
-    except Exception:  # pylint: disable=broad-exception-caught
-        pass
+    safe_close(conn)
     _DB_RATE_LIMIT_LOCAL.conn = None
 
 

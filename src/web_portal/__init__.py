@@ -930,8 +930,10 @@ def main() -> None:
     host = os.getenv("WEB_PORTAL_HOST", "0.0.0.0")
     threads = _env_int("WEB_PORTAL_THREADS", 1, minimum=1)
     threaded = _env_bool("WEB_PORTAL_THREADED", threads > 1)
-    from .app import create_app  # pylint: disable=import-outside-toplevel
-    app = create_app()
+    import importlib  # pylint: disable=import-outside-toplevel
+
+    app_module = importlib.import_module(".app", __package__)
+    app = app_module.create_app()
     app.run(host=host, port=port, threaded=threaded)
 
 

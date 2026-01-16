@@ -30,7 +30,6 @@ class QueueBackpressureConfig:
     resubscribe_factor: float
     resubscribe_min: int
     resubscribe_cooldown: float
-    base_active_limit: int
 
 
 @dataclass
@@ -103,7 +102,6 @@ def load_backpressure_state(config: WsLoopConfig) -> QueueBackpressureState:
         resubscribe_factor=resubscribe_factor,
         resubscribe_min=resubscribe_min,
         resubscribe_cooldown=resubscribe_cooldown,
-        base_active_limit=config.runtime.max_active_tickers,
     )
     return QueueBackpressureState(
         config=bp_config,

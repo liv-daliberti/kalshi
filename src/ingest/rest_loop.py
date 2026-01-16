@@ -13,6 +13,7 @@ from src.jobs.backfill_config import build_backfill_config_from_settings
 from src.jobs.archive_closed import archive_closed_events, build_archive_closed_config
 from src.jobs.closed_cleanup import build_closed_cleanup_config, closed_cleanup_pass
 from src.db.db import ensure_schema_compatible, maybe_init_schema
+from src.core.db_utils import safe_close
 from src.core.env_utils import _env_float, _env_int
 from src.jobs.discovery import discovery_pass
 from src.kalshi.kalshi_sdk import make_client
@@ -37,15 +38,6 @@ def _safe_rollback(conn: psycopg.Connection | None) -> None:
         logger.warning("DB rollback failed after error")
 
 
-def _safe_close(conn: psycopg.Connection | None) -> None:
-    if conn is None:
-        return
-    try:
-        conn.close()
-    except Exception:  # pylint: disable=broad-exception-caught
-        logger.warning("DB close failed during reconnect")
-
-
 def _should_reconnect(exc: Exception) -> bool:
     return isinstance(exc, _DB_RECONNECT_ERRORS)
 
@@ -68,7 +60,7 @@ def _connect_rest_resources(settings, private_key_pem: str):
             return client, conn
         except Exception:  # pylint: disable=broad-exception-caught
             _safe_rollback(conn)
-            _safe_close(conn)
+            safe_close(conn, logger=logger, warn_message="DB close failed during reconnect")
             logger.exception("REST setup failed; retrying")
             sleep_s = min(max_sleep, base_sleep * (2 ** attempt))
             sleep_s += random.uniform(0.0, min(base_sleep, 1.0))
@@ -113,7 +105,7 @@ def rest_discovery_loop(settings, private_key_pem: str) -> None:
             logger.exception("discovery failed")
             _safe_rollback(conn)
             if _should_reconnect(exc):
-                _safe_close(conn)
+                safe_close(conn, logger=logger, warn_message="DB close failed during reconnect")
                 conn = None
                 client = None
             if failure_ctx.handle_exception(logger, start):
@@ -173,7 +165,7 @@ def rest_backfill_loop(settings, private_key_pem: str, queue_cfg) -> None:
             logger.exception("backfill failed")
             _safe_rollback(conn)
             if _should_reconnect(exc):
-                _safe_close(conn)
+                safe_close(conn, logger=logger, warn_message="DB close failed during reconnect")
                 conn = None
                 client = None
             if failure_ctx.handle_exception(logger, start):
@@ -231,7 +223,7 @@ def rest_closed_cleanup_loop(settings, private_key_pem: str) -> None:
             logger.exception("closed cleanup failed")
             _safe_rollback(conn)
             if _should_reconnect(exc):
-                _safe_close(conn)
+                safe_close(conn, logger=logger, warn_message="DB close failed during reconnect")
                 conn = None
                 client = None
             if failure_ctx.handle_exception(logger, start):
