@@ -143,7 +143,7 @@ def assert_queue_op_allowed(operation: str) -> None:
     if not role:
         return
     allowed: dict[str, set[str]] = {
-        "enqueue": {"rest"},
+        "enqueue": {"rest", "ws"},
         "claim": {"worker"},
         "complete": {"worker"},
         "maintenance": {"worker"},

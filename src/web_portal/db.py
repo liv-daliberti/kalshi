@@ -350,7 +350,7 @@ def refresh_portal_snapshot(*, concurrent: bool = True) -> None:
                 if not _ensure_portal_snapshot_schema(conn):
                     raise RuntimeError(
                         "portal_event_rollup missing; run migrator or enable DB_INIT_SCHEMA."
-                    )
+                    ) from exc
                 with timed_cursor(conn) as cur:
                     cur.execute(fallback_query)
             return
@@ -411,15 +411,17 @@ def maybe_refresh_portal_snapshot(*, reason: str, background: bool = False) -> b
     return _refresh_portal_snapshot(reason)
 
 
+PortalSnapshotOffsets = tuple[int, int, int]
+
+
 def fetch_portal_snapshot(
     conn: psycopg.Connection,
     limit: int,
     filters: "PortalFilters",
-    active_offset: int = 0,
-    scheduled_offset: int = 0,
-    closed_offset: int = 0,
+    offsets: PortalSnapshotOffsets = (0, 0, 0),
 ) -> dict[str, Any] | None:
     """Fetch the portal snapshot JSON payload from the database."""
+    active_offset, scheduled_offset, closed_offset = offsets
     close_window_hours = filters.close_window_hours
     categories = list(filters.categories) if filters.categories else None
     queue_timeout = _env_int("WORK_QUEUE_LOCK_TIMEOUT_SECONDS", 900, minimum=10)

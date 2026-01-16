@@ -717,9 +717,11 @@ def _fetch_portal_data(
                         conn,
                         limit,
                         filters,
-                        paging.active_offset,
-                        paging.scheduled_offset,
-                        paging.closed_offset,
+                        offsets=(
+                            paging.active_offset,
+                            paging.scheduled_offset,
+                            paging.closed_offset,
+                        ),
                     )
                 if payload:
                     data = _portal_data_from_snapshot(payload)
@@ -842,34 +844,34 @@ def index():
     except RuntimeError as exc:
         password_error = str(exc)
 
-    db_url = os.getenv("DATABASE_URL")
     limit = clamp_limit(request.args.get("limit") or os.getenv("WEB_PORTAL_LIMIT"))
     filters = _parse_portal_filters(request.args)
     paging = _parse_portal_paging(request.args, limit)
     filter_fields = _portal_filter_fields(filters)
-    category_params = build_filter_params(limit, filters, include_category=False)
     selected_categories = list(filters.categories)
-    if password_error or not db_url:
+    if password_error or not os.getenv("DATABASE_URL"):
         error_message = password_error or "DATABASE_URL is not set."
         data = _empty_portal_data(error_message)
-        context = _portal_context(
-            limit=limit,
-            filters=filters,
-            paging=paging,
-            scope_note=scope_note,
-            selected_categories=selected_categories,
-            category_filters=[],
-            filter_fields=filter_fields,
-            data=data,
-            load_more_links={},
+        return render_template(
+            "portal.html",
+            **_portal_context(
+                limit=limit,
+                filters=filters,
+                paging=paging,
+                scope_note=scope_note,
+                selected_categories=selected_categories,
+                category_filters=[],
+                filter_fields=filter_fields,
+                data=data,
+                load_more_links={},
+            ),
         )
-        return render_template("portal.html", **context)
 
     data = _fetch_portal_data(limit, filters, paging)
     category_filters = build_category_filters(
         active_categories=data.active_categories,
         selected_categories=selected_categories,
-        base_params=category_params,
+        base_params=build_filter_params(limit, filters, include_category=False),
         endpoint="index",
         url_for=url_for,
     )
@@ -893,18 +895,20 @@ def index():
             **{**base_params, "closed_page": paging.closed_page + 1},
         ),
     }
-    context = _portal_context(
-        limit=limit,
-        filters=filters,
-        paging=paging,
-        scope_note=scope_note,
-        selected_categories=selected_categories,
-        category_filters=category_filters,
-        filter_fields=filter_fields,
-        data=data,
-        load_more_links=load_more_links,
+    return render_template(
+        "portal.html",
+        **_portal_context(
+            limit=limit,
+            filters=filters,
+            paging=paging,
+            scope_note=scope_note,
+            selected_categories=selected_categories,
+            category_filters=category_filters,
+            filter_fields=filter_fields,
+            data=data,
+            load_more_links=load_more_links,
+        ),
     )
-    return render_template("portal.html", **context)
 
 
 def main() -> None:
@@ -926,7 +930,7 @@ def main() -> None:
     host = os.getenv("WEB_PORTAL_HOST", "0.0.0.0")
     threads = _env_int("WEB_PORTAL_THREADS", 1, minimum=1)
     threaded = _env_bool("WEB_PORTAL_THREADED", threads > 1)
-    from .app import create_app
+    from .app import create_app  # pylint: disable=import-outside-toplevel
     app = create_app()
     app.run(host=host, port=port, threaded=threaded)
 

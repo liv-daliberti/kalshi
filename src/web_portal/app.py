@@ -13,7 +13,7 @@ from src.core.logging_utils import configure_logging as configure_service_loggin
 from src.core.env_utils import env_int, parse_bool
 
 from .kalshi_sdk import configure_rest_rate_limit
-from . import register_routes
+from . import register_routes  # pylint: disable=no-name-in-module
 from .routes import register_blueprints
 
 logger = logging.getLogger(__name__)

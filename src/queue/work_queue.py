@@ -113,13 +113,18 @@ def queue_name_for_job_type(job_type: str, default_queue: str) -> str:
 
 
 def _default_queue_for_job_types(job_types: tuple[str, ...]) -> str:
+    job_set = set(job_types)
+    if job_set and job_set.issubset({"backfill_market", "discover_market"}):
+        override = os.getenv(_queue_name_env_key("backfill_market"))
+        if override:
+            return override
+        if "backfill_market" in job_set:
+            return "kalshi.backfill"
     if len(job_types) == 1:
         job_type = job_types[0]
         override = os.getenv(_queue_name_env_key(job_type))
         if override:
             return override
-        if job_type == "backfill_market":
-            return "kalshi.backfill"
         if job_type == "cleanup_market":
             return "kalshi.cleanup"
     return "kalshi.ingest"
@@ -128,7 +133,7 @@ def _default_queue_for_job_types(job_types: tuple[str, ...]) -> str:
 def _load_job_types() -> tuple[str, ...]:
     raw_job_types = os.getenv("WORK_QUEUE_JOB_TYPES")
     if raw_job_types is None:
-        return ("backfill_market",)
+        return ("backfill_market", "discover_market")
     return _parse_csv(raw_job_types)
 
 
@@ -264,6 +269,8 @@ def enqueue_job(
     payload: dict[str, Any],
     available_at: Optional[datetime] = None,
     max_attempts: Optional[int] = None,
+    *,
+    commit: bool = True,
 ) -> int:
     """Insert a new job into the work queue and return its id."""
     assert_queue_op_allowed("enqueue")
@@ -297,7 +304,8 @@ def enqueue_job(
             cur.execute("SELECT pg_notify('work_queue_update', %s)", (notify_payload,))
         except Exception:  # pylint: disable=broad-exception-caught
             logger.exception("Queue notify failed for job %s", job_id)
-    conn.commit()
+    if commit:
+        conn.commit()
     return int(job_id)
 
 

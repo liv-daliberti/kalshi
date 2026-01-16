@@ -13,6 +13,7 @@ import psycopg  # pylint: disable=import-error
 
 from src.jobs.backfill import BackfillConfig, MarketContext, backfill_market
 from src.jobs.backfill_config import build_backfill_config_from_settings
+from src.jobs.discover_market import discover_market
 from src.db.db import maybe_init_schema, set_state
 from src.core.env_utils import _env_int
 from src.core.guardrails import assert_service_role
@@ -97,6 +98,12 @@ def _process_item(
             ctx,
             force_full=force_full,
         )
+    if item.job_type == "discover_market":
+        payload = item.payload or {}
+        ticker = payload.get("ticker") or payload.get("market_ticker")
+        if not ticker:
+            raise ValueError(f"Invalid discover_market payload for job {item.job_id}")
+        return discover_market(conn, client, str(ticker))
     raise ValueError(f"Unknown job type {item.job_type}")
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -15,6 +16,8 @@ from src.core.env_utils import _env_bool, _env_int
 from src.core.guardrails import assert_state_write_allowed
 
 SCHEMA_VERSION = 1
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -700,6 +703,45 @@ def _market_tick_payload(tick: dict) -> dict:
     }
 
 
+def _ensure_markets_exist(conn: psycopg.Connection, tickers: set[str]) -> list[str]:
+    if not tickers:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO markets (ticker, updated_at)
+            SELECT unnest(%s::text[]), NOW()
+            ON CONFLICT (ticker) DO NOTHING
+            RETURNING ticker
+            """,
+            (sorted(tickers),),
+        )
+        rows = cur.fetchall()
+    return [row[0] for row in rows]
+
+
+def _enqueue_discover_market_jobs(conn: psycopg.Connection, tickers: list[str]) -> None:
+    if not tickers:
+        return
+    try:
+        from src.queue.work_queue import enqueue_job
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception("discover_market enqueue unavailable")
+        return
+    try:
+        for ticker in tickers:
+            enqueue_job(conn, "discover_market", {"ticker": ticker}, commit=False)
+        conn.commit()
+    except PermissionError:
+        logger.warning("discover_market enqueue blocked by guardrails")
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception("discover_market enqueue failed")
+        try:
+            conn.rollback()
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning("discover_market enqueue rollback failed")
+
+
 def insert_market_tick(conn: psycopg.Connection, tick: dict) -> None:
     """Insert a market tick row.
 
@@ -715,6 +757,12 @@ def insert_market_ticks(conn: psycopg.Connection, ticks: list[dict]) -> None:
     """Insert multiple market tick rows in one transaction."""
     if not ticks:
         return
+    tickers: set[str] = set()
+    for tick in ticks:
+        ticker = tick.get("ticker")
+        if isinstance(ticker, str) and ticker:
+            tickers.add(ticker)
+    inserted = _ensure_markets_exist(conn, tickers)
     sql = """
     INSERT INTO market_ticks(
       ts, ticker, price, yes_bid, yes_ask,
@@ -766,6 +814,7 @@ def insert_market_ticks(conn: psycopg.Connection, ticks: list[dict]) -> None:
                 ("last_ws_tick_ts", last_ws_ts.isoformat()),
             )
     conn.commit()
+    _enqueue_discover_market_jobs(conn, inserted)
 
 
 def _lifecycle_payload(event: dict) -> dict:

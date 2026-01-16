@@ -66,7 +66,7 @@ def _connect_rest_resources(settings, private_key_pem: str):
             maybe_init_schema(conn, schema_path=_SCHEMA_PATH)
             ensure_schema_compatible(conn)
             return client, conn
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception:  # pylint: disable=broad-exception-caught
             _safe_rollback(conn)
             _safe_close(conn)
             logger.exception("REST setup failed; retrying")
@@ -187,12 +187,10 @@ def rest_closed_cleanup_loop(settings, private_key_pem: str) -> None:
     """Run the REST closed-market cleanup loop."""
     client = None
     conn = None
-    failure_threshold = _env_int("REST_FAILURE_THRESHOLD", 5, minimum=1)
-    breaker_seconds = _env_float("REST_CIRCUIT_BREAKER_SECONDS", 60.0, minimum=1.0)
     failure_ctx = LoopFailureContext(
         name="rest.closed_cleanup",
-        failure_threshold=failure_threshold,
-        breaker_seconds=breaker_seconds,
+        failure_threshold=_env_int("REST_FAILURE_THRESHOLD", 5, minimum=1),
+        breaker_seconds=_env_float("REST_CIRCUIT_BREAKER_SECONDS", 60.0, minimum=1.0),
     )
     cfg = build_closed_cleanup_config(settings)
     archive_cfg = build_archive_closed_config(settings)
