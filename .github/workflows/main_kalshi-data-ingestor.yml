@@ -31,18 +31,20 @@ jobs:
           source antenv/bin/activate
           pip install -r requirements.txt
 
-      # Exclude antenv + env files from artifact; Oryx builds on App Service if SCM_DO_BUILD_DURING_DEPLOYMENT=true
+      # Upload only runtime assets to keep the deploy package small and avoid ZIP deploy limits.
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
           name: python-app
           path: |
-            .
-            !antenv/
-            !.env
-            !.env.*
-            !configs/env/*.env
-            !configs/env/*.env.example
+            src/
+            scripts/
+            configs/
+            sql/
+            requirements.txt
+            setup.py
+            gunicorn.conf.py
+            README.md
 
   deploy:
     runs-on: ubuntu-latest
@@ -54,6 +56,7 @@ jobs:
         with:
           name: python-app
           path: ./artifact
+          merge-multiple: true
 
       # This step requires AZURE_CREDENTIALS to contain the full JSON from:
       # az ad sp create-for-rbac --sdk-auth
