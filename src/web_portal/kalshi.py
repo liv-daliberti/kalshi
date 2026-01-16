@@ -10,6 +10,7 @@ from typing import Any
 
 from .kalshi_sdk import (
     KalshiSdkError,
+    extract_http_status,
     make_client,
     rest_register_rate_limit,
     rest_wait,
@@ -48,23 +49,7 @@ def _portal_time():
     return _portal_attr("time", time)
 
 
-def _extract_http_status(exc: Exception) -> int | None:
-    """Extract an HTTP status code from an exception when possible."""
-    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
-    if status is not None:
-        try:
-            return int(status)
-        except (TypeError, ValueError):
-            return None
-    http_resp = getattr(exc, "http_resp", None)
-    if http_resp is not None:
-        status = getattr(http_resp, "status", None) or getattr(http_resp, "status_code", None)
-        if status is not None:
-            try:
-                return int(status)
-            except (TypeError, ValueError):
-                return None
-    return None
+_extract_http_status = extract_http_status
 
 
 def _load_kalshi_client():

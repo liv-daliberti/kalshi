@@ -6,52 +6,14 @@ import logging
 from typing import Any
 
 from src.db.db import upsert_event, upsert_market
-from src.kalshi.kalshi_sdk import rest_register_rate_limit, rest_wait
+from src.kalshi.kalshi_sdk import (
+    coerce_payload,
+    extract_http_status,
+    rest_register_rate_limit,
+    rest_wait,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _coerce_status_value(value: Any) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _extract_http_status(exc: Exception) -> int | None:
-    status = _coerce_status_value(
-        getattr(exc, "status", None) or getattr(exc, "status_code", None)
-    )
-    if status is None:
-        http_resp = getattr(exc, "http_resp", None)
-        status = _coerce_status_value(
-            getattr(http_resp, "status", None)
-            or getattr(http_resp, "status_code", None)
-        )
-    return status
-
-
-def _coerce_payload(value: Any) -> dict[str, Any] | None:
-    payload = None
-    if value is None:
-        payload = None
-    elif isinstance(value, dict):
-        payload = value
-    elif hasattr(value, "model_dump"):
-        try:
-            payload = value.model_dump(mode="json")
-        except TypeError:
-            payload = value.model_dump()
-    elif hasattr(value, "dict"):
-        try:
-            payload = value.dict()
-        except TypeError:
-            payload = value.dict
-    elif hasattr(value, "__dict__"):
-        payload = dict(value.__dict__)
-    return payload
 
 
 def _log_missing_market(status: int | None, ticker: str) -> None:
@@ -69,7 +31,7 @@ def _maybe_upsert_event(conn, client, event_ticker: str | None) -> None:
         try:
             event = _fetch_event(client, event_ticker)
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            status = _extract_http_status(exc)
+            status = extract_http_status(exc)
             if status != 404:
                 raise
     if event:
@@ -87,7 +49,7 @@ def _extract_market_payload(response: Any) -> dict[str, Any] | None:
         market = response.market
     else:
         market = response
-    return _coerce_payload(market)
+    return coerce_payload(market)
 
 
 def _extract_event_payload(response: Any) -> dict[str, Any] | None:
@@ -99,7 +61,7 @@ def _extract_event_payload(response: Any) -> dict[str, Any] | None:
         event = response.event
     else:
         event = response
-    return _coerce_payload(event)
+    return coerce_payload(event)
 
 
 def _fetch_market(client, ticker: str) -> dict[str, Any] | None:
@@ -107,7 +69,7 @@ def _fetch_market(client, ticker: str) -> dict[str, Any] | None:
         rest_wait()
         response = client.get_market(ticker)
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        if _extract_http_status(exc) == 429:
+        if extract_http_status(exc) == 429:
             rest_register_rate_limit(exc)
         raise
     return _extract_market_payload(response)
@@ -118,7 +80,7 @@ def _fetch_event(client, event_ticker: str) -> dict[str, Any] | None:
         rest_wait()
         response = client.get_event(event_ticker)
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        if _extract_http_status(exc) == 429:
+        if extract_http_status(exc) == 429:
             rest_register_rate_limit(exc)
         raise
     return _extract_event_payload(response)
@@ -132,7 +94,7 @@ def discover_market(conn, client, ticker: str) -> int:
     try:
         market = _fetch_market(client, ticker)
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        status = _extract_http_status(exc)
+        status = extract_http_status(exc)
         if status != 404:
             raise
         market = None
