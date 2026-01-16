@@ -9,6 +9,7 @@ import json
 import logging
 import queue
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
@@ -17,7 +18,8 @@ from src.core.guardrails import assert_service_role
 from src.core.loop_utils import log_metric as _log_metric
 from src.core.number_utils import coerce_int as _coerce_int
 from src.core.env_utils import env_int
-from src.db.db import load_active_tickers_shard, set_state
+from src.db.db import set_state
+from src.db.tickers import load_active_tickers_shard
 from src.ingest.ws.ws_ingest_config import (
     _DEFAULT_WS_PATH,
     _bool_env,
@@ -60,18 +62,24 @@ from src.ingest.ws.ws_ingest_subscriptions import (
     _register_subscription_sid,
     _refresh_subscriptions,
 )
+from src.ingest.ws.ws_ingest_backpressure import (
+    QueueBackpressureState,
+    enqueue_ws_item,
+    load_backpressure_state,
+    reset_backpressure_override,
+)
 from src.ingest.ws.ws_ingest_writer import (
     _DB_WORK_LIFECYCLE,
     _DB_WORK_STOP,
     _DB_WORK_TICK,
     _db_writer_loop,
-    _queue_put_nowait,
     _update_market_id_map,
     writer_is_healthy,
 )
 
 
 logger = logging.getLogger(__name__)
+
 
 @lru_cache(maxsize=1)
 def _load_orjson():
@@ -223,6 +231,7 @@ async def _run_ws_connection(
     ws_lib,
     context: WsSessionContext,
     state: WsLoopState,
+    backpressure: QueueBackpressureState | None,
 ) -> None:
     headers = _build_ws_headers(
         context.api_key_id,
@@ -244,37 +253,71 @@ async def _run_ws_connection(
             errors_total=state.error_total,
         )
         subscription_context = await _build_subscription_context(websocket, context)
+        task_context = WsTaskContext(
+            work_queue=context.work_queue,
+            market_id_map=context.market_id_map,
+            refresh_seconds=context.config.runtime.refresh_seconds,
+            backpressure=backpressure,
+        )
         await _run_ws_tasks(
             websocket,
             subscription_context,
-            context.work_queue,
-            context.market_id_map,
-            context.config.runtime.refresh_seconds,
+            task_context,
         )
+
+
+@dataclass(frozen=True)
+class WsTaskContext:
+    """Parameters shared across WS listener/refresher tasks."""
+
+    work_queue: queue.Queue
+    market_id_map: dict[str, str]
+    refresh_seconds: int
+    backpressure: QueueBackpressureState | None
+
+
+@dataclass(frozen=True)
+class WsMessageContext:
+    """Context shared while handling WS messages."""
+
+    work_queue: queue.Queue
+    market_id_map: dict[str, str]
+    subscription_state: SubscriptionState | None
+    subscription_config: SubscriptionConfig | None
+    backpressure: QueueBackpressureState | None
 
 
 async def _run_ws_tasks(
     websocket,
     subscription_context: SubscriptionContext,
-    work_queue: queue.Queue,
-    market_id_map: dict[str, str],
-    refresh_seconds: int,
+    task_context: WsTaskContext,
 ) -> None:
     heartbeat_seconds = env_int("WS_HEARTBEAT_SECONDS", 60, minimum=0)
+    message_context = WsMessageContext(
+        work_queue=task_context.work_queue,
+        market_id_map=task_context.market_id_map,
+        subscription_state=subscription_context.state,
+        subscription_config=subscription_context.config,
+        backpressure=task_context.backpressure,
+    )
     listener = asyncio.create_task(
         _listen_loop(
             websocket,
-            work_queue,
-            market_id_map,
-            subscription_context.state,
-            subscription_context.config,
+            message_context,
         )
     )
+    wake_event = None
+    if (
+        task_context.backpressure is not None
+        and task_context.backpressure.config.mode == "resubscribe"
+    ):
+        wake_event = task_context.backpressure.resubscribe_event
     refresher = asyncio.create_task(
         _refresh_subscriptions(
             websocket,
             subscription_context,
-            refresh_seconds,
+            task_context.refresh_seconds,
+            wake_event,
         )
     )
     heartbeat = None
@@ -282,10 +325,10 @@ async def _run_ws_tasks(
         heartbeat = asyncio.create_task(
             _heartbeat_loop(
                 subscription_context,
-                work_queue,
-                market_id_map,
+                task_context.work_queue,
+                task_context.market_id_map,
                 heartbeat_seconds,
-                refresh_seconds,
+                task_context.refresh_seconds,
             )
         )
     done, pending = await asyncio.wait(
@@ -305,6 +348,131 @@ async def _run_ws_tasks(
             raise exc
 
 
+@dataclass(frozen=True)
+class HeartbeatMetrics:
+    """Snapshot of subscription metrics for heartbeat reporting."""
+
+    subscribed: int
+    sid_count: int
+    pending_subs: int
+    pending_updates: int
+
+
+@dataclass(frozen=True)
+class HeartbeatContext:
+    """Derived heartbeat values for metrics/log payloads."""
+
+    active_count: int | None
+    missing: int | None
+    stale_window: int
+    stale_count: int | None
+    work_queue: queue.Queue
+    market_id_map: dict[str, str]
+
+
+def _load_active_tickers_for_heartbeat(
+    subscription_context: SubscriptionContext,
+) -> tuple[list[str] | None, int | None]:
+    try:
+        active = load_active_tickers_shard(
+            subscription_context.conn,
+            subscription_context.config.max_active_tickers,
+            subscription_context.config.shard.count,
+            subscription_context.config.shard.shard_id,
+            shard_key=subscription_context.config.shard.key,
+            round_robin=subscription_context.config.shard.round_robin,
+            round_robin_step=subscription_context.config.shard.round_robin_step,
+        )
+        return active, len(active)
+    except (PsycopgError, ValueError, TypeError, RuntimeError):
+        return None, None
+
+
+def _compute_stale_tick_count(
+    conn,
+    active: list[str] | None,
+    stale_window: int,
+) -> int | None:
+    if not active or stale_window <= 0:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM unnest(%s::text[]) AS a(ticker)
+                LEFT JOIN LATERAL (
+                  SELECT ts
+                  FROM market_ticks mt
+                  WHERE mt.ticker = a.ticker
+                  ORDER BY mt.ts DESC
+                  LIMIT 1
+                ) mt ON TRUE
+                WHERE mt.ts IS NULL
+                   OR mt.ts < NOW() - (%s * INTERVAL '1 second')
+                """,
+                (active, stale_window),
+            )
+            return int(cur.fetchone()[0] or 0)
+    except (PsycopgError, ValueError, TypeError, RuntimeError):
+        return None
+
+
+async def _snapshot_subscription_metrics(state: SubscriptionState) -> HeartbeatMetrics:
+    async with state.lock:
+        return HeartbeatMetrics(
+            subscribed=len(state.subscribed),
+            sid_count=len(state.sid_tickers),
+            pending_subs=sum(len(tickers) for tickers in state.pending_subscriptions.values()),
+            pending_updates=len(state.pending_updates),
+        )
+
+
+def _build_heartbeat_payload(
+    metrics: HeartbeatMetrics,
+    context: HeartbeatContext,
+) -> dict[str, Any]:
+    return {
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "subscribed": metrics.subscribed,
+        "active_tickers": context.active_count,
+        "missing_subscriptions": context.missing,
+        "subscription_ids": metrics.sid_count,
+        "pending_subscriptions": metrics.pending_subs,
+        "pending_updates": metrics.pending_updates,
+        "queue_size": context.work_queue.qsize(),
+        "queue_max": context.work_queue.maxsize,
+        "market_id_map": len(context.market_id_map),
+        "stale_tick_window_s": context.stale_window,
+        "stale_tick_count": context.stale_count,
+    }
+
+
+def _log_heartbeat_metrics(
+    metrics: HeartbeatMetrics | None,
+    context: HeartbeatContext,
+) -> None:
+    payload = {
+        "active_tickers": context.active_count,
+        "stale_tick_window_s": context.stale_window,
+        "stale_tick_count": context.stale_count,
+        "queue_size": context.work_queue.qsize(),
+        "queue_max": context.work_queue.maxsize,
+        "market_id_map": len(context.market_id_map),
+    }
+    if metrics is not None:
+        payload.update(
+            {
+                "subscribed": metrics.subscribed,
+                "missing_subscriptions": context.missing,
+                "subscription_ids": metrics.sid_count,
+                "pending_subscriptions": metrics.pending_subs,
+                "pending_updates": metrics.pending_updates,
+            }
+        )
+    _log_metric(logger, "ws.heartbeat", **payload)
+
+
 async def _heartbeat_loop(
     subscription_context: SubscriptionContext,
     work_queue: queue.Queue,
@@ -318,111 +486,50 @@ async def _heartbeat_loop(
         except asyncio.CancelledError:
             break
         state = subscription_context.state
-        active = None
-        active_count = None
-        missing = None
-        try:
-            active = load_active_tickers_shard(
-                subscription_context.conn,
-                subscription_context.config.max_active_tickers,
-                subscription_context.config.shard.count,
-                subscription_context.config.shard.shard_id,
-                shard_key=subscription_context.config.shard.key,
-                round_robin=subscription_context.config.shard.round_robin,
-                round_robin_step=subscription_context.config.shard.round_robin_step,
-            )
-            active_count = len(active)
-        except Exception:  # pylint: disable=broad-exception-caught
-            active = None
-            active_count = None
-
+        active, active_count = _load_active_tickers_for_heartbeat(subscription_context)
         stale_window = env_int(
             "WS_TICK_STALE_SECONDS",
             stale_window_seconds,
             minimum=0,
         )
-        stale_count = None
-        if active and stale_window > 0:
-            try:
-                with subscription_context.conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM unnest(%s::text[]) AS a(ticker)
-                        LEFT JOIN LATERAL (
-                          SELECT ts
-                          FROM market_ticks mt
-                          WHERE mt.ticker = a.ticker
-                          ORDER BY mt.ts DESC
-                          LIMIT 1
-                        ) mt ON TRUE
-                        WHERE mt.ts IS NULL
-                           OR mt.ts < NOW() - (%s * INTERVAL '1 second')
-                        """,
-                        (active, stale_window),
-                    )
-                    stale_count = int(cur.fetchone()[0] or 0)
-            except Exception:  # pylint: disable=broad-exception-caught
-                stale_count = None
-
-        if state is None:
-            _log_metric(
-                logger,
-                "ws.heartbeat",
-                active_tickers=active_count,
-                stale_tick_window_s=stale_window,
-                stale_tick_count=stale_count,
-                queue_size=work_queue.qsize(),
-                queue_max=work_queue.maxsize,
-                market_id_map=len(market_id_map),
-            )
-            continue
-        async with state.lock:
-            subscribed = len(state.subscribed)
-            sid_count = len(state.sid_tickers)
-            pending_subs = sum(
-                len(tickers) for tickers in state.pending_subscriptions.values()
-            )
-            pending_updates = len(state.pending_updates)
-        if active_count is not None:
-            missing = max(0, active_count - (subscribed + pending_subs))
-        heartbeat_payload = {
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
-            "subscribed": subscribed,
-            "active_tickers": active_count,
-            "missing_subscriptions": missing,
-            "subscription_ids": sid_count,
-            "pending_subscriptions": pending_subs,
-            "pending_updates": pending_updates,
-            "queue_size": work_queue.qsize(),
-            "queue_max": work_queue.maxsize,
-            "market_id_map": len(market_id_map),
-            "stale_tick_window_s": stale_window,
-            "stale_tick_count": stale_count,
-        }
-        _record_ws_heartbeat(subscription_context.conn, heartbeat_payload)
-        _log_metric(
-            logger,
-            "ws.heartbeat",
-            subscribed=subscribed,
-            active_tickers=active_count,
-            missing_subscriptions=missing,
-            subscription_ids=sid_count,
-            pending_subscriptions=pending_subs,
-            pending_updates=pending_updates,
-            stale_tick_window_s=stale_window,
-            stale_tick_count=stale_count,
-            queue_size=work_queue.qsize(),
-            queue_max=work_queue.maxsize,
-            market_id_map=len(market_id_map),
+        stale_count = _compute_stale_tick_count(
+            subscription_context.conn,
+            active,
+            stale_window,
         )
+        context = HeartbeatContext(
+            active_count=active_count,
+            missing=None,
+            stale_window=stale_window,
+            stale_count=stale_count,
+            work_queue=work_queue,
+            market_id_map=market_id_map,
+        )
+        if state is None:
+            _log_heartbeat_metrics(metrics=None, context=context)
+            continue
+        metrics = await _snapshot_subscription_metrics(state)
+        missing = None
+        if active_count is not None:
+            missing = max(0, active_count - (metrics.subscribed + metrics.pending_subs))
+        context = HeartbeatContext(
+            active_count=active_count,
+            missing=missing,
+            stale_window=stale_window,
+            stale_count=stale_count,
+            work_queue=work_queue,
+            market_id_map=market_id_map,
+        )
+        heartbeat_payload = _build_heartbeat_payload(metrics, context)
+        _record_ws_heartbeat(subscription_context.conn, heartbeat_payload)
+        _log_heartbeat_metrics(metrics, context)
         if missing:
             logger.warning(
                 "ws heartbeat: missing subscriptions=%d active=%s subscribed=%d pending=%d",
                 missing,
                 active_count,
-                subscribed,
-                pending_subs,
+                metrics.subscribed,
+                metrics.pending_subs,
             )
 
 
@@ -530,44 +637,41 @@ async def _handle_update_ack(
 async def _handle_ticker_payload(
     message: dict,
     payload: dict,
-    work_queue: queue.Queue,
-    market_id_map: dict[str, str],
-    subscription_state: SubscriptionState | None,
+    context: WsMessageContext,
 ) -> None:
-    tick = _normalize_tick(payload, market_id_map)
+    tick = _normalize_tick(payload, context.market_id_map)
     if tick is None:
         return
-    if subscription_state is not None:
+    if context.subscription_state is not None:
         sid = _coerce_int(message.get("sid"))
         if sid is not None:
             await _record_subscription_ticker(
-                subscription_state,
+                context.subscription_state,
                 sid,
                 tick.get("ticker"),
             )
-    _queue_put_nowait(
-        work_queue,
+    await enqueue_ws_item(
+        context.work_queue,
         (_DB_WORK_TICK, tick, None, None),
         "tick",
+        context.backpressure,
     )
 
 
 async def _handle_lifecycle_payload(
     message: dict,
     payload: dict,
-    work_queue: queue.Queue,
-    market_id_map: dict[str, str],
-    subscription_state: SubscriptionState | None,
+    context: WsMessageContext,
 ) -> None:
-    _update_market_id_map(payload, market_id_map)
+    _update_market_id_map(payload, context.market_id_map)
     lifecycle = _normalize_lifecycle(payload)
     if lifecycle is None:
         return
-    if subscription_state is not None:
+    if context.subscription_state is not None:
         sid = _coerce_int(message.get("sid"))
         if sid is not None:
             await _record_subscription_ticker(
-                subscription_state,
+                context.subscription_state,
                 sid,
                 lifecycle.get("market_ticker"),
             )
@@ -575,18 +679,17 @@ async def _handle_lifecycle_payload(
     delete_ticker = None
     if _is_terminal_lifecycle(lifecycle.get("event_type")):
         delete_ticker = lifecycle.get("market_ticker")
-    _queue_put_nowait(
-        work_queue,
+    await enqueue_ws_item(
+        context.work_queue,
         (_DB_WORK_LIFECYCLE, lifecycle, market, delete_ticker),
         "lifecycle",
+        context.backpressure,
     )
 
 
 async def _handle_channel_payload(
     message: dict,
-    work_queue: queue.Queue,
-    market_id_map: dict[str, str],
-    subscription_state: SubscriptionState | None,
+    context: WsMessageContext,
 ) -> None:
     channel = _extract_channel(message)
     payload = _extract_payload(message)
@@ -594,48 +697,191 @@ async def _handle_channel_payload(
         await _handle_ticker_payload(
             message,
             payload,
-            work_queue,
-            market_id_map,
-            subscription_state,
+            context,
         )
     elif channel == "market_lifecycle_v2":
         await _handle_lifecycle_payload(
             message,
             payload,
-            work_queue,
-            market_id_map,
-            subscription_state,
+            context,
         )
 
 
 async def _listen_loop(
     websocket,
-    work_queue: queue.Queue,
-    market_id_map: dict[str, str],
-    subscription_state: SubscriptionState | None = None,
-    subscription_config: SubscriptionConfig | None = None,
+    context: WsMessageContext,
 ) -> None:
     """Receive and persist WS messages."""
     async for raw in websocket:
         message = _decode_ws_message(raw)
         if message is None:
             continue
-        if await _handle_subscription_ack(message, subscription_state):
+        if await _handle_subscription_ack(message, context.subscription_state):
             continue
         if await _handle_error_message(
             websocket,
             message,
-            subscription_state,
-            subscription_config,
+            context.subscription_state,
+            context.subscription_config,
         ):
             continue
-        await _handle_update_ack(message, subscription_state)
-        await _handle_channel_payload(
-            message,
-            work_queue,
-            market_id_map,
-            subscription_state,
+        await _handle_update_ack(message, context.subscription_state)
+        await _handle_channel_payload(message, context)
+
+
+@dataclass(frozen=True)
+class WsRuntime:
+    """Runtime wiring for websocket ingestion connections."""
+
+    config: WsLoopConfig
+    backpressure: QueueBackpressureState
+    session_context: WsSessionContext
+    writer: "WsWriterRuntime"
+    connection: "WsConnectionRuntime"
+
+
+@dataclass(frozen=True)
+class WsWriterRuntime:
+    """Writer thread handles for the WS runtime."""
+
+    writer_ref: dict[str, WriterState]
+    monitor_task: asyncio.Task
+
+
+@dataclass(frozen=True)
+class WsConnectionRuntime:
+    """Websocket library and error metadata."""
+
+    ws_lib: Any
+    ws_errors: tuple[type[BaseException], ...]
+    ws_expected_errors: tuple[type[BaseException], ...]
+
+
+def _build_ws_runtime(
+    conn,
+    api_key_id: str,
+    private_key_pem: str,
+    options: WsLoopOptions | None,
+    **kwargs: Any,
+) -> WsRuntime:
+    options = _resolve_ws_loop_options(options, **kwargs)
+    config = _build_ws_loop_config(conn, options)
+    backpressure = load_backpressure_state(config)
+    writer_state = _start_db_writer(config)
+    writer_ref = {"state": writer_state}
+    monitor_task = asyncio.create_task(_monitor_writer_loop(writer_ref, config))
+    writer_runtime = WsWriterRuntime(
+        writer_ref=writer_ref,
+        monitor_task=monitor_task,
+    )
+    ws_lib = _load_websockets()
+    connection_runtime = WsConnectionRuntime(
+        ws_lib=ws_lib,
+        ws_errors=_ws_error_types(ws_lib),
+        ws_expected_errors=_ws_expected_error_types(ws_lib),
+    )
+    session_context = WsSessionContext(
+        conn=conn,
+        work_queue=writer_state.work_queue,
+        market_id_map={},
+        config=config,
+        api_key_id=api_key_id,
+        private_key_pem=private_key_pem,
+    )
+    return WsRuntime(
+        config=config,
+        backpressure=backpressure,
+        session_context=session_context,
+        writer=writer_runtime,
+        connection=connection_runtime,
+    )
+
+
+async def _shutdown_ws_runtime(runtime: WsRuntime) -> None:
+    runtime.writer.monitor_task.cancel()
+    await asyncio.gather(runtime.writer.monitor_task, return_exceptions=True)
+    current_writer = runtime.writer.writer_ref["state"]
+    current_writer.stop_event.set()
+    try:
+        current_writer.work_queue.put_nowait(_DB_WORK_STOP)
+    except queue.Full:
+        pass
+    current_writer.thread.join(timeout=5)
+    reset_backpressure_override(runtime.backpressure)
+
+
+async def _sleep_ws_backoff(state: WsLoopState, config: WsLoopConfig) -> None:
+    if state.consecutive_failures >= config.failure.threshold:
+        logger.warning(
+            "WS circuit open failures=%d cooldown_s=%.1f",
+            state.consecutive_failures,
+            config.failure.cooldown,
         )
+        await asyncio.sleep(config.failure.cooldown)
+        state.consecutive_failures = 0
+        state.backoff = 1
+        return
+    await asyncio.sleep(state.backoff)
+    state.backoff = min(state.backoff * 2, 60)
+
+
+async def _handle_ws_expected_disconnect(
+    state: WsLoopState,
+    config: WsLoopConfig,
+    exc: BaseException,
+) -> None:
+    state.error_total += 1
+    state.consecutive_failures += 1
+    logger.warning("WS disconnected; reconnecting soon: %s", exc)
+    _log_metric(
+        logger,
+        "ws.reconnect",
+        errors_total=state.error_total,
+        consecutive_failures=state.consecutive_failures,
+        backoff_s=state.backoff,
+    )
+    await _sleep_ws_backoff(state, config)
+
+
+async def _handle_ws_error(state: WsLoopState, config: WsLoopConfig) -> None:
+    state.error_total += 1
+    state.consecutive_failures += 1
+    logger.exception("WS loop error; reconnecting")
+    _log_metric(
+        logger,
+        "ws.reconnect",
+        errors_total=state.error_total,
+        consecutive_failures=state.consecutive_failures,
+        backoff_s=state.backoff,
+    )
+    await _sleep_ws_backoff(state, config)
+
+
+async def _handle_ws_fatal_error(state: WsLoopState, exc: BaseException) -> None:
+    state.error_total += 1
+    state.consecutive_failures += 1
+    logger.exception("WS fatal error; restarting loop: %s", exc)
+    await asyncio.sleep(5)
+
+
+async def _run_ws_forever(runtime: WsRuntime, state: WsLoopState) -> None:
+    fatal_errors = (TypeError, AttributeError, KeyError)
+    while True:
+        try:
+            await _run_ws_connection(
+                runtime.connection.ws_lib,
+                runtime.session_context,
+                state,
+                runtime.backpressure,
+            )
+        except asyncio.CancelledError:
+            raise
+        except runtime.connection.ws_expected_errors as exc:
+            await _handle_ws_expected_disconnect(state, runtime.config, exc)
+        except runtime.connection.ws_errors:
+            await _handle_ws_error(state, runtime.config)
+        except fatal_errors as exc:
+            await _handle_ws_fatal_error(state, exc)
 
 
 async def ws_loop(
@@ -666,85 +912,9 @@ async def ws_loop(
         while True:
             await asyncio.sleep(3600)
 
-    options = _resolve_ws_loop_options(options, **kwargs)
-    config = _build_ws_loop_config(conn, options)
-    writer_state = _start_db_writer(config)
-    writer_ref = {"state": writer_state}
-    monitor_task = asyncio.create_task(_monitor_writer_loop(writer_ref, config))
+    runtime = _build_ws_runtime(conn, api_key_id, private_key_pem, options, **kwargs)
     state = WsLoopState()
-    ws_lib = _load_websockets()
-    ws_errors = _ws_error_types(ws_lib)
-    ws_expected_errors = _ws_expected_error_types(ws_lib)
-    session_context = WsSessionContext(
-        conn=conn,
-        work_queue=writer_state.work_queue,
-        market_id_map={},
-        config=config,
-        api_key_id=api_key_id,
-        private_key_pem=private_key_pem,
-    )
     try:
-        while True:
-            try:
-                await _run_ws_connection(ws_lib, session_context, state)
-            except ws_expected_errors as exc:
-                state.error_total += 1
-                state.consecutive_failures += 1
-                logger.warning("WS disconnected; reconnecting soon: %s", exc)
-                _log_metric(
-                    logger,
-                    "ws.reconnect",
-                    errors_total=state.error_total,
-                    consecutive_failures=state.consecutive_failures,
-                    backoff_s=state.backoff,
-                )
-                if state.consecutive_failures >= config.failure.threshold:
-                    logger.warning(
-                        "WS circuit open failures=%d cooldown_s=%.1f",
-                        state.consecutive_failures,
-                        config.failure.cooldown,
-                    )
-                    await asyncio.sleep(config.failure.cooldown)
-                    state.consecutive_failures = 0
-                    state.backoff = 1
-                    continue
-                await asyncio.sleep(state.backoff)
-                state.backoff = min(state.backoff * 2, 60)
-            except ws_errors:
-                state.error_total += 1
-                state.consecutive_failures += 1
-                logger.exception("WS loop error; reconnecting")
-                _log_metric(
-                    logger,
-                    "ws.reconnect",
-                    errors_total=state.error_total,
-                    consecutive_failures=state.consecutive_failures,
-                    backoff_s=state.backoff,
-                )
-                if state.consecutive_failures >= config.failure.threshold:
-                    logger.warning(
-                        "WS circuit open failures=%d cooldown_s=%.1f",
-                        state.consecutive_failures,
-                        config.failure.cooldown,
-                    )
-                    await asyncio.sleep(config.failure.cooldown)
-                    state.consecutive_failures = 0
-                    state.backoff = 1
-                    continue
-                await asyncio.sleep(state.backoff)
-                state.backoff = min(state.backoff * 2, 60)
-            except Exception:  # pylint: disable=broad-exception-caught
-                state.error_total += 1
-                state.consecutive_failures += 1
-                logger.exception("WS fatal error; restarting loop")
-                await asyncio.sleep(5)
+        await _run_ws_forever(runtime, state)
     finally:
-        monitor_task.cancel()
-        await asyncio.gather(monitor_task, return_exceptions=True)
-        current_writer = writer_ref["state"]
-        current_writer.stop_event.set()
-        try:
-            current_writer.work_queue.put_nowait(_DB_WORK_STOP)
-        except queue.Full:
-            pass
-        current_writer.thread.join(timeout=5)
+        await _shutdown_ws_runtime(runtime)

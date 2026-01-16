@@ -11,42 +11,71 @@ from src.kalshi.kalshi_sdk import rest_register_rate_limit, rest_wait
 logger = logging.getLogger(__name__)
 
 
+def _coerce_status_value(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _extract_http_status(exc: Exception) -> int | None:
-    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
-    if status is not None:
-        try:
-            return int(status)
-        except (TypeError, ValueError):
-            return None
-    http_resp = getattr(exc, "http_resp", None)
-    if http_resp is not None:
-        status = getattr(http_resp, "status", None) or getattr(http_resp, "status_code", None)
-        if status is not None:
-            try:
-                return int(status)
-            except (TypeError, ValueError):
-                return None
-    return None
+    status = _coerce_status_value(
+        getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    )
+    if status is None:
+        http_resp = getattr(exc, "http_resp", None)
+        status = _coerce_status_value(
+            getattr(http_resp, "status", None)
+            or getattr(http_resp, "status_code", None)
+        )
+    return status
 
 
 def _coerce_payload(value: Any) -> dict[str, Any] | None:
+    payload = None
     if value is None:
-        return None
-    if isinstance(value, dict):
-        return value
-    if hasattr(value, "model_dump"):
+        payload = None
+    elif isinstance(value, dict):
+        payload = value
+    elif hasattr(value, "model_dump"):
         try:
-            return value.model_dump(mode="json")
+            payload = value.model_dump(mode="json")
         except TypeError:
-            return value.model_dump()
-    if hasattr(value, "dict"):
+            payload = value.model_dump()
+    elif hasattr(value, "dict"):
         try:
-            return value.dict()
+            payload = value.dict()
         except TypeError:
-            return value.dict
-    if hasattr(value, "__dict__"):
-        return dict(value.__dict__)
-    return None
+            payload = value.dict
+    elif hasattr(value, "__dict__"):
+        payload = dict(value.__dict__)
+    return payload
+
+
+def _log_missing_market(status: int | None, ticker: str) -> None:
+    if status == 404:
+        logger.warning("discover_market: market not found ticker=%s", ticker)
+    else:
+        logger.warning("discover_market: market payload missing ticker=%s", ticker)
+
+
+def _maybe_upsert_event(conn, client, event_ticker: str | None) -> None:
+    if not event_ticker:
+        return
+    event = None
+    if hasattr(client, "get_event"):
+        try:
+            event = _fetch_event(client, event_ticker)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            status = _extract_http_status(exc)
+            if status != 404:
+                raise
+    if event:
+        upsert_event(conn, event)
+    else:
+        upsert_event(conn, {"event_ticker": event_ticker})
 
 
 def _extract_market_payload(response: Any) -> dict[str, Any] | None:
@@ -99,32 +128,21 @@ def discover_market(conn, client, ticker: str) -> int:
     """Fetch a market/event via REST and upsert metadata rows."""
     if not ticker:
         raise ValueError("discover_market requires a market ticker")
+    status = None
     try:
         market = _fetch_market(client, ticker)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         status = _extract_http_status(exc)
-        if status == 404:
-            logger.warning("discover_market: market not found ticker=%s", ticker)
-            return 0
-        raise
+        if status != 404:
+            raise
+        market = None
+
+    result = 0
     if not market:
-        logger.warning("discover_market: market payload missing ticker=%s", ticker)
-        return 0
+        _log_missing_market(status, ticker)
+    else:
+        _maybe_upsert_event(conn, client, market.get("event_ticker"))
+        upsert_market(conn, market)
+        result = 1
 
-    event_ticker = market.get("event_ticker")
-    if event_ticker:
-        event = None
-        if hasattr(client, "get_event"):
-            try:
-                event = _fetch_event(client, event_ticker)
-            except Exception as exc:  # pylint: disable=broad-exception-caught
-                status = _extract_http_status(exc)
-                if status != 404:
-                    raise
-        if event:
-            upsert_event(conn, event)
-        else:
-            upsert_event(conn, {"event_ticker": event_ticker})
-
-    upsert_market(conn, market)
-    return 1
+    return result

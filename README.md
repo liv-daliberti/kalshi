@@ -314,6 +314,7 @@ can store embeddings or text chunks), plus event + market metadata from the DB.
 
 Service contracts and ownership rules:
 
+- System diagram: `docs/system_diagram.md`
 - `docs/contracts.md`
 - `docs/operations.md`
 - `docs/service_registry.md`

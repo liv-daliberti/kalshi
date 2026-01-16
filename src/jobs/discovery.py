@@ -17,12 +17,14 @@ from src.db.db import (
     get_event_updated_at,
     get_market_updated_at,
     get_state,
+    maybe_upsert_active_market_from_market,
     parse_ts_iso,
+    seed_active_markets_from_markets,
     set_state,
-    upsert_active_market,
     upsert_event,
     upsert_market,
 )
+from src.db.tickers import load_active_tickers
 from src.core.env_utils import env_int
 from src.core.guardrails import assert_service_role
 from src.core.loop_utils import log_metric as _log_metric
@@ -208,23 +210,6 @@ def _should_skip_market(
     return db_updated is not None and db_updated <= last_discovery_dt
 
 
-def _market_is_active(market: dict) -> tuple[bool, str]:
-    """Determine whether a market should be considered active."""
-    market_status = (market.get("status") or "").lower()
-    if market_status in {"open", "paused", "active"}:
-        return True, market_status
-    if market_status:
-        return False, market_status
-    open_time = parse_ts_iso(market.get("open_time"))
-    close_time = parse_ts_iso(market.get("close_time"))
-    now = datetime.now(timezone.utc)
-    is_active = (
-        (open_time is None or open_time <= now)
-        and (close_time is None or close_time > now)
-    )
-    return is_active, market_status
-
-
 def _process_market(
     conn: psycopg.Connection,
     market: dict,
@@ -234,17 +219,8 @@ def _process_market(
     if _should_skip_market(conn, market, last_discovery_dt):
         return 0, 0
     upsert_market(conn, market)
-    is_active, market_status = _market_is_active(market)
-    if is_active:
-        upsert_active_market(
-            conn,
-            ticker=market["ticker"],
-            event_ticker=market["event_ticker"],
-            close_time=parse_ts_iso(market.get("close_time")),
-            status=market.get("status") or market_status,
-        )
-        return 1, 1
-    return 1, 0
+    active = maybe_upsert_active_market_from_market(conn, market)
+    return 1, 1 if active else 0
 
 
 def _process_event(
@@ -420,6 +396,22 @@ def discovery_pass(
     :rtype: tuple[int, int, int]
     """
     assert_service_role("rest", "discovery_pass")
+    try:
+        existing_active = load_active_tickers(conn, 1)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception("load_active_tickers failed before discovery pass")
+        existing_active = []
+    if not existing_active:
+        try:
+            seeded = seed_active_markets_from_markets(conn)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception("seed_active_markets_from_markets failed")
+        else:
+            if seeded:
+                logger.info(
+                    "discovery_pass: seeded active_markets from markets rows=%d",
+                    seeded,
+                )
     statuses = event_statuses or ("active",)
     context = _build_discovery_context(conn, client, strike_periods)
     counts = _run_discovery(context, statuses)

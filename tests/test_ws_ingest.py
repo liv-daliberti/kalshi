@@ -916,7 +916,7 @@ class TestWsIngestAsync(unittest.IsolatedAsyncioTestCase):
         self.assertIn("additional_headers", sent_kwargs)
         self.assertIsNotNone(sent_kwargs.get("max_queue"))
         self.assertIsNotNone(sent_kwargs.get("max_size"))
-        self.assertEqual(len(thread_holder["thread"].args), 3)
+        self.assertEqual(len(thread_holder["thread"].args), 5)
 
     async def test_ws_loop_subscribe_defaults_and_extra_headers(self) -> None:
         conn = FakeConn("db")

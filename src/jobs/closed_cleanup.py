@@ -19,7 +19,12 @@ from src.jobs.backfill import (
     _market_time_window,
 )
 from src.jobs.backfill_config import BackfillConfig
-from src.db.db import cleanup_active_markets, upsert_event, upsert_market
+from src.db.db import (
+    cleanup_active_markets,
+    maybe_upsert_active_market_from_market,
+    upsert_event,
+    upsert_market,
+)
 from src.core.env_utils import _env_float
 from src.kalshi.kalshi_sdk import get_market_candlesticks, iter_events
 from src.core.logging_utils import configure_logging as configure_service_logging, parse_log_level
@@ -453,6 +458,7 @@ def _refresh_settlements_for_status(
             ticker = market.get("ticker")
             if ticker in context.missing_settlement:
                 upsert_market(conn, market)
+                maybe_upsert_active_market_from_market(conn, market)
                 markets_updated += 1
                 context.missing_settlement.pop(ticker, None)
         if not context.missing_settlement:

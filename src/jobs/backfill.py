@@ -12,7 +12,15 @@ from typing import Iterator, Optional
 import psycopg  # pylint: disable=import-error
 
 from src.jobs.backfill_config import BackfillConfig
-from src.db.db import dec, get_state, parse_ts_iso, set_state, upsert_event, upsert_market
+from src.db.db import (
+    dec,
+    get_state,
+    maybe_upsert_active_market_from_market,
+    parse_ts_iso,
+    set_state,
+    upsert_event,
+    upsert_market,
+)
 from src.jobs.event_filter import EventScanStats, accept_event
 from src.core.guardrails import assert_service_role
 from src.core.loop_utils import log_metric as _log_metric
@@ -677,6 +685,7 @@ def _backfill_event(
     for market in (event.get("markets") or []):
         try:
             upsert_market(conn, market)
+            maybe_upsert_active_market_from_market(conn, market)
         except Exception:  # pylint: disable=broad-exception-caught
             logger.exception(
                 "backfill_pass: market upsert failed event=%s market=%s",

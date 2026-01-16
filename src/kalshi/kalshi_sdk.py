@@ -54,6 +54,47 @@ def rest_backoff_remaining() -> float:
     return _rest_backoff_remaining()
 
 
+def extract_http_status(exc: Exception) -> int | None:
+    """Extract an HTTP status code from an exception when possible."""
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    if status is not None:
+        try:
+            return int(status)
+        except (TypeError, ValueError):
+            return None
+    http_resp = getattr(exc, "http_resp", None)
+    if http_resp is not None:
+        status = getattr(http_resp, "status", None) or getattr(http_resp, "status_code", None)
+        if status is not None:
+            try:
+                return int(status)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def coerce_payload(value: Any) -> dict[str, Any] | None:
+    """Convert SDK payloads into dicts when possible."""
+    payload = None
+    if value is None:
+        payload = None
+    elif isinstance(value, dict):
+        payload = value
+    elif hasattr(value, "model_dump"):
+        try:
+            payload = value.model_dump(mode="json")
+        except TypeError:
+            payload = value.model_dump()
+    elif hasattr(value, "dict"):
+        try:
+            payload = value.dict()
+        except TypeError:
+            payload = value.dict
+    elif hasattr(value, "__dict__"):
+        payload = dict(value.__dict__)
+    return payload
+
+
 def _is_validation_error(exc: Exception) -> bool:
     name = exc.__class__.__name__
     if name != "ValidationError":

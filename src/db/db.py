@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -16,6 +17,13 @@ from src.core.env_utils import _env_bool, _env_int
 from src.core.loop_utils import log_metric as _log_metric
 from src.core.guardrails import assert_state_write_allowed
 
+try:
+    from src.queue.work_queue import enqueue_job
+except ImportError:
+    enqueue_job = None
+    _ENQUEUE_JOB_IMPORT_ERROR = sys.exc_info()
+else:
+    _ENQUEUE_JOB_IMPORT_ERROR = None
 SCHEMA_VERSION = 1
 
 logger = logging.getLogger(__name__)
@@ -426,12 +434,29 @@ def upsert_market(conn: psycopg.Connection, market: dict) -> None:
     conn.commit()
 
 
+def market_is_active(market: dict) -> tuple[bool, str]:
+    """Determine whether a market should be treated as active."""
+    market_status = (market.get("status") or "").lower()
+    if market_status in {"open", "paused", "active"}:
+        return True, market_status
+    if market_status:
+        return False, market_status
+    open_time = parse_ts_iso(market.get("open_time"))
+    close_time = parse_ts_iso(market.get("close_time"))
+    now = datetime.now(timezone.utc)
+    is_active = (
+        (open_time is None or open_time <= now)
+        and (close_time is None or close_time > now)
+    )
+    return is_active, market_status
+
+
 def upsert_active_market(
     conn: psycopg.Connection,
     ticker: str,
     event_ticker: str,
     close_time,
-    status: str,
+    status: str | None,
 ) -> None:
     """Insert or update an active market row.
 
@@ -444,7 +469,7 @@ def upsert_active_market(
     :param close_time: Market close time.
     :type close_time: datetime.datetime | None
     :param status: Market status string.
-    :type status: str
+    :type status: str | None
     """
     sql = """
     INSERT INTO active_markets(ticker, event_ticker, close_time, status, last_seen_ts, updated_at)
@@ -459,6 +484,29 @@ def upsert_active_market(
     with conn.cursor() as cur:
         cur.execute(sql, (ticker, event_ticker, close_time, status))
     conn.commit()
+
+
+def maybe_upsert_active_market_from_market(
+    conn: psycopg.Connection,
+    market: dict,
+) -> bool:
+    """Upsert active market metadata when the market is active."""
+    ticker = market.get("ticker")
+    event_ticker = market.get("event_ticker")
+    if not ticker or not event_ticker:
+        return False
+    is_active, market_status = market_is_active(market)
+    if not is_active:
+        return False
+    status = market.get("status") or market_status or None
+    upsert_active_market(
+        conn,
+        ticker=ticker,
+        event_ticker=event_ticker,
+        close_time=parse_ts_iso(market.get("close_time")),
+        status=status,
+    )
+    return True
 
 
 def delete_active_market(conn: psycopg.Connection, ticker: str) -> None:
@@ -498,189 +546,58 @@ def cleanup_active_markets(conn: psycopg.Connection, grace_minutes: int = 30) ->
     return deleted
 
 
-def _active_tickers_where(
-    shard_count: int,
-    shard_id: int,
-    shard_key: str = "event",
-) -> tuple[str, list]:
-    clauses = [
-        "(close_time IS NULL OR close_time > NOW() - INTERVAL '30 minutes')",
-    ]
-    params: list = []
-    normalized_key = (shard_key or "event").strip().lower()
-    if normalized_key not in {"event", "market"}:
-        raise ValueError(f"Invalid shard_key={shard_key!r}; expected 'event' or 'market'")
-    shard_expr = "coalesce(event_ticker, ticker)" if normalized_key == "event" else "ticker"
-    if shard_count > 1:
-        clauses.append(f"mod(abs(hashtext({shard_expr})), %s) = %s")
-        params.extend([shard_count, shard_id])
-    return "WHERE " + " AND ".join(clauses), params
 
-
-def _active_tickers_count(conn: psycopg.Connection, where_sql: str, params: list) -> int:
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT COUNT(*) FROM active_markets {where_sql}", params)
-        row = cur.fetchone()
-    return int(row[0] or 0)
-
-
-def _load_state_int(conn: psycopg.Connection, key: str, default: int = 0) -> int:
-    raw = get_state(conn, key, str(default)) or str(default)
-    try:
-        return max(0, int(raw))
-    except (TypeError, ValueError):
-        return default
-
-
-def _store_state_int(conn: psycopg.Connection, key: str, value: int) -> None:
-    set_state(conn, key, str(max(0, value)))
-
-
-@dataclass(frozen=True)
-class _ActiveTickerQuery:
-    """Parameters for querying active tickers."""
-
-    where_sql: str
-    params: list
-    limit: int
-
-
-def _load_active_tickers_slice(
+def upsert_active_markets_from_markets(
     conn: psycopg.Connection,
-    where_sql: str,
-    params: list,
-    limit: int | None,
-    offset: int = 0,
-) -> list[str]:
-    sql = f"""
-    SELECT ticker
-    FROM active_markets
-    {where_sql}
-    ORDER BY close_time NULLS LAST, ticker
+    tickers: list[str],
+) -> int:
+    """Populate active_markets rows using data from markets."""
+    if not tickers:
+        return 0
+    sql = """
+    INSERT INTO active_markets(ticker, event_ticker, close_time, status, last_seen_ts, updated_at)
+    SELECT m.ticker, m.event_ticker, m.close_time, NULL, NOW(), NOW()
+    FROM markets m
+    WHERE m.ticker = ANY(%s)
+      AND m.event_ticker IS NOT NULL
+      AND (m.open_time IS NULL OR m.open_time <= NOW())
+      AND (m.close_time IS NULL OR m.close_time > NOW() - INTERVAL '30 minutes')
+    ON CONFLICT (ticker) DO UPDATE SET
+      event_ticker=EXCLUDED.event_ticker,
+      close_time=EXCLUDED.close_time,
+      status=COALESCE(active_markets.status, EXCLUDED.status),
+      last_seen_ts=NOW(),
+      updated_at=NOW()
+    RETURNING ticker
     """
-    use_tuple = not params
-    if limit is not None and limit > 0:
-        sql += " LIMIT %s"
-        params = [*params, limit]
-    if offset > 0:
-        sql += " OFFSET %s"
-        params = [*params, offset]
     with conn.cursor() as cur:
-        exec_params = tuple(params) if use_tuple else params
-        cur.execute(sql, exec_params)
-        return [r[0] for r in cur.fetchall()]
+        cur.execute(sql, (tickers,))
+        rows = cur.fetchall()
+    conn.commit()
+    return len(rows)
 
 
-def _load_active_tickers_round_robin(
-    conn: psycopg.Connection,
-    query: _ActiveTickerQuery,
-    cursor_key: str,
-    step: int | None = None,
-) -> list[str]:
-    if query.limit <= 0:
-        return _load_active_tickers_slice(conn, query.where_sql, query.params, None)
-    advance = step if step is not None and step > 0 else query.limit
-    total = _active_tickers_count(conn, query.where_sql, query.params)
-    if total <= query.limit:
-        return _load_active_tickers_slice(
-            conn,
-            query.where_sql,
-            query.params,
-            query.limit,
-        )
-    cursor = _load_state_int(conn, cursor_key, 0)
-    offset = cursor % total
-    first_count = min(query.limit, total - offset)
-    rows = _load_active_tickers_slice(
-        conn,
-        query.where_sql,
-        query.params,
-        first_count,
-        offset,
-    )
-    if first_count < query.limit:
-        rows.extend(
-            _load_active_tickers_slice(
-                conn,
-                query.where_sql,
-                query.params,
-                query.limit - first_count,
-                0,
-            )
-        )
-    _store_state_int(conn, cursor_key, cursor + advance)
-    return rows
-
-
-def load_active_tickers(
-    conn: psycopg.Connection,
-    limit: int,
-    *,
-    round_robin: bool = False,
-    cursor_key: str | None = None,
-    round_robin_step: int | None = None,
-) -> list[str]:
-    """Load active market tickers ordered by close time.
-
-    :param conn: Open database connection.
-    :type conn: psycopg.Connection
-    :param limit: Maximum number of tickers to return.
-    :type limit: int
-    :param round_robin: Rotate through active tickers when capped.
-    :type round_robin: bool
-    :param cursor_key: ingest_state key for round-robin cursor.
-    :type cursor_key: str | None
-    :return: List of active tickers.
-    :rtype: list[str]
+def seed_active_markets_from_markets(conn: psycopg.Connection) -> int:
+    """Populate active_markets from markets table when active set is empty."""
+    sql = """
+    INSERT INTO active_markets(ticker, event_ticker, close_time, status, last_seen_ts, updated_at)
+    SELECT m.ticker, m.event_ticker, m.close_time, NULL, NOW(), NOW()
+    FROM markets m
+    WHERE m.event_ticker IS NOT NULL
+      AND (m.open_time IS NULL OR m.open_time <= NOW())
+      AND (m.close_time IS NULL OR m.close_time > NOW() - INTERVAL '30 minutes')
+    ON CONFLICT (ticker) DO UPDATE SET
+      event_ticker=EXCLUDED.event_ticker,
+      close_time=EXCLUDED.close_time,
+      status=COALESCE(active_markets.status, EXCLUDED.status),
+      last_seen_ts=NOW(),
+      updated_at=NOW()
     """
-    where_sql, params = _active_tickers_where(1, 0)
-    if round_robin:
-        key = cursor_key or "ws_active_cursor:1:0"
-        return _load_active_tickers_round_robin(
-            conn,
-            _ActiveTickerQuery(where_sql=where_sql, params=params, limit=limit),
-            key,
-            step=round_robin_step,
-        )
-    if limit <= 0:
-        return _load_active_tickers_slice(conn, where_sql, params, None)
-    return _load_active_tickers_slice(conn, where_sql, params, limit)
-
-
-def load_active_tickers_shard(
-    conn: psycopg.Connection,
-    limit: int,
-    shard_count: int,
-    shard_id: int,
-    *,
-    shard_key: str = "event",
-    round_robin: bool = False,
-    cursor_key: str | None = None,
-    round_robin_step: int | None = None,
-) -> list[str]:
-    """Load active market tickers for a shard, grouped by the shard key."""
-    if shard_count <= 1:
-        return load_active_tickers(
-            conn,
-            limit,
-            round_robin=round_robin,
-            cursor_key=cursor_key,
-            round_robin_step=round_robin_step,
-        )
-    if shard_id < 0 or shard_id >= shard_count:
-        raise ValueError(f"Invalid shard id {shard_id} for shard_count {shard_count}")
-    where_sql, params = _active_tickers_where(shard_count, shard_id, shard_key)
-    if round_robin:
-        key = cursor_key or f"ws_active_cursor:{shard_count}:{shard_id}"
-        return _load_active_tickers_round_robin(
-            conn,
-            _ActiveTickerQuery(where_sql=where_sql, params=params, limit=limit),
-            key,
-            step=round_robin_step,
-        )
-    if limit <= 0:
-        return _load_active_tickers_slice(conn, where_sql, params, None)
-    return _load_active_tickers_slice(conn, where_sql, params, limit)
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        inserted = cur.rowcount
+    conn.commit()
+    return inserted
 
 
 def _market_tick_payload(tick: dict) -> dict:
@@ -724,10 +641,14 @@ def _ensure_markets_exist(conn: psycopg.Connection, tickers: set[str]) -> list[s
 def _enqueue_discover_market_jobs(conn: psycopg.Connection, tickers: list[str]) -> None:
     if not tickers:
         return
-    try:
-        from src.queue.work_queue import enqueue_job
-    except Exception:  # pylint: disable=broad-exception-caught
-        logger.exception("discover_market enqueue unavailable")
+    if enqueue_job is None:
+        if _ENQUEUE_JOB_IMPORT_ERROR:
+            logger.error(
+                "discover_market enqueue unavailable",
+                exc_info=_ENQUEUE_JOB_IMPORT_ERROR,
+            )
+        else:
+            logger.error("discover_market enqueue unavailable")
         return
     try:
         for ticker in tickers:

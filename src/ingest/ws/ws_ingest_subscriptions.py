@@ -7,9 +7,11 @@ import itertools
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, Iterable
 
-from src.db.db import load_active_tickers_shard
+from src.db.db import upsert_active_markets_from_markets
+from src.db.tickers import load_active_tickers_shard, load_market_tickers_shard
 from src.core.number_utils import coerce_int as _coerce_int
 from src.ingest.ws.ws_ingest_config import _bool_env
 from src.ingest.ws.ws_ingest_db_utils import _psycopg_error_type
@@ -25,7 +27,89 @@ from src.ingest.ws.ws_ingest_protocol import _build_subscribe_message, _chunked
 
 logger = logging.getLogger(__name__)
 
+_ACTIVE_TICKER_LIMIT_OVERRIDE: int | None = None
+
+
+def set_active_ticker_limit_override(limit: int | None) -> None:
+    """Set an optional override for max active tickers during WS subscriptions."""
+    global _ACTIVE_TICKER_LIMIT_OVERRIDE  # pylint: disable=global-statement
+    if limit is None:
+        _ACTIVE_TICKER_LIMIT_OVERRIDE = None
+        return
+    _ACTIVE_TICKER_LIMIT_OVERRIDE = max(1, int(limit))
+
+
+def _resolve_active_limit(base_limit: int) -> int:
+    limit = base_limit
+    if _ACTIVE_TICKER_LIMIT_OVERRIDE:
+        limit = min(limit, _ACTIVE_TICKER_LIMIT_OVERRIDE)
+    return limit
+
+
+def _load_active_tickers(
+    conn,
+    limit: int,
+    config: SubscriptionConfig | WsLoopConfig,
+) -> list[str] | None:
+    try:
+        return load_active_tickers_shard(
+            conn,
+            limit,
+            config.shard.count,
+            config.shard.shard_id,
+            shard_key=config.shard.key,
+            round_robin=config.shard.round_robin,
+            round_robin_step=config.shard.round_robin_step,
+        )
+    except (_psycopg_error_type(), ValueError, TypeError, RuntimeError):
+        logger.exception("load_active_tickers failed")
+        return None
+
+
+def _load_market_tickers(
+    conn,
+    limit: int,
+    config: SubscriptionConfig | WsLoopConfig,
+) -> list[str] | None:
+    try:
+        return load_market_tickers_shard(
+            conn,
+            limit,
+            config.shard.count,
+            config.shard.shard_id,
+            shard_key=config.shard.key,
+            round_robin=config.shard.round_robin,
+            round_robin_step=config.shard.round_robin_step,
+        )
+    except (_psycopg_error_type(), ValueError, TypeError, RuntimeError):
+        logger.exception("load_market_tickers failed")
+        return None
+
+
+def _seed_active_markets(conn, tickers: list[str]) -> None:
+    if not tickers:
+        return
+    try:
+        seeded = upsert_active_markets_from_markets(conn, tickers)
+    except (_psycopg_error_type(), ValueError, TypeError, RuntimeError):
+        logger.exception("active_markets upsert failed for WS fallback")
+        return
+    if seeded:
+        logger.info("WS fallback seeded active_markets rows=%d", seeded)
+
 _SUBSCRIPTION_ID_FIELDS = ("sid", "subscription_id", "subscriptionId")
+
+
+@dataclass(frozen=True)
+class UpdateMessageRequest:
+    """Input values for update_subscription payloads."""
+
+    request_id: int
+    channels: Iterable[str]
+    add_tickers: list[str]
+    remove_tickers: list[str]
+    subscription_id: int | None = None
+    subscription_id_field: str | None = None
 
 
 def _normalize_subscription_id_field(value: str | None) -> str | None:
@@ -109,42 +193,35 @@ def _fallback_sid_field(current: str | None) -> str | None:
     return None
 
 
-def _build_update_message(
-    request_id: int,
-    channels: Iterable[str],
-    add_tickers: list[str],
-    remove_tickers: list[str],
-    subscription_id: int | None = None,
-    subscription_id_field: str | None = None,
-) -> dict:
+def _build_update_message(request: UpdateMessageRequest) -> dict:
     """Build a subscription update request for the WS API."""
     update_style = os.getenv("KALSHI_WS_UPDATE_STYLE", "markets").strip().lower()
     include_channels = _bool_env("KALSHI_WS_UPDATE_INCLUDE_CHANNELS", False)
     params: dict[str, Any] = {}
     if update_style in {"market_tickers", "tickers", "legacy"}:
         market_tickers: dict[str, list[str]] = {}
-        if add_tickers:
-            market_tickers["add"] = add_tickers
-        if remove_tickers:
-            market_tickers["remove"] = remove_tickers
+        if request.add_tickers:
+            market_tickers["add"] = request.add_tickers
+        if request.remove_tickers:
+            market_tickers["remove"] = request.remove_tickers
         params["market_tickers"] = market_tickers
     else:
-        if add_tickers:
-            params["add_markets"] = add_tickers
-        if remove_tickers:
-            params["delete_markets"] = remove_tickers
+        if request.add_tickers:
+            params["add_markets"] = request.add_tickers
+        if request.remove_tickers:
+            params["delete_markets"] = request.remove_tickers
     if include_channels:
-        params["channels"] = list(channels)
+        params["channels"] = list(request.channels)
     payload = {
-        "id": request_id,
+        "id": request.request_id,
         "cmd": "update_subscription",
         "params": params,
     }
-    if subscription_id is not None:
-        sid_field = _normalize_subscription_id_field(subscription_id_field)
+    if request.subscription_id is not None:
+        sid_field = _normalize_subscription_id_field(request.subscription_id_field)
         if sid_field is None:
             sid_field = _resolve_subscription_id_field_env() or "sid"
-        params[sid_field] = subscription_id
+        params[sid_field] = request.subscription_id
     return payload
 
 
@@ -225,12 +302,16 @@ async def _handle_update_error(
         if sid_field is not None:
             req_id = next(state.request_id)
             msg = _build_update_message(
-                req_id,
-                config.channels,
-                list(pending.tickers) if pending.action == "add" else [],
-                list(pending.tickers) if pending.action == "remove" else [],
-                subscription_id=pending.sid,
-                subscription_id_field=sid_field,
+                UpdateMessageRequest(
+                    request_id=req_id,
+                    channels=config.channels,
+                    add_tickers=list(pending.tickers) if pending.action == "add" else [],
+                    remove_tickers=list(pending.tickers)
+                    if pending.action == "remove"
+                    else [],
+                    subscription_id=pending.sid,
+                    subscription_id_field=sid_field,
+                )
             )
             logger.warning(
                 "WS update_subscription error code=%s id=%s; retrying with sid_field=%s",
@@ -311,18 +392,24 @@ async def _subscribe_initial(
     config: WsLoopConfig,
     state: SubscriptionState,
 ) -> None:
-    try:
-        active = load_active_tickers_shard(
-            conn,
-            config.runtime.max_active_tickers,
-            config.shard.count,
-            config.shard.shard_id,
-            shard_key=config.shard.key,
-            round_robin=config.shard.round_robin,
-            round_robin_step=config.shard.round_robin_step,
-        )
-    except (_psycopg_error_type(), ValueError, TypeError, RuntimeError):
-        logger.exception("load_active_tickers failed during subscribe")
+    limit = _resolve_active_limit(config.runtime.max_active_tickers)
+    active = _load_active_tickers(conn, limit, config)
+    if active is None:
+        logger.warning("load_active_tickers failed during subscribe")
+        active = []
+    if not active:
+        fallback = _load_market_tickers(conn, limit, config)
+        if fallback is None:
+            logger.warning("load_market_tickers failed during subscribe fallback")
+        else:
+            if fallback:
+                logger.warning(
+                    "WS active_markets empty; falling back to markets tickers=%d",
+                    len(fallback),
+                )
+                _seed_active_markets(conn, fallback)
+            active = fallback
+    if active is None:
         active = []
     await _send_subscribe_batches(
         websocket,
@@ -363,19 +450,21 @@ async def _build_subscription_context(
 
 
 async def _load_active_ticker_set(context: SubscriptionContext) -> set[str] | None:
-    try:
-        active = load_active_tickers_shard(
-            context.conn,
-            context.config.max_active_tickers,
-            context.config.shard.count,
-            context.config.shard.shard_id,
-            shard_key=context.config.shard.key,
-            round_robin=context.config.shard.round_robin,
-            round_robin_step=context.config.shard.round_robin_step,
-        )
-    except (_psycopg_error_type(), ValueError, TypeError, RuntimeError):
-        logger.exception("load_active_tickers failed")
+    limit = _resolve_active_limit(context.config.max_active_tickers)
+    active = _load_active_tickers(context.conn, limit, context.config)
+    if active is None:
         return None
+    if not active:
+        fallback = _load_market_tickers(context.conn, limit, context.config)
+        if fallback is None:
+            return None
+        if fallback:
+            logger.warning(
+                "WS active_markets empty; falling back to markets tickers=%d",
+                len(fallback),
+            )
+            _seed_active_markets(context.conn, fallback)
+        active = fallback
     return set(active)
 
 
@@ -422,12 +511,14 @@ async def _apply_subscription_additions(
         sid = next(sid_cycle)
         req_id = next(context.state.request_id)
         msg = _build_update_message(
-            req_id,
-            context.config.channels,
-            batch,
-            [],
-            subscription_id=sid,
-            subscription_id_field=sid_field,
+            UpdateMessageRequest(
+                request_id=req_id,
+                channels=context.config.channels,
+                add_tickers=batch,
+                remove_tickers=[],
+                subscription_id=sid,
+                subscription_id_field=sid_field,
+            )
         )
         logger.debug(
             "WS update_subscription add: id=%s sid=%s tickers=%s",
@@ -484,12 +575,14 @@ async def _apply_subscription_removals(
         for batch in _chunked(tickers, context.config.ws_batch_size):
             req_id = next(context.state.request_id)
             msg = _build_update_message(
-                req_id,
-                context.config.channels,
-                [],
-                batch,
-                subscription_id=sid,
-                subscription_id_field=sid_field,
+                UpdateMessageRequest(
+                    request_id=req_id,
+                    channels=context.config.channels,
+                    add_tickers=[],
+                    remove_tickers=batch,
+                    subscription_id=sid,
+                    subscription_id_field=sid_field,
+                )
             )
             logger.debug(
                 "WS update_subscription remove: id=%s sid=%s tickers=%s",
@@ -517,10 +610,18 @@ async def _refresh_subscriptions(
     websocket,
     context: SubscriptionContext,
     refresh_seconds: int,
+    wake_event: asyncio.Event | None = None,
 ) -> None:
     """Periodically refresh WS subscriptions."""
     while True:
-        await asyncio.sleep(refresh_seconds)
+        if wake_event is None:
+            await asyncio.sleep(refresh_seconds)
+        else:
+            try:
+                await asyncio.wait_for(wake_event.wait(), timeout=refresh_seconds)
+                wake_event.clear()
+            except asyncio.TimeoutError:
+                pass
         active_set = await _load_active_ticker_set(context)
         if active_set is None:
             continue
