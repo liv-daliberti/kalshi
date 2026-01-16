@@ -138,11 +138,7 @@ jobs:
               -o tsv)"
 
             if [ -z "$EXISTING_SECRET" ]; then
-              SECRET="$(python - <<'PY'
-import secrets
-print(secrets.token_urlsafe(48))
-PY
-)"
+              SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
             else
               SECRET="$EXISTING_SECRET"
             fi
