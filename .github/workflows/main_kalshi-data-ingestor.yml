@@ -123,6 +123,15 @@ jobs:
                 --link-to-default-domain Enabled
             fi
 
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        id: deploy-to-webapp
+        with:
+          app-name: "Kalshi-Data-Ingestor"
+          slot-name: "Production"
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_8A914FC12C584EAEAAED9C60384BF3DD }}
+          package: ./artifact
+
       - name: Configure app settings
         uses: azure/CLI@v2
         with:
@@ -162,14 +171,3 @@ jobs:
               --resource-group "$RG" \
               --name "$APP" \
               --generic-configurations '{"appCommandLine":"bash -lc \"${APP_PATH}/scripts/start_kalshi_appservice.sh\""}'
-
-            az webapp restart --resource-group "$RG" --name "$APP"
-
-      - name: Deploy to Azure Web App
-        uses: azure/webapps-deploy@v3
-        id: deploy-to-webapp
-        with:
-          app-name: "Kalshi-Data-Ingestor"
-          slot-name: "Production"
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_8A914FC12C584EAEAAED9C60384BF3DD }}
-          package: ./artifact
