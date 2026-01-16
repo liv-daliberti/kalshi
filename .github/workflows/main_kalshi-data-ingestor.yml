@@ -14,7 +14,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -22,17 +22,16 @@ jobs:
       - name: Set up Python version
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      # 
-      # The following section in your workflow is designed to catch build issues early on the client side, before deployment. This can be helpful for debugging and validation. However, if this step significantly increases deployment time and early detection is not critical for your workflow, you may remove this section to streamline the deployment process.
+      # Optional: catch dependency/build issues early
       - name: Create and Start virtual environment and Install dependencies
         run: |
           python -m venv antenv
           source antenv/bin/activate
           pip install -r requirements.txt
-                
-      # By default, when you enable GitHub CI/CD integration through the Azure portal, the platform automatically sets the SCM_DO_BUILD_DURING_DEPLOYMENT application setting to true. This triggers the use of Oryx, a build engine that handles application compilation and dependency installation (e.g., pip install) directly on the platform during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact to reduce the payload size. 
+
+      # Exclude antenv + env files from artifact; Oryx builds on App Service if SCM_DO_BUILD_DURING_DEPLOYMENT=true
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
@@ -44,24 +43,22 @@ jobs:
             !.env.*
             !configs/env/*.env
             !configs/env/*.env.example
-      # 
-      # If you prefer to disable the Oryx build process during deployment, follow these steps:
-      # 1. Remove the SCM_DO_BUILD_DURING_DEPLOYMENT app setting from your Azure App Service Environment variables.
-      # 2. Refer to sample workflows for alternative deployment strategies: https://github.com/Azure/actions-workflow-samples/tree/master/AppService
-      
 
   deploy:
     runs-on: ubuntu-latest
     needs: build
-    
+
     steps:
       - name: Download artifact from build job
         uses: actions/download-artifact@v4
         with:
           name: python-app
 
+      # This step requires AZURE_CREDENTIALS to contain the full JSON from:
+      # az ad sp create-for-rbac --sdk-auth
+      # (must include clientId, clientSecret, tenantId, subscriptionId)
       - name: Azure Login
-        uses: azure/login@v1
+        uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
@@ -70,15 +67,20 @@ jobs:
         with:
           inlineScript: |
             set -euo pipefail
+
             az account set --subscription "179a1c0b-5228-4f8e-904d-c6bb1072f1eb"
+
             RESOURCE_GROUP="liv"
             APP_NAME="Kalshi-Data-Ingestor"
             PROFILE_NAME="kalshi-cdn"
             ENDPOINT_NAME="kalshi-ingestor-cdn"
-            ORIGIN_HOST=$(az webapp show -g "$RESOURCE_GROUP" -n "$APP_NAME" --query defaultHostName -o tsv)
+
+            ORIGIN_HOST="$(az webapp show -g "$RESOURCE_GROUP" -n "$APP_NAME" --query defaultHostName -o tsv)"
+
             if ! az cdn profile show -g "$RESOURCE_GROUP" -n "$PROFILE_NAME" >/dev/null 2>&1; then
               az cdn profile create -g "$RESOURCE_GROUP" -n "$PROFILE_NAME" --sku Standard_Microsoft
             fi
+
             if ! az cdn endpoint show -g "$RESOURCE_GROUP" --profile-name "$PROFILE_NAME" -n "$ENDPOINT_NAME" >/dev/null 2>&1; then
               az cdn endpoint create \
                 -g "$RESOURCE_GROUP" \
@@ -87,6 +89,7 @@ jobs:
                 --origin "$ORIGIN_HOST" \
                 --origin-host-header "$ORIGIN_HOST"
             fi
+
             az cdn endpoint update \
               -g "$RESOURCE_GROUP" \
               --profile-name "$PROFILE_NAME" \
@@ -104,25 +107,31 @@ jobs:
         uses: azure/CLI@v2
         with:
           inlineScript: |
+            set -euo pipefail
+
             az account set --subscription "179a1c0b-5228-4f8e-904d-c6bb1072f1eb"
+
             az webapp config appsettings set \
               --resource-group "liv" \
               --name "Kalshi-Data-Ingestor" \
               --settings \
-                WEB_PORTAL_SECRET_KEY=${{ secrets.WEB_PORTAL_SECRET_KEY }} \
+                WEB_PORTAL_SECRET_KEY='${{ secrets.WEB_PORTAL_SECRET_KEY }}' \
                 WEB_PORTAL_TRUST_PROXY=1 \
                 WEB_PORTAL_COOKIE_SAMESITE=None \
                 WEB_PORTAL_STATIC_CACHE_MAX_AGE_SEC=3600 \
                 WEB_PORTAL_COOKIE_SECURE=1
+
+            # Set the Linux startup command (App Service -> appCommandLine)
+            # Use APP_PATH so it works regardless of cwd, matching Oryx-style invocation.
             az webapp config set \
               --resource-group "liv" \
               --name "Kalshi-Data-Ingestor" \
-              --startup-file "bash scripts/start_kalshi_appservice.sh"
-      
-      - name: 'Deploy to Azure Web App'
+              --generic-configurations '{"appCommandLine":"bash -lc \"${APP_PATH}/scripts/start_kalshi_appservice.sh\""}'
+
+      - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
         with:
-          app-name: 'Kalshi-Data-Ingestor'
-          slot-name: 'Production'
+          app-name: "Kalshi-Data-Ingestor"
+          slot-name: "Production"
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_8A914FC12C584EAEAAED9C60384BF3DD }}
