@@ -13,6 +13,7 @@ import psycopg  # pylint: disable=import-error
 from dateutil.parser import isoparse
 
 from src.core.env_utils import _env_bool, _env_int
+from src.core.loop_utils import log_metric as _log_metric
 from src.core.guardrails import assert_state_write_allowed
 
 SCHEMA_VERSION = 1
@@ -742,6 +743,19 @@ def _enqueue_discover_market_jobs(conn: psycopg.Connection, tickers: list[str]) 
             logger.warning("discover_market enqueue rollback failed")
 
 
+def _log_placeholder_inserts(tickers: list[str]) -> None:
+    if not tickers:
+        return
+    sample = ",".join(tickers[:25])
+    _log_metric(
+        logger,
+        "ws.placeholder_markets",
+        placeholders=len(tickers),
+        unique_tickers=len(tickers),
+        tickers=sample,
+    )
+
+
 def insert_market_tick(conn: psycopg.Connection, tick: dict) -> None:
     """Insert a market tick row.
 
@@ -814,6 +828,7 @@ def insert_market_ticks(conn: psycopg.Connection, ticks: list[dict]) -> None:
                 ("last_ws_tick_ts", last_ws_ts.isoformat()),
             )
     conn.commit()
+    _log_placeholder_inserts(inserted)
     _enqueue_discover_market_jobs(conn, inserted)
 
 
