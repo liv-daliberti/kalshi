@@ -90,7 +90,7 @@ jobs:
 
             if ! az afd origin-group show -g "$RESOURCE_GROUP" --profile-name "$FD_PROFILE" -n "$ORIGIN_GROUP" >/dev/null 2>&1; then
               az afd origin-group create -g "$RESOURCE_GROUP" --profile-name "$FD_PROFILE" -n "$ORIGIN_GROUP" \
-                --probe-request-type GET --probe-protocol Https --probe-interval-in-seconds 120 \
+                --probe-path "/" --probe-request-type GET --probe-protocol Https --probe-interval-in-seconds 120 \
                 --sample-size 4 --successful-samples-required 3
             fi
 
