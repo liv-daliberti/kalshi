@@ -62,7 +62,7 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Ensure CDN compression is enabled
+      - name: Ensure Front Door Standard is configured
         uses: azure/CLI@v2
         with:
           inlineScript: |
@@ -72,36 +72,52 @@ jobs:
 
             RESOURCE_GROUP="liv"
             APP_NAME="Kalshi-Data-Ingestor"
-            PROFILE_NAME="kalshi-cdn"
-            ENDPOINT_NAME="kalshi-ingestor-cdn"
+            FD_PROFILE="kalshi-fd"
+            FD_ENDPOINT="kalshi-ingestor"
+            ORIGIN_GROUP="kalshi-og"
+            ORIGIN_NAME="kalshi-origin"
+            ROUTE_NAME="route1"
 
             ORIGIN_HOST="$(az webapp show -g "$RESOURCE_GROUP" -n "$APP_NAME" --query defaultHostName -o tsv)"
 
-            if ! az cdn profile show -g "$RESOURCE_GROUP" -n "$PROFILE_NAME" >/dev/null 2>&1; then
-              az cdn profile create -g "$RESOURCE_GROUP" -n "$PROFILE_NAME" --sku Standard_Microsoft
+            if ! az afd profile show -g "$RESOURCE_GROUP" -n "$FD_PROFILE" >/dev/null 2>&1; then
+              az afd profile create -g "$RESOURCE_GROUP" -n "$FD_PROFILE" --sku Standard_AzureFrontDoor
             fi
 
-            if ! az cdn endpoint show -g "$RESOURCE_GROUP" --profile-name "$PROFILE_NAME" -n "$ENDPOINT_NAME" >/dev/null 2>&1; then
-              az cdn endpoint create \
-                -g "$RESOURCE_GROUP" \
-                --profile-name "$PROFILE_NAME" \
-                -n "$ENDPOINT_NAME" \
-                --origin "$ORIGIN_HOST" \
+            if ! az afd endpoint show -g "$RESOURCE_GROUP" --profile-name "$FD_PROFILE" -n "$FD_ENDPOINT" >/dev/null 2>&1; then
+              az afd endpoint create -g "$RESOURCE_GROUP" --profile-name "$FD_PROFILE" -n "$FD_ENDPOINT" --enabled-state Enabled
+            fi
+
+            if ! az afd origin-group show -g "$RESOURCE_GROUP" --profile-name "$FD_PROFILE" -n "$ORIGIN_GROUP" >/dev/null 2>&1; then
+              az afd origin-group create -g "$RESOURCE_GROUP" --profile-name "$FD_PROFILE" -n "$ORIGIN_GROUP" \
+                --probe-request-type GET --probe-protocol Https --probe-interval-in-seconds 120 \
+                --sample-size 4 --successful-samples-required 3
+            fi
+
+            if ! az afd origin show -g "$RESOURCE_GROUP" --profile-name "$FD_PROFILE" --origin-group-name "$ORIGIN_GROUP" -n "$ORIGIN_NAME" >/dev/null 2>&1; then
+              az afd origin create -g "$RESOURCE_GROUP" --profile-name "$FD_PROFILE" --origin-group-name "$ORIGIN_GROUP" \
+                -n "$ORIGIN_NAME" \
+                --host-name "$ORIGIN_HOST" \
+                --origin-host-header "$ORIGIN_HOST" \
+                --priority 1 --weight 1000 \
+                --enabled-state Enabled
+            else
+              # Keep the origin host in sync if the app default hostname changes.
+              az afd origin update -g "$RESOURCE_GROUP" --profile-name "$FD_PROFILE" --origin-group-name "$ORIGIN_GROUP" \
+                -n "$ORIGIN_NAME" \
+                --host-name "$ORIGIN_HOST" \
                 --origin-host-header "$ORIGIN_HOST"
             fi
 
-            az cdn endpoint update \
-              -g "$RESOURCE_GROUP" \
-              --profile-name "$PROFILE_NAME" \
-              -n "$ENDPOINT_NAME" \
-              --is-compression-enabled true \
-              --content-types-to-compress \
-                "text/html" \
-                "text/css" \
-                "application/javascript" \
-                "application/json" \
-                "image/svg+xml" \
-                "font/woff2"
+            if ! az afd route show -g "$RESOURCE_GROUP" --profile-name "$FD_PROFILE" --endpoint-name "$FD_ENDPOINT" -n "$ROUTE_NAME" >/dev/null 2>&1; then
+              az afd route create -g "$RESOURCE_GROUP" --profile-name "$FD_PROFILE" --endpoint-name "$FD_ENDPOINT" \
+                -n "$ROUTE_NAME" \
+                --origin-group "$ORIGIN_GROUP" \
+                --https-redirect Enabled \
+                --supported-protocols Http Https \
+                --patterns-to-match "/*" \
+                --link-to-default-domain Enabled
+            fi
 
       - name: Configure app settings
         uses: azure/CLI@v2
