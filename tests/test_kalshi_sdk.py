@@ -11,6 +11,7 @@ from _test_utils import add_src_to_path
 add_src_to_path()
 
 import src.kalshi.kalshi_sdk as kalshi_sdk
+import src.kalshi.kalshi_rest_rate_limit as rest_rate_limit
 
 
 class StopLoop(Exception):
@@ -63,17 +64,17 @@ class FailingConn(FakeConn):
 
 class KalshiSdkTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        kalshi_sdk._REST_RATE_LIMIT_BACKEND_OVERRIDE = None
-        kalshi_sdk._REST_RATE_LIMIT_DB_URL_OVERRIDE = None
-        kalshi_sdk._REST_RATE_LIMIT_WARNED.clear()
-        kalshi_sdk._DB_RATE_LIMIT_ERROR_TS = 0.0
+        rest_rate_limit._REST_RATE_LIMIT_BACKEND_OVERRIDE = None
+        rest_rate_limit._REST_RATE_LIMIT_DB_URL_OVERRIDE = None
+        rest_rate_limit._REST_RATE_LIMIT_WARNED.clear()
+        rest_rate_limit._DB_RATE_LIMIT_ERROR_TS = 0.0
         kalshi_sdk._LAST_HOST_OVERRIDE = None
-        kalshi_sdk._REST_NEXT_ALLOWED = 0.0
-        kalshi_sdk._REST_LAST_REFILL = 0.0
-        kalshi_sdk._REST_TOKENS = 0.0
-        kalshi_sdk._CANDLE_NEXT_ALLOWED = 0.0
-        if hasattr(kalshi_sdk._DB_RATE_LIMIT_LOCAL, "conn"):
-            kalshi_sdk._DB_RATE_LIMIT_LOCAL.conn = None
+        rest_rate_limit._REST_NEXT_ALLOWED = 0.0
+        rest_rate_limit._REST_LAST_REFILL = 0.0
+        rest_rate_limit._REST_TOKENS = 0.0
+        rest_rate_limit._CANDLE_NEXT_ALLOWED = 0.0
+        if hasattr(rest_rate_limit._DB_RATE_LIMIT_LOCAL, "conn"):
+            rest_rate_limit._DB_RATE_LIMIT_LOCAL.conn = None
 
 
 class TestRestLimits(KalshiSdkTestCase):
@@ -82,7 +83,7 @@ class TestRestLimits(KalshiSdkTestCase):
             os.environ,
             {"KALSHI_REST_RATE_PER_SEC": "bad", "KALSHI_REST_BURST": "0"},
         ):
-            rate, burst = kalshi_sdk._rest_limits()
+            rate, burst = rest_rate_limit._rest_limits()
         self.assertEqual(rate, 0.0)
         self.assertEqual(burst, 1)
 
@@ -91,80 +92,80 @@ class TestRestLimits(KalshiSdkTestCase):
             os.environ,
             {"KALSHI_REST_RATE_PER_SEC": "1.5", "KALSHI_REST_BURST": "bad"},
         ):
-            rate, burst = kalshi_sdk._rest_limits()
+            rate, burst = rest_rate_limit._rest_limits()
         self.assertEqual(rate, 1.5)
         self.assertEqual(burst, 5)
 
     def test_rest_rate_limit_db_url_missing(self) -> None:
-        with patch.object(kalshi_sdk, "_REST_RATE_LIMIT_DB_URL_OVERRIDE", None), \
+        with patch.object(rest_rate_limit, "_REST_RATE_LIMIT_DB_URL_OVERRIDE", None), \
              patch.dict(os.environ, {}, clear=True):
-            self.assertIsNone(kalshi_sdk._rest_rate_limit_db_url())
+            self.assertIsNone(rest_rate_limit._rest_rate_limit_db_url())
 
     def test_rest_rate_limit_db_url_blank(self) -> None:
-        with patch.object(kalshi_sdk, "_REST_RATE_LIMIT_DB_URL_OVERRIDE", None), \
+        with patch.object(rest_rate_limit, "_REST_RATE_LIMIT_DB_URL_OVERRIDE", None), \
              patch.dict(os.environ, {"KALSHI_REST_RATE_LIMIT_DB_URL": "   "}):
-            self.assertIsNone(kalshi_sdk._rest_rate_limit_db_url())
+            self.assertIsNone(rest_rate_limit._rest_rate_limit_db_url())
 
     def test_configure_rest_rate_limit_overrides(self) -> None:
         kalshi_sdk.configure_rest_rate_limit(backend=" DB ", db_url=" url ")
-        self.assertEqual(kalshi_sdk._REST_RATE_LIMIT_BACKEND_OVERRIDE, "db")
-        self.assertEqual(kalshi_sdk._REST_RATE_LIMIT_DB_URL_OVERRIDE, "url")
+        self.assertEqual(rest_rate_limit._REST_RATE_LIMIT_BACKEND_OVERRIDE, "db")
+        self.assertEqual(rest_rate_limit._REST_RATE_LIMIT_DB_URL_OVERRIDE, "url")
         kalshi_sdk.configure_rest_rate_limit(backend="", db_url="")
-        self.assertIsNone(kalshi_sdk._REST_RATE_LIMIT_BACKEND_OVERRIDE)
-        self.assertIsNone(kalshi_sdk._REST_RATE_LIMIT_DB_URL_OVERRIDE)
+        self.assertIsNone(rest_rate_limit._REST_RATE_LIMIT_BACKEND_OVERRIDE)
+        self.assertIsNone(rest_rate_limit._REST_RATE_LIMIT_DB_URL_OVERRIDE)
 
     def test_rest_rate_limit_db_url_override(self) -> None:
-        kalshi_sdk._REST_RATE_LIMIT_DB_URL_OVERRIDE = "override"
+        rest_rate_limit._REST_RATE_LIMIT_DB_URL_OVERRIDE = "override"
         with patch.dict(os.environ, {"KALSHI_REST_RATE_LIMIT_DB_URL": "env"}):
-            self.assertEqual(kalshi_sdk._rest_rate_limit_db_url(), "override")
+            self.assertEqual(rest_rate_limit._rest_rate_limit_db_url(), "override")
 
     def test_rate_limit_warn_once(self) -> None:
-        with patch("src.kalshi.kalshi_sdk.logger.warning") as warn:
-            kalshi_sdk._rate_limit_warn_once("key", "message")
-            kalshi_sdk._rate_limit_warn_once("key", "message")
+        with patch("src.kalshi.kalshi_rest_rate_limit.logger.warning") as warn:
+            rest_rate_limit._rate_limit_warn_once("key", "message")
+            rest_rate_limit._rate_limit_warn_once("key", "message")
         self.assertEqual(warn.call_count, 1)
 
     def test_rest_rate_limit_backend_memory(self) -> None:
         with patch.dict(os.environ, {"KALSHI_REST_RATE_LIMIT_BACKEND": "memory"}):
-            self.assertEqual(kalshi_sdk._rest_rate_limit_backend(), "memory")
+            self.assertEqual(rest_rate_limit._rest_rate_limit_backend(), "memory")
 
     def test_rest_rate_limit_backend_variants(self) -> None:
         with patch.dict(os.environ, {"KALSHI_REST_RATE_LIMIT_BACKEND": "redis"}), \
-             patch("src.kalshi.kalshi_sdk._rate_limit_warn_once") as warn:
-            self.assertEqual(kalshi_sdk._rest_rate_limit_backend(), "memory")
+             patch("src.kalshi.kalshi_rest_rate_limit._rate_limit_warn_once") as warn:
+            self.assertEqual(rest_rate_limit._rest_rate_limit_backend(), "memory")
         self.assertEqual(warn.call_count, 1)
 
         with patch.dict(os.environ, {"KALSHI_REST_RATE_LIMIT_BACKEND": "db"}):
-            self.assertEqual(kalshi_sdk._rest_rate_limit_backend(), "db")
+            self.assertEqual(rest_rate_limit._rest_rate_limit_backend(), "db")
 
         with patch.dict(os.environ, {"KALSHI_REST_RATE_LIMIT_BACKEND": "weird"}), \
-             patch("src.kalshi.kalshi_sdk._rate_limit_warn_once") as warn:
-            self.assertEqual(kalshi_sdk._rest_rate_limit_backend(), "memory")
+             patch("src.kalshi.kalshi_rest_rate_limit._rate_limit_warn_once") as warn:
+            self.assertEqual(rest_rate_limit._rest_rate_limit_backend(), "memory")
         self.assertEqual(warn.call_count, 1)
 
         with patch.dict(os.environ, {}, clear=True), \
-             patch("src.kalshi.kalshi_sdk._rest_rate_limit_db_url", return_value="db"):
-            self.assertEqual(kalshi_sdk._rest_rate_limit_backend(), "db")
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_db_url", return_value="db"):
+            self.assertEqual(rest_rate_limit._rest_rate_limit_backend(), "db")
 
 
 class TestDbRateLimitConn(KalshiSdkTestCase):
     def test_db_rate_limit_conn_backend_memory(self) -> None:
-        with patch("src.kalshi.kalshi_sdk._rest_rate_limit_backend", return_value="memory"):
-            self.assertIsNone(kalshi_sdk._db_rate_limit_conn())
+        with patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_backend", return_value="memory"):
+            self.assertIsNone(rest_rate_limit._db_rate_limit_conn())
 
     def test_db_rate_limit_conn_missing_url(self) -> None:
-        with patch("src.kalshi.kalshi_sdk._rest_rate_limit_backend", return_value="db"), \
-             patch("src.kalshi.kalshi_sdk._rest_rate_limit_db_url", return_value=None), \
-             patch("src.kalshi.kalshi_sdk._rate_limit_warn_once") as warn:
-            self.assertIsNone(kalshi_sdk._db_rate_limit_conn())
+        with patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_backend", return_value="db"), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_db_url", return_value=None), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rate_limit_warn_once") as warn:
+            self.assertIsNone(rest_rate_limit._db_rate_limit_conn())
         self.assertEqual(warn.call_count, 1)
 
     def test_db_rate_limit_conn_existing(self) -> None:
         conn = SimpleNamespace(closed=False)
-        kalshi_sdk._DB_RATE_LIMIT_LOCAL.conn = conn
-        with patch("src.kalshi.kalshi_sdk._rest_rate_limit_backend", return_value="db"), \
-             patch("src.kalshi.kalshi_sdk._rest_rate_limit_db_url", return_value="db"):
-            self.assertIs(kalshi_sdk._db_rate_limit_conn(), conn)
+        rest_rate_limit._DB_RATE_LIMIT_LOCAL.conn = conn
+        with patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_backend", return_value="db"), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_db_url", return_value="db"):
+            self.assertIs(rest_rate_limit._db_rate_limit_conn(), conn)
 
     def test_db_rate_limit_conn_import_error(self) -> None:
         orig_import = __import__
@@ -175,10 +176,10 @@ class TestDbRateLimitConn(KalshiSdkTestCase):
             return orig_import(name, *args, **kwargs)
 
         with patch("builtins.__import__", side_effect=fake_import), \
-             patch("src.kalshi.kalshi_sdk._rest_rate_limit_backend", return_value="db"), \
-             patch("src.kalshi.kalshi_sdk._rest_rate_limit_db_url", return_value="db"), \
-             patch("src.kalshi.kalshi_sdk._rate_limit_warn_once") as warn:
-            self.assertIsNone(kalshi_sdk._db_rate_limit_conn())
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_backend", return_value="db"), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_db_url", return_value="db"), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rate_limit_warn_once") as warn:
+            self.assertIsNone(rest_rate_limit._db_rate_limit_conn())
         self.assertEqual(warn.call_count, 1)
 
     def test_db_rate_limit_conn_connect_error(self) -> None:
@@ -187,10 +188,10 @@ class TestDbRateLimitConn(KalshiSdkTestCase):
                 raise RuntimeError("nope")
 
         with patch.dict(sys.modules, {"psycopg": FakePsycopg()}), \
-             patch("src.kalshi.kalshi_sdk._rest_rate_limit_backend", return_value="db"), \
-             patch("src.kalshi.kalshi_sdk._rest_rate_limit_db_url", return_value="db"), \
-             patch("src.kalshi.kalshi_sdk._rate_limit_warn_once") as warn:
-            self.assertIsNone(kalshi_sdk._db_rate_limit_conn())
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_backend", return_value="db"), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_db_url", return_value="db"), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rate_limit_warn_once") as warn:
+            self.assertIsNone(rest_rate_limit._db_rate_limit_conn())
         self.assertEqual(warn.call_count, 1)
 
     def test_db_rate_limit_conn_success(self) -> None:
@@ -201,59 +202,59 @@ class TestDbRateLimitConn(KalshiSdkTestCase):
                 return conn
 
         with patch.dict(sys.modules, {"psycopg": FakePsycopg()}), \
-             patch("src.kalshi.kalshi_sdk._rest_rate_limit_backend", return_value="db"), \
-             patch("src.kalshi.kalshi_sdk._rest_rate_limit_db_url", return_value="db"):
-            self.assertIs(kalshi_sdk._db_rate_limit_conn(), conn)
-        self.assertIs(kalshi_sdk._DB_RATE_LIMIT_LOCAL.conn, conn)
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_backend", return_value="db"), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_db_url", return_value="db"):
+            self.assertIs(rest_rate_limit._db_rate_limit_conn(), conn)
+        self.assertIs(rest_rate_limit._DB_RATE_LIMIT_LOCAL.conn, conn)
 
     def test_reset_db_rate_limit_conn(self) -> None:
-        kalshi_sdk._DB_RATE_LIMIT_LOCAL.conn = None
-        kalshi_sdk._reset_db_rate_limit_conn()
+        rest_rate_limit._DB_RATE_LIMIT_LOCAL.conn = None
+        rest_rate_limit._reset_db_rate_limit_conn()
 
         class BadConn:
             def close(self):
                 raise RuntimeError("fail")
 
-        kalshi_sdk._DB_RATE_LIMIT_LOCAL.conn = BadConn()
-        kalshi_sdk._reset_db_rate_limit_conn()
-        self.assertIsNone(kalshi_sdk._DB_RATE_LIMIT_LOCAL.conn)
+        rest_rate_limit._DB_RATE_LIMIT_LOCAL.conn = BadConn()
+        rest_rate_limit._reset_db_rate_limit_conn()
+        self.assertIsNone(rest_rate_limit._DB_RATE_LIMIT_LOCAL.conn)
 
     def test_to_float_fallback(self) -> None:
-        self.assertEqual(kalshi_sdk._to_float("bad", 1.5), 1.5)
+        self.assertEqual(rest_rate_limit._to_float("bad", 1.5), 1.5)
 
     def test_parse_db_rate_state_fallbacks(self) -> None:
         now = 100.0
-        state = kalshi_sdk._parse_db_rate_state(None, now, burst=5)
+        state = rest_rate_limit._parse_db_rate_state(None, now, burst=5)
         self.assertEqual(state["tokens"], 5.0)
-        state = kalshi_sdk._parse_db_rate_state("{", now, burst=5)
+        state = rest_rate_limit._parse_db_rate_state("{", now, burst=5)
         self.assertEqual(state["tokens"], 5.0)
-        state = kalshi_sdk._parse_db_rate_state("[]", now, burst=5)
+        state = rest_rate_limit._parse_db_rate_state("[]", now, burst=5)
         self.assertEqual(state["tokens"], 5.0)
         raw = json.dumps({"tokens": 10, "last_refill_ts": 200, "next_allowed_ts": -5})
-        state = kalshi_sdk._parse_db_rate_state(raw, now, burst=5)
+        state = rest_rate_limit._parse_db_rate_state(raw, now, burst=5)
         self.assertEqual(state["tokens"], 5.0)
         self.assertEqual(state["last_refill_ts"], now)
         self.assertEqual(state["next_allowed_ts"], 0.0)
 
     def test_db_rate_limit_error_throttled(self) -> None:
         with patch("src.kalshi.kalshi_sdk.time.monotonic", side_effect=[100.0, 110.0]), \
-             patch("src.kalshi.kalshi_sdk.logger.warning") as warn:
-            kalshi_sdk._db_rate_limit_error(RuntimeError("fail"))
-            kalshi_sdk._db_rate_limit_error(RuntimeError("fail"))
+             patch("src.kalshi.kalshi_rest_rate_limit.logger.warning") as warn:
+            rest_rate_limit._db_rate_limit_error(RuntimeError("fail"))
+            rest_rate_limit._db_rate_limit_error(RuntimeError("fail"))
         self.assertEqual(warn.call_count, 1)
 
 
 class TestDbRateLimitState(KalshiSdkTestCase):
     def test_db_rate_limit_fetch_state_default(self) -> None:
         conn = FakeConn(row=None)
-        state = kalshi_sdk._db_rate_limit_fetch_state(conn, now=123.0, burst=5)
+        state = rest_rate_limit._db_rate_limit_fetch_state(conn, now=123.0, burst=5)
         self.assertEqual(state["tokens"], 5.0)
         self.assertEqual(len(conn.cursor_obj.executes), 2)
 
     def test_db_rate_limit_write_state(self) -> None:
         conn = FakeConn()
         state = {"tokens": 1.0, "last_refill_ts": 0.0, "next_allowed_ts": 0.0}
-        kalshi_sdk._db_rate_limit_write_state(conn, state)
+        rest_rate_limit._db_rate_limit_write_state(conn, state)
         self.assertEqual(len(conn.cursor_obj.executes), 1)
 
 
@@ -263,44 +264,44 @@ class TestDbRestLimits(KalshiSdkTestCase):
             {"tokens": 0.0, "last_refill_ts": 1000.0, "next_allowed_ts": 1005.0}
         )
         conn = FakeConn(row=(raw,))
-        with patch("src.kalshi.kalshi_sdk._db_rate_limit_conn", return_value=conn), \
+        with patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_conn", return_value=conn), \
              patch("src.kalshi.kalshi_sdk.time.time", return_value=1000.0):
-            remaining = kalshi_sdk._db_rest_backoff_remaining()
+            remaining = rest_rate_limit._db_rest_backoff_remaining()
         self.assertEqual(remaining, 5.0)
 
     def test_db_rest_backoff_remaining_error(self) -> None:
         conn = FakeConn(row=None, raise_on_execute=True)
-        with patch("src.kalshi.kalshi_sdk._db_rate_limit_conn", return_value=conn), \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_error") as log_err, \
-             patch("src.kalshi.kalshi_sdk._reset_db_rate_limit_conn") as reset:
-            remaining = kalshi_sdk._db_rest_backoff_remaining()
+        with patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_conn", return_value=conn), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_error") as log_err, \
+             patch("src.kalshi.kalshi_rest_rate_limit._reset_db_rate_limit_conn") as reset:
+            remaining = rest_rate_limit._db_rest_backoff_remaining()
         self.assertIsNone(remaining)
         self.assertEqual(log_err.call_count, 1)
         self.assertEqual(reset.call_count, 1)
 
     def test_db_rest_backoff_remaining_no_conn(self) -> None:
-        with patch("src.kalshi.kalshi_sdk._db_rate_limit_conn", return_value=None):
-            self.assertIsNone(kalshi_sdk._db_rest_backoff_remaining())
+        with patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_conn", return_value=None):
+            self.assertIsNone(rest_rate_limit._db_rest_backoff_remaining())
 
     def test_db_rest_apply_cooldown_noop(self) -> None:
-        self.assertTrue(kalshi_sdk._db_rest_apply_cooldown(0))
+        self.assertTrue(rest_rate_limit._db_rest_apply_cooldown(0))
 
     def test_db_rest_apply_cooldown_no_conn(self) -> None:
-        with patch("src.kalshi.kalshi_sdk._db_rate_limit_conn", return_value=None):
-            self.assertFalse(kalshi_sdk._db_rest_apply_cooldown(5.0))
+        with patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_conn", return_value=None):
+            self.assertFalse(rest_rate_limit._db_rest_apply_cooldown(5.0))
 
     def test_db_rest_apply_cooldown_updates_state(self) -> None:
         conn = FakeConn()
-        with patch("src.kalshi.kalshi_sdk._db_rate_limit_conn", return_value=conn), \
-             patch("src.kalshi.kalshi_sdk._rest_limits", return_value=(0.0, 3)), \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_fetch_state", return_value={
+        with patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_conn", return_value=conn), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_limits", return_value=(0.0, 3)), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_fetch_state", return_value={
                  "tokens": 1.0,
                  "last_refill_ts": 0.0,
                  "next_allowed_ts": 0.0,
              }) as fetch_state, \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_write_state") as write_state, \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_write_state") as write_state, \
              patch("src.kalshi.kalshi_sdk.time.time", return_value=100.0):
-            result = kalshi_sdk._db_rest_apply_cooldown(5.0)
+            result = rest_rate_limit._db_rest_apply_cooldown(5.0)
         self.assertTrue(result)
         self.assertEqual(fetch_state.call_count, 1)
         _, updated_state = write_state.call_args[0]
@@ -309,27 +310,27 @@ class TestDbRestLimits(KalshiSdkTestCase):
 
     def test_db_rest_apply_cooldown_error(self) -> None:
         conn = FailingConn()
-        with patch("src.kalshi.kalshi_sdk._db_rate_limit_conn", return_value=conn), \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_error") as log_err, \
-             patch("src.kalshi.kalshi_sdk._reset_db_rate_limit_conn") as reset:
-            result = kalshi_sdk._db_rest_apply_cooldown(5.0)
+        with patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_conn", return_value=conn), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_error") as log_err, \
+             patch("src.kalshi.kalshi_rest_rate_limit._reset_db_rate_limit_conn") as reset:
+            result = rest_rate_limit._db_rest_apply_cooldown(5.0)
         self.assertFalse(result)
         self.assertEqual(log_err.call_count, 1)
         self.assertEqual(reset.call_count, 1)
 
     def test_db_rest_wait_no_conn(self) -> None:
-        with patch("src.kalshi.kalshi_sdk._db_rate_limit_conn", return_value=None):
-            self.assertFalse(kalshi_sdk._db_rest_wait())
+        with patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_conn", return_value=None):
+            self.assertFalse(rest_rate_limit._db_rest_wait())
 
     def test_db_rest_wait_rate_zero(self) -> None:
         conn = FakeConn()
         state = {"tokens": 0.0, "last_refill_ts": 900.0, "next_allowed_ts": 0.0}
-        with patch("src.kalshi.kalshi_sdk._db_rate_limit_conn", return_value=conn), \
-             patch("src.kalshi.kalshi_sdk._rest_limits", return_value=(0.0, 5)), \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_fetch_state", return_value=state), \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_write_state") as write_state, \
+        with patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_conn", return_value=conn), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_limits", return_value=(0.0, 5)), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_fetch_state", return_value=state), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_write_state") as write_state, \
              patch("src.kalshi.kalshi_sdk.time.time", return_value=1000.0):
-            self.assertTrue(kalshi_sdk._db_rest_wait())
+            self.assertTrue(rest_rate_limit._db_rest_wait())
         _, updated_state = write_state.call_args[0]
         self.assertEqual(updated_state["tokens"], 5.0)
         self.assertEqual(updated_state["last_refill_ts"], 1000.0)
@@ -337,15 +338,15 @@ class TestDbRestLimits(KalshiSdkTestCase):
     def test_db_rest_wait_tokens_waits(self) -> None:
         conn = FakeConn()
         state = {"tokens": 0.0, "last_refill_ts": 1000.0, "next_allowed_ts": 0.0}
-        with patch("src.kalshi.kalshi_sdk._db_rate_limit_conn", return_value=conn), \
-             patch("src.kalshi.kalshi_sdk._rest_limits", return_value=(1.0, 5)), \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_fetch_state", return_value=state), \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_write_state"), \
+        with patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_conn", return_value=conn), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_limits", return_value=(1.0, 5)), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_fetch_state", return_value=state), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_write_state"), \
              patch("src.kalshi.kalshi_sdk.time.time", return_value=1000.0), \
              patch("src.kalshi.kalshi_sdk.time.sleep", side_effect=StopLoop), \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_error") as log_err, \
-             patch("src.kalshi.kalshi_sdk._reset_db_rate_limit_conn") as reset:
-            result = kalshi_sdk._db_rest_wait()
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_error") as log_err, \
+             patch("src.kalshi.kalshi_rest_rate_limit._reset_db_rate_limit_conn") as reset:
+            result = rest_rate_limit._db_rest_wait()
         self.assertFalse(result)
         log_err.assert_called_once()
         reset.assert_called_once()
@@ -353,15 +354,15 @@ class TestDbRestLimits(KalshiSdkTestCase):
     def test_db_rest_wait_backoff(self) -> None:
         conn = FakeConn()
         state = {"tokens": 1.0, "last_refill_ts": 1000.0, "next_allowed_ts": 1010.0}
-        with patch("src.kalshi.kalshi_sdk._db_rate_limit_conn", return_value=conn), \
-             patch("src.kalshi.kalshi_sdk._rest_limits", return_value=(1.0, 5)), \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_fetch_state", return_value=state), \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_write_state"), \
+        with patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_conn", return_value=conn), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_limits", return_value=(1.0, 5)), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_fetch_state", return_value=state), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_write_state"), \
              patch("src.kalshi.kalshi_sdk.time.time", return_value=1000.0), \
              patch("src.kalshi.kalshi_sdk.time.sleep", side_effect=StopLoop), \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_error") as log_err, \
-             patch("src.kalshi.kalshi_sdk._reset_db_rate_limit_conn") as reset:
-            result = kalshi_sdk._db_rest_wait()
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_error") as log_err, \
+             patch("src.kalshi.kalshi_rest_rate_limit._reset_db_rate_limit_conn") as reset:
+            result = rest_rate_limit._db_rest_wait()
         self.assertFalse(result)
         log_err.assert_called_once()
         reset.assert_called_once()
@@ -369,105 +370,105 @@ class TestDbRestLimits(KalshiSdkTestCase):
     def test_db_rest_wait_tokens_available(self) -> None:
         conn = FakeConn()
         state = {"tokens": 2.0, "last_refill_ts": 1000.0, "next_allowed_ts": 0.0}
-        with patch("src.kalshi.kalshi_sdk._db_rate_limit_conn", return_value=conn), \
-             patch("src.kalshi.kalshi_sdk._rest_limits", return_value=(1.0, 5)), \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_fetch_state", return_value=state), \
-             patch("src.kalshi.kalshi_sdk._db_rate_limit_write_state") as write_state, \
+        with patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_conn", return_value=conn), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_limits", return_value=(1.0, 5)), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_fetch_state", return_value=state), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rate_limit_write_state") as write_state, \
              patch("src.kalshi.kalshi_sdk.time.time", return_value=1000.0):
-            self.assertTrue(kalshi_sdk._db_rest_wait())
+            self.assertTrue(rest_rate_limit._db_rest_wait())
         _, updated_state = write_state.call_args[0]
         self.assertEqual(updated_state["tokens"], 1.0)
 
 
 class TestRestWaitLocal(KalshiSdkTestCase):
     def test_rest_backoff_remaining_local(self) -> None:
-        kalshi_sdk._REST_NEXT_ALLOWED = 100.0
+        rest_rate_limit._REST_NEXT_ALLOWED = 100.0
         with patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=90.0):
-            remaining = kalshi_sdk._rest_backoff_remaining_local()
+            remaining = rest_rate_limit._rest_backoff_remaining_local()
         self.assertEqual(remaining, 10.0)
 
     def test_rest_apply_cooldown_local_updates(self) -> None:
-        kalshi_sdk._REST_NEXT_ALLOWED = 50.0
+        rest_rate_limit._REST_NEXT_ALLOWED = 50.0
         with patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=40.0):
-            kalshi_sdk._rest_apply_cooldown_local(5.0)
-        self.assertEqual(kalshi_sdk._REST_NEXT_ALLOWED, 50.0)
+            rest_rate_limit._rest_apply_cooldown_local(5.0)
+        self.assertEqual(rest_rate_limit._REST_NEXT_ALLOWED, 50.0)
         with patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=60.0):
-            kalshi_sdk._rest_apply_cooldown_local(5.0)
-        self.assertEqual(kalshi_sdk._REST_NEXT_ALLOWED, 65.0)
+            rest_rate_limit._rest_apply_cooldown_local(5.0)
+        self.assertEqual(rest_rate_limit._REST_NEXT_ALLOWED, 65.0)
 
     def test_rest_apply_cooldown_local_noop(self) -> None:
-        kalshi_sdk._REST_NEXT_ALLOWED = 12.0
-        kalshi_sdk._rest_apply_cooldown_local(0)
-        self.assertEqual(kalshi_sdk._REST_NEXT_ALLOWED, 12.0)
+        rest_rate_limit._REST_NEXT_ALLOWED = 12.0
+        rest_rate_limit._rest_apply_cooldown_local(0)
+        self.assertEqual(rest_rate_limit._REST_NEXT_ALLOWED, 12.0)
 
     def test_rest_wait_local_rate_zero(self) -> None:
-        with patch("src.kalshi.kalshi_sdk._rest_limits", return_value=(0.0, 5)):
-            kalshi_sdk._rest_wait_local()
+        with patch("src.kalshi.kalshi_rest_rate_limit._rest_limits", return_value=(0.0, 5)):
+            rest_rate_limit._rest_wait_local()
 
     def test_rest_wait_local_zero_wait(self) -> None:
-        kalshi_sdk._REST_NEXT_ALLOWED = 0.0
-        kalshi_sdk._REST_LAST_REFILL = 0.0
-        kalshi_sdk._REST_TOKENS = 0.0
-        with patch("src.kalshi.kalshi_sdk._rest_limits", return_value=(float("inf"), 0)), \
+        rest_rate_limit._REST_NEXT_ALLOWED = 0.0
+        rest_rate_limit._REST_LAST_REFILL = 0.0
+        rest_rate_limit._REST_TOKENS = 0.0
+        with patch("src.kalshi.kalshi_rest_rate_limit._rest_limits", return_value=(float("inf"), 0)), \
              patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=1000.0):
-            kalshi_sdk._rest_wait_local()
+            rest_rate_limit._rest_wait_local()
 
     def test_rest_wait_local_backoff(self) -> None:
-        kalshi_sdk._REST_NEXT_ALLOWED = 105.0
+        rest_rate_limit._REST_NEXT_ALLOWED = 105.0
         with patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=100.0), \
              patch("src.kalshi.kalshi_sdk.time.sleep", side_effect=StopLoop):
             with self.assertRaises(StopLoop):
-                kalshi_sdk._rest_wait_local()
+                rest_rate_limit._rest_wait_local()
 
     def test_rest_wait_local_tokens_available(self) -> None:
-        kalshi_sdk._REST_NEXT_ALLOWED = 0.0
-        kalshi_sdk._REST_LAST_REFILL = 100.0
-        kalshi_sdk._REST_TOKENS = 2.0
-        with patch("src.kalshi.kalshi_sdk._rest_limits", return_value=(1.0, 5)), \
+        rest_rate_limit._REST_NEXT_ALLOWED = 0.0
+        rest_rate_limit._REST_LAST_REFILL = 100.0
+        rest_rate_limit._REST_TOKENS = 2.0
+        with patch("src.kalshi.kalshi_rest_rate_limit._rest_limits", return_value=(1.0, 5)), \
              patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=100.0):
-            kalshi_sdk._rest_wait_local()
-        self.assertEqual(kalshi_sdk._REST_TOKENS, 1.0)
+            rest_rate_limit._rest_wait_local()
+        self.assertEqual(rest_rate_limit._REST_TOKENS, 1.0)
 
     def test_rest_register_rate_limit_invalid_env(self) -> None:
         with patch.dict(os.environ, {"KALSHI_REST_COOLDOWN_SEC": "bad"}), \
-             patch("src.kalshi.kalshi_sdk.rest_apply_cooldown") as apply_cooldown:
+             patch("src.kalshi.kalshi_rest_rate_limit.rest_apply_cooldown") as apply_cooldown:
             kalshi_sdk.rest_register_rate_limit()
         apply_cooldown.assert_called_once_with(30.0)
 
     def test_rest_backoff_remaining_db(self) -> None:
-        with patch("src.kalshi.kalshi_sdk._rest_rate_limit_backend", return_value="db"), \
-             patch("src.kalshi.kalshi_sdk._db_rest_backoff_remaining", return_value=2.5):
+        with patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_backend", return_value="db"), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rest_backoff_remaining", return_value=2.5):
             self.assertEqual(kalshi_sdk.rest_backoff_remaining(), 2.5)
 
     def test_rest_backoff_remaining_fallback(self) -> None:
-        with patch("src.kalshi.kalshi_sdk._rest_rate_limit_backend", return_value="db"), \
-             patch("src.kalshi.kalshi_sdk._db_rest_backoff_remaining", return_value=None), \
-             patch("src.kalshi.kalshi_sdk._rest_backoff_remaining_local", return_value=1.0):
+        with patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_backend", return_value="db"), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rest_backoff_remaining", return_value=None), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_backoff_remaining_local", return_value=1.0):
             self.assertEqual(kalshi_sdk.rest_backoff_remaining(), 1.0)
 
     def test_rest_apply_cooldown_db(self) -> None:
-        with patch("src.kalshi.kalshi_sdk._rest_rate_limit_backend", return_value="db"), \
-             patch("src.kalshi.kalshi_sdk._db_rest_apply_cooldown") as db_apply:
+        with patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_backend", return_value="db"), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rest_apply_cooldown") as db_apply:
             kalshi_sdk.rest_apply_cooldown(1.5)
         db_apply.assert_called_once_with(1.5)
 
     def test_rest_wait_db(self) -> None:
-        with patch("src.kalshi.kalshi_sdk._rest_rate_limit_backend", return_value="db"), \
-             patch("src.kalshi.kalshi_sdk._db_rest_wait", return_value=True), \
-             patch("src.kalshi.kalshi_sdk._rest_wait_local") as wait_local:
+        with patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_backend", return_value="db"), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rest_wait", return_value=True), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_wait_local") as wait_local:
             kalshi_sdk.rest_wait()
         self.assertEqual(wait_local.call_count, 0)
 
     def test_rest_wait_db_fallback(self) -> None:
-        with patch("src.kalshi.kalshi_sdk._rest_rate_limit_backend", return_value="db"), \
-             patch("src.kalshi.kalshi_sdk._db_rest_wait", return_value=False), \
-             patch("src.kalshi.kalshi_sdk._rest_wait_local") as wait_local:
+        with patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_backend", return_value="db"), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rest_wait", return_value=False), \
+             patch("src.kalshi.kalshi_rest_rate_limit._rest_wait_local") as wait_local:
             kalshi_sdk.rest_wait()
         self.assertEqual(wait_local.call_count, 1)
 
     def test_rest_register_rate_limit_retry_after(self) -> None:
-        with patch("src.kalshi.kalshi_sdk._extract_retry_after", return_value=4.0), \
-             patch("src.kalshi.kalshi_sdk.rest_apply_cooldown") as apply_cooldown:
+        with patch("src.kalshi.kalshi_rest_rate_limit._extract_retry_after", return_value=4.0), \
+             patch("src.kalshi.kalshi_rest_rate_limit.rest_apply_cooldown") as apply_cooldown:
             kalshi_sdk.rest_register_rate_limit(exc=Exception("boom"))
         apply_cooldown.assert_called_once_with(4.0)
 
@@ -476,31 +477,31 @@ class TestCandlesticksRateLimit(KalshiSdkTestCase):
     def test_candlesticks_wait_invalid_interval(self) -> None:
         with patch.dict(os.environ, {"KALSHI_CANDLE_MIN_INTERVAL_SECONDS": "bad"}), \
              patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=100.0):
-            kalshi_sdk._candlesticks_wait()
+            rest_rate_limit._candlesticks_wait()
 
     def test_candlesticks_wait_sets_next_allowed(self) -> None:
         with patch.dict(os.environ, {"KALSHI_CANDLE_MIN_INTERVAL_SECONDS": "1"}), \
              patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=100.0):
-            kalshi_sdk._candlesticks_wait()
-        self.assertEqual(kalshi_sdk._CANDLE_NEXT_ALLOWED, 101.0)
+            rest_rate_limit._candlesticks_wait()
+        self.assertEqual(rest_rate_limit._CANDLE_NEXT_ALLOWED, 101.0)
 
     def test_candlesticks_wait_sleeps(self) -> None:
-        kalshi_sdk._CANDLE_NEXT_ALLOWED = 110.0
+        rest_rate_limit._CANDLE_NEXT_ALLOWED = 110.0
         with patch.dict(os.environ, {"KALSHI_CANDLE_MIN_INTERVAL_SECONDS": "0"}), \
              patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=100.0), \
              patch("src.kalshi.kalshi_sdk.time.sleep") as sleep:
-            kalshi_sdk._candlesticks_wait()
+            rest_rate_limit._candlesticks_wait()
         sleep.assert_called_once_with(10.0)
 
     def test_candlesticks_apply_cooldown_noop(self) -> None:
-        kalshi_sdk._CANDLE_NEXT_ALLOWED = 5.0
-        kalshi_sdk._candlesticks_apply_cooldown(0.0)
-        self.assertEqual(kalshi_sdk._CANDLE_NEXT_ALLOWED, 5.0)
+        rest_rate_limit._CANDLE_NEXT_ALLOWED = 5.0
+        rest_rate_limit._candlesticks_apply_cooldown(0.0)
+        self.assertEqual(rest_rate_limit._CANDLE_NEXT_ALLOWED, 5.0)
 
     def test_candlesticks_apply_cooldown_updates(self) -> None:
         with patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=10.0):
-            kalshi_sdk._candlesticks_apply_cooldown(5.0)
-        self.assertEqual(kalshi_sdk._CANDLE_NEXT_ALLOWED, 15.0)
+            rest_rate_limit._candlesticks_apply_cooldown(5.0)
+        self.assertEqual(rest_rate_limit._CANDLE_NEXT_ALLOWED, 15.0)
 
 
 class TestSdkPatching(KalshiSdkTestCase):
@@ -937,63 +938,63 @@ class TestSdkHelpers(KalshiSdkTestCase):
 
     def test_extract_headers(self) -> None:
         exc = SimpleNamespace(headers={"Retry-After": "1"})
-        self.assertEqual(kalshi_sdk._extract_headers(exc), {"Retry-After": "1"})
+        self.assertEqual(rest_rate_limit._extract_headers(exc), {"Retry-After": "1"})
         http_resp = SimpleNamespace(headers={"X": "1"})
         exc = SimpleNamespace(http_resp=http_resp)
-        self.assertEqual(kalshi_sdk._extract_headers(exc), {"X": "1"})
+        self.assertEqual(rest_rate_limit._extract_headers(exc), {"X": "1"})
 
         class Resp:
             def getheaders(self):
                 return [("X", "2")]
 
         exc = SimpleNamespace(http_resp=Resp())
-        self.assertEqual(kalshi_sdk._extract_headers(exc), [("X", "2")])
+        self.assertEqual(rest_rate_limit._extract_headers(exc), [("X", "2")])
 
         class BadResp:
             def getheaders(self):
                 raise RuntimeError("fail")
 
         exc = SimpleNamespace(http_resp=BadResp())
-        self.assertIsNone(kalshi_sdk._extract_headers(exc))
+        self.assertIsNone(rest_rate_limit._extract_headers(exc))
         exc = SimpleNamespace(http_resp=SimpleNamespace())
-        self.assertIsNone(kalshi_sdk._extract_headers(exc))
+        self.assertIsNone(rest_rate_limit._extract_headers(exc))
 
     def test_header_lookup(self) -> None:
-        self.assertEqual(kalshi_sdk._header_lookup({"X": "1"}, "x"), "1")
+        self.assertEqual(rest_rate_limit._header_lookup({"X": "1"}, "x"), "1")
         headers = [("Retry-After", "2")]
-        self.assertEqual(kalshi_sdk._header_lookup(headers, "retry-after"), "2")
+        self.assertEqual(rest_rate_limit._header_lookup(headers, "retry-after"), "2")
         headers = [("A", "1"), ("bad",)]
-        self.assertIsNone(kalshi_sdk._header_lookup(headers, "missing"))
+        self.assertIsNone(rest_rate_limit._header_lookup(headers, "missing"))
 
         class HeaderObj:
             def get(self, _name):
                 return "3"
 
-        self.assertEqual(kalshi_sdk._header_lookup(HeaderObj(), "X"), "3")
+        self.assertEqual(rest_rate_limit._header_lookup(HeaderObj(), "X"), "3")
 
         class HeaderNone:
             def get(self, _name):
                 return None
 
-        self.assertIsNone(kalshi_sdk._header_lookup(HeaderNone(), "X"))
+        self.assertIsNone(rest_rate_limit._header_lookup(HeaderNone(), "X"))
 
         class BadHeader:
             def get(self, _name):
                 raise RuntimeError("boom")
 
-        self.assertIsNone(kalshi_sdk._header_lookup(BadHeader(), "X"))
+        self.assertIsNone(rest_rate_limit._header_lookup(BadHeader(), "X"))
 
     def test_parse_retry_after(self) -> None:
         with patch("src.kalshi.kalshi_sdk.time.time", return_value=100.0):
-            self.assertEqual(kalshi_sdk._parse_retry_after("5"), 5.0)
-            self.assertEqual(kalshi_sdk._parse_retry_after(1e10), 1e10 - 100.0)
-            parsed = kalshi_sdk._parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT")
+            self.assertEqual(rest_rate_limit._parse_retry_after("5"), 5.0)
+            self.assertEqual(rest_rate_limit._parse_retry_after(1e10), 1e10 - 100.0)
+            parsed = rest_rate_limit._parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT")
             self.assertIsNotNone(parsed)
             self.assertGreater(parsed, 0.0)
-        self.assertIsNone(kalshi_sdk._parse_retry_after("bad"))
-        self.assertIsNone(kalshi_sdk._parse_retry_after(None))
+        self.assertIsNone(rest_rate_limit._parse_retry_after("bad"))
+        self.assertIsNone(rest_rate_limit._parse_retry_after(None))
         with patch("src.kalshi.kalshi_sdk.time.time", return_value=0.0):
-            parsed = kalshi_sdk._parse_retry_after("Thu, 01 Jan 1970 00:20:00")
+            parsed = rest_rate_limit._parse_retry_after("Thu, 01 Jan 1970 00:20:00")
         self.assertEqual(parsed, 1200.0)
 
     def test_extract_retry_after(self) -> None:
@@ -1115,6 +1116,45 @@ class TestSdkHelpers(KalshiSdkTestCase):
             )
         self.assertTrue(ok)
         hook.assert_called_once()
+
+    def test_call_with_retries_transient_status(self) -> None:
+        class ServerError(Exception):
+            status = 500
+
+        calls = {"count": 0}
+
+        def flake():
+            if calls["count"] == 0:
+                calls["count"] += 1
+                raise ServerError()
+            return "ok"
+
+        with patch("src.kalshi.kalshi_sdk.rest_wait"), \
+             patch("src.kalshi.kalshi_sdk.time.sleep"), \
+             patch("src.kalshi.kalshi_sdk.random.uniform", return_value=0.0):
+            ok, result = kalshi_sdk._call_with_retries(
+                flake, kalshi_sdk.RetryConfig(1, 1.0, 5.0), "ctx"
+            )
+        self.assertTrue(ok)
+        self.assertEqual(result, "ok")
+
+    def test_call_with_retries_transient_exception(self) -> None:
+        calls = {"count": 0}
+
+        def flake():
+            if calls["count"] == 0:
+                calls["count"] += 1
+                raise TimeoutError("boom")
+            return "ok"
+
+        with patch("src.kalshi.kalshi_sdk.rest_wait"), \
+             patch("src.kalshi.kalshi_sdk.time.sleep"), \
+             patch("src.kalshi.kalshi_sdk.random.uniform", return_value=0.0):
+            ok, result = kalshi_sdk._call_with_retries(
+                flake, kalshi_sdk.RetryConfig(1, 1.0, 5.0), "ctx"
+            )
+        self.assertTrue(ok)
+        self.assertEqual(result, "ok")
 
     def test_make_client_success(self) -> None:
         client = SimpleNamespace()
@@ -1242,7 +1282,7 @@ class TestSdkHelpers(KalshiSdkTestCase):
                 return {"events": [{"a": 1}], "next_cursor": "c"}
             return {"events": [{"b": 2}], "next_cursor": None}
 
-        def call_with_retries(func, _cfg, _ctx):
+        def call_with_retries(func, _cfg, _ctx, **_kwargs):
             return True, func()
 
         with patch("src.kalshi.kalshi_sdk._call_with_retries", side_effect=call_with_retries), \
@@ -1278,7 +1318,7 @@ class TestSdkHelpers(KalshiSdkTestCase):
             def get_events(self, **_kwargs):
                 return {"events": [{"a": 1}], "next_cursor": None}
 
-        def call_with_retries(func, _cfg, _ctx):
+        def call_with_retries(func, _cfg, _ctx, **_kwargs):
             return True, func()
 
         with patch("src.kalshi.kalshi_sdk._call_with_retries", side_effect=call_with_retries):

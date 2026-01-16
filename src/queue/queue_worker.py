@@ -338,6 +338,8 @@ def run_worker(
     if not queue_cfg.enabled:
         logger.error("WORK_QUEUE_ENABLE not set; worker exiting")
         return
+    if not queue_cfg.rabbitmq.publish or not queue_cfg.rabbitmq.url:
+        logger.info("RabbitMQ disabled; worker will poll DB queue")
     client, conn = open_client_and_conn(
         settings,
         private_key_pem=private_key_pem,

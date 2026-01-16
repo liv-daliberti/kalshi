@@ -15,10 +15,18 @@ from src.jobs.backfill_config import BackfillConfig
 from src.db.db import dec, get_state, parse_ts_iso, set_state, upsert_event, upsert_market
 from src.jobs.event_filter import EventScanStats, accept_event
 from src.core.guardrails import assert_service_role
+from src.core.loop_utils import log_metric as _log_metric
 from src.kalshi.kalshi_sdk import get_market_candlesticks, iter_events
 from src.queue.work_queue import QueueConfig, QueuePublisher, enqueue_job
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_rollback(conn: psycopg.Connection) -> None:
+    try:
+        conn.rollback()
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.warning("backfill_pass: rollback failed")
 
 
 @dataclass(frozen=True)
@@ -643,7 +651,21 @@ def _backfill_event(
     :rtype: tuple[int, int, int]
     """
     event = context.event
-    upsert_event(conn, event)
+    try:
+        upsert_event(conn, event)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception(
+            "backfill_pass: event upsert failed event_ticker=%s",
+            event.get("event_ticker"),
+        )
+        _log_metric(
+            logger,
+            "backfill.item_error",
+            kind="event_upsert",
+            event_ticker=event.get("event_ticker"),
+        )
+        _safe_rollback(conn)
+        return 0, 0, 0
 
     series = event.get("series_ticker")
     if not series:
@@ -653,7 +675,23 @@ def _backfill_event(
     queue_cfg = context.queue_cfg
     queue_enabled = queue_cfg is not None and queue_cfg.enabled
     for market in (event.get("markets") or []):
-        upsert_market(conn, market)
+        try:
+            upsert_market(conn, market)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception(
+                "backfill_pass: market upsert failed event=%s market=%s",
+                event.get("event_ticker"),
+                market.get("ticker"),
+            )
+            _log_metric(
+                logger,
+                "backfill.item_error",
+                kind="market_upsert",
+                event_ticker=event.get("event_ticker"),
+                market_ticker=market.get("ticker"),
+            )
+            _safe_rollback(conn)
+            continue
         counts.markets += 1
         market_ctx = MarketContext(series, market, context.strike_period)
         if queue_enabled:
@@ -673,14 +711,44 @@ def _backfill_event(
                 if window is None or window.start_s >= window.end_s:
                     enqueue = False
             if enqueue:
-                counts.queued += _queue_backfill_market(
-                    conn,
-                    queue_cfg,
-                    context.publisher,
-                    market_ctx,
-                )
+                try:
+                    counts.queued += _queue_backfill_market(
+                        conn,
+                        queue_cfg,
+                        context.publisher,
+                        market_ctx,
+                    )
+                except Exception:  # pylint: disable=broad-exception-caught
+                    logger.exception(
+                        "backfill_pass: enqueue failed event=%s market=%s",
+                        event.get("event_ticker"),
+                        market.get("ticker"),
+                    )
+                    _log_metric(
+                        logger,
+                        "backfill.item_error",
+                        kind="enqueue",
+                        event_ticker=event.get("event_ticker"),
+                        market_ticker=market.get("ticker"),
+                    )
+                    _safe_rollback(conn)
         else:
-            counts.candles += _backfill_market(conn, client, cfg, market_ctx)
+            try:
+                counts.candles += _backfill_market(conn, client, cfg, market_ctx)
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.exception(
+                    "backfill_pass: market backfill failed event=%s market=%s",
+                    event.get("event_ticker"),
+                    market.get("ticker"),
+                )
+                _log_metric(
+                    logger,
+                    "backfill.item_error",
+                    kind="market_backfill",
+                    event_ticker=event.get("event_ticker"),
+                    market_ticker=market.get("ticker"),
+                )
+                _safe_rollback(conn)
     return counts.markets, counts.candles, counts.queued
 
 
@@ -787,13 +855,28 @@ def _scan_backfill_events(
             queue_cfg=scan_ctx.queue_cfg,
             publisher=scan_ctx.publisher,
         )
-        added_markets, added_candles, added_queued = _backfill_event(
-            scan_ctx.conn,
-            scan_ctx.client,
-            scan_ctx.cfg,
-            event_ctx,
-        )
-        counts.markets += added_markets
-        counts.candles += added_candles
-        counts.queued += added_queued
+        try:
+            added_markets, added_candles, added_queued = _backfill_event(
+                scan_ctx.conn,
+                scan_ctx.client,
+                scan_ctx.cfg,
+                event_ctx,
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception(
+                "backfill_pass: event processing failed event_ticker=%s",
+                event.get("event_ticker"),
+            )
+            _log_metric(
+                logger,
+                "backfill.item_error",
+                kind="event_process",
+                event_ticker=event.get("event_ticker"),
+            )
+            _safe_rollback(scan_ctx.conn)
+            continue
+        else:
+            counts.markets += added_markets
+            counts.candles += added_candles
+            counts.queued += added_queued
     return counts, stats

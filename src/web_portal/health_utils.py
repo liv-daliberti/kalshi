@@ -17,6 +17,7 @@ from src.core.time_utils import age_seconds as _age_seconds
 
 from .config import _env_bool, _env_float, _env_int
 from .db import _db_connection, _fetch_state_rows
+from .db_timing import timed_cursor
 from .formatters import (
     _format_age_minutes,
     _format_pg_version,
@@ -82,7 +83,7 @@ def _load_portal_health_context() -> PortalHealthContext:
     health_payload = None
     try:
         with _db_connection(connect_timeout=3) as conn:
-            with conn.cursor() as cur:
+            with timed_cursor(conn) as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
             server_version = _format_pg_version(conn.info.server_version)
@@ -244,72 +245,117 @@ def _snapshot_poller_card() -> dict[str, Any]:
     }
 
 
+def _ws_ingest_unavailable(
+    context: PortalHealthContext,
+) -> tuple[str, str, str, list[str]] | None:
+    """Return status values when WS ingestion cannot be inspected."""
+    if not context.db_url:
+        return (
+            "error",
+            "Missing",
+            "DATABASE_URL is not set; cannot check WS ingestion.",
+            context.db_details,
+        )
+    if context.db_error:
+        return (
+            "error",
+            "Down",
+            "Database connection failed; cannot check WS ingestion.",
+            context.db_details + [f"Error: {context.db_error}"],
+        )
+    return None
+
+
+def _ws_ingest_status(
+    ws_enabled: bool,
+    ws_status: str,
+    ws_label: str,
+    heartbeat: dict[str, Any],
+) -> tuple[str, str, str]:
+    """Derive WS ingestion status from flags and heartbeat data."""
+    missing_subs = heartbeat.get("missing_subscriptions")
+    stale_ticks = heartbeat.get("stale_tick_count")
+    if not ws_enabled:
+        return "warn", "Disabled", "WebSocket ingestion is disabled."
+    if ws_status == "ok":
+        level = "ok"
+        summary = "WebSocket ingestion is healthy."
+    else:
+        level = "warn"
+        summary = "WebSocket ingestion is stale."
+    if missing_subs or (stale_ticks is not None and stale_ticks > 0):
+        return (
+            "warn",
+            "Degraded",
+            "WebSocket ingestion is missing subscriptions or stale ticks.",
+        )
+    return level, ws_label, summary
+
+
+def _ws_ingest_details(
+    ws_enabled: bool,
+    ws_payload: dict[str, Any],
+    heartbeat: dict[str, Any],
+) -> list[str]:
+    """Build detail rows for the WS ingestion card."""
+    details = [
+        f"KALSHI_WS_ENABLE set: {fmt_bool(ws_enabled)}",
+        f"Last WS tick: {ws_payload.get('age_label', 'N/A')} ago",
+    ]
+    heartbeat_age = heartbeat.get("age_text")
+    if heartbeat_age:
+        details.append(f"Heartbeat: {heartbeat_age}")
+    if heartbeat.get("active_tickers") is not None:
+        details.append(f"Active tickers (shard): {heartbeat.get('active_tickers')}")
+    if heartbeat.get("subscribed") is not None:
+        details.append(f"Subscribed: {heartbeat.get('subscribed')}")
+    if heartbeat.get("missing_subscriptions") is not None:
+        details.append(f"Missing subscriptions: {heartbeat.get('missing_subscriptions')}")
+    if heartbeat.get("stale_tick_window_s") is not None:
+        details.append(
+            "Stale ticks > "
+            f"{heartbeat.get('stale_tick_window_s')}s: {heartbeat.get('stale_tick_count')}"
+        )
+    if heartbeat.get("pending_subscriptions") is not None:
+        details.append(f"Pending subscriptions: {heartbeat.get('pending_subscriptions')}")
+    if heartbeat.get("pending_updates") is not None:
+        details.append(f"Pending updates: {heartbeat.get('pending_updates')}")
+    if not heartbeat:
+        details.append("Heartbeat: missing")
+    return details
+
+
+def _ws_ingest_payload_card(
+    health_payload: dict[str, Any],
+) -> tuple[str, str, str, list[str]]:
+    """Build the WS ingestion card data from cached payloads."""
+    ws_payload = health_payload.get("ws") or {}
+    heartbeat = health_payload.get("ws_heartbeat") or {}
+    ws_enabled = bool(ws_payload.get("enabled"))
+    ws_status = ws_payload.get("status") or "stale"
+    ws_label = ws_payload.get("label") or "Unknown"
+    ws_level, ws_label, ws_summary = _ws_ingest_status(
+        ws_enabled,
+        ws_status,
+        ws_label,
+        heartbeat,
+    )
+    details = _ws_ingest_details(ws_enabled, ws_payload, heartbeat)
+    return ws_level, ws_label, ws_summary, details
+
+
 def _ws_ingest_card(context: PortalHealthContext) -> dict[str, Any]:
-    details = []
+    details: list[str] = []
     ws_level = "warn"
     ws_label = "Unknown"
     ws_summary = "WebSocket ingestion status is unavailable."
-    if not context.db_url:
-        ws_level = "error"
-        ws_label = "Missing"
-        ws_summary = "DATABASE_URL is not set; cannot check WS ingestion."
-        details = context.db_details
-    elif context.db_error:
-        ws_level = "error"
-        ws_label = "Down"
-        ws_summary = "Database connection failed; cannot check WS ingestion."
-        details = context.db_details + [f"Error: {context.db_error}"]
+    unavailable = _ws_ingest_unavailable(context)
+    if unavailable is not None:
+        ws_level, ws_label, ws_summary, details = unavailable
     elif context.health_payload:
-        ws_payload = context.health_payload.get("ws") or {}
-        heartbeat = context.health_payload.get("ws_heartbeat") or {}
-        ws_enabled = bool(ws_payload.get("enabled"))
-        ws_status = ws_payload.get("status") or "stale"
-        ws_label = ws_payload.get("label") or ws_label
-        missing_subs = heartbeat.get("missing_subscriptions")
-        stale_ticks = heartbeat.get("stale_tick_count")
-        if not ws_enabled:
-            ws_level = "warn"
-            ws_label = "Disabled"
-            ws_summary = "WebSocket ingestion is disabled."
-        elif ws_status == "ok":
-            ws_level = "ok"
-            ws_summary = "WebSocket ingestion is healthy."
-        else:
-            ws_level = "warn"
-            ws_summary = "WebSocket ingestion is stale."
-        if ws_enabled and (missing_subs or (stale_ticks is not None and stale_ticks > 0)):
-            ws_level = "warn"
-            ws_label = "Degraded"
-            ws_summary = "WebSocket ingestion is missing subscriptions or stale ticks."
-
-        details = [
-            f"KALSHI_WS_ENABLE set: {fmt_bool(ws_enabled)}",
-            f"Last WS tick: {ws_payload.get('age_label', 'N/A')} ago",
-        ]
-        heartbeat_age = heartbeat.get("age_text")
-        if heartbeat_age:
-            details.append(f"Heartbeat: {heartbeat_age}")
-        if heartbeat.get("active_tickers") is not None:
-            details.append(f"Active tickers (shard): {heartbeat.get('active_tickers')}")
-        if heartbeat.get("subscribed") is not None:
-            details.append(f"Subscribed: {heartbeat.get('subscribed')}")
-        if heartbeat.get("missing_subscriptions") is not None:
-            details.append(
-                f"Missing subscriptions: {heartbeat.get('missing_subscriptions')}"
-            )
-        if heartbeat.get("stale_tick_window_s") is not None:
-            details.append(
-                "Stale ticks > "
-                f"{heartbeat.get('stale_tick_window_s')}s: {heartbeat.get('stale_tick_count')}"
-            )
-        if heartbeat.get("pending_subscriptions") is not None:
-            details.append(
-                f"Pending subscriptions: {heartbeat.get('pending_subscriptions')}"
-            )
-        if heartbeat.get("pending_updates") is not None:
-            details.append(f"Pending updates: {heartbeat.get('pending_updates')}")
-        if not heartbeat:
-            details.append("Heartbeat: missing")
+        ws_level, ws_label, ws_summary, details = _ws_ingest_payload_card(
+            context.health_payload
+        )
     return {
         "title": "WebSocket Ingestion",
         "level": ws_level,
@@ -368,7 +414,7 @@ def _fetch_latest_prediction_ts(conn: psycopg.Connection) -> datetime | None:
     )
     for label, query in queries:
         try:
-            with conn.cursor() as cur:
+            with timed_cursor(conn) as cur:
                 cur.execute(query)
                 row = cur.fetchone()
             ts_value = row[0] if row else None
@@ -394,6 +440,19 @@ class PortalStateTimestamps:
     ws_heartbeat_row: dict[str, Any] | None
 
 
+@dataclass(frozen=True)
+class PortalSnapshotState:
+    """Timestamp snapshot derived from a portal health snapshot."""
+
+    discovery_ts: datetime | None
+    backfill_ts: datetime | None
+    last_tick_ts: datetime | None
+    last_ws_tick_ts: datetime | None
+    last_prediction_ts: datetime | None
+    ws_heartbeat_row: dict[str, Any] | None
+    rag_call_row: dict[str, Any] | None
+
+
 def _state_ts(
     row: dict[str, Any] | None,
     *,
@@ -408,8 +467,93 @@ def _state_ts(
     return parsed
 
 
+def _snapshot_state_row(
+    state_rows: dict[str, Any],
+    key: str,
+) -> dict[str, Any] | None:
+    """Return a state row dict if present in a snapshot."""
+    raw = state_rows.get(key)
+    return raw if isinstance(raw, dict) else None
+
+
+def _load_snapshot_state(snapshot: dict[str, Any]) -> PortalSnapshotState:
+    """Build timestamp state from a portal health snapshot payload."""
+    state_rows = snapshot.get("state_rows") or {}
+    discovery_ts = _state_ts(_snapshot_state_row(state_rows, "last_discovery_ts"))
+    backfill_ts = _state_ts(
+        _snapshot_state_row(state_rows, "last_min_close_ts"),
+        parse_epoch=True,
+    )
+    last_tick_ts = _state_ts(_snapshot_state_row(state_rows, "last_tick_ts"))
+    if last_tick_ts is None:
+        last_tick_ts = _parse_ts(snapshot.get("latest_tick_ts"))
+    last_ws_tick_ts = _state_ts(_snapshot_state_row(state_rows, "last_ws_tick_ts"))
+    if last_ws_tick_ts is None:
+        last_ws_tick_ts = last_tick_ts
+    last_prediction_ts = _state_ts(
+        _snapshot_state_row(state_rows, "last_prediction_ts")
+    )
+    latest_prediction_ts = _parse_ts(snapshot.get("latest_prediction_ts"))
+    if latest_prediction_ts is not None and (
+        last_prediction_ts is None or latest_prediction_ts > last_prediction_ts
+    ):
+        last_prediction_ts = latest_prediction_ts
+    return PortalSnapshotState(
+        discovery_ts=discovery_ts,
+        backfill_ts=backfill_ts,
+        last_tick_ts=last_tick_ts,
+        last_ws_tick_ts=last_ws_tick_ts,
+        last_prediction_ts=last_prediction_ts,
+        ws_heartbeat_row=_snapshot_state_row(state_rows, "ws_heartbeat"),
+        rag_call_row=_snapshot_state_row(state_rows, "rag_24h_calls"),
+    )
+
+
+def _snapshot_queue_payload(snapshot: dict[str, Any]) -> dict[str, int]:
+    """Normalize queue stats for the snapshot health payload."""
+    queue_stats = snapshot.get("queue") or {}
+    return {
+        "pending": int(queue_stats.get("pending") or 0),
+        "running": int(queue_stats.get("running") or 0),
+        "failed": int(queue_stats.get("failed") or 0),
+        "workers": int(queue_stats.get("workers") or 0),
+    }
+
+
+def _build_snapshot_health_payload(
+    snapshot: dict[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    """Assemble portal health data from a snapshot payload."""
+    state = _load_snapshot_state(snapshot)
+    ws_payload = _ws_health(now, state.last_ws_tick_ts)
+    ws_heartbeat = _load_ws_heartbeat(state.ws_heartbeat_row, now)
+    call_payload = _rag_call_window_payload(state.rag_call_row, now)
+    rag_payload = _rag_health_from_ts(now, state.last_prediction_ts, call_payload)
+    discovery_stale_seconds, backfill_stale_seconds = _ingest_stale_seconds()
+    discovery_payload = _ingest_health_payload(
+        state.discovery_ts,
+        now,
+        discovery_stale_seconds,
+    )
+    backfill_payload = _ingest_health_payload(
+        state.backfill_ts,
+        now,
+        backfill_stale_seconds,
+    )
+    return {
+        "discovery": discovery_payload,
+        "backfill": backfill_payload,
+        "last_tick": _health_time_payload(state.last_tick_ts, now),
+        "ws": ws_payload,
+        "ws_heartbeat": ws_heartbeat,
+        "rag": rag_payload,
+        "queue": _snapshot_queue_payload(snapshot),
+    }
+
+
 def _query_latest_tick_ts(conn: psycopg.Connection) -> datetime | None:
-    with conn.cursor() as cur:
+    with timed_cursor(conn) as cur:
         cur.execute("SELECT MAX(ts) FROM market_ticks")
         row = cur.fetchone()
     return row[0] if row else None
@@ -460,7 +604,7 @@ def _fetch_queue_stats(conn: psycopg.Connection) -> dict[str, int]:
         minimum=10,
     )
     try:
-        with conn.cursor(row_factory=dict_row) as cur:
+        with timed_cursor(conn, row_factory=dict_row) as cur:
             cur.execute(
                 """
                 SELECT
@@ -741,56 +885,7 @@ def build_portal_health_from_snapshot(
     if not snapshot:
         return None
     now = datetime.now(timezone.utc)
-    state_rows = snapshot.get("state_rows") or {}
-
-    def _row(key: str) -> dict[str, Any] | None:
-        raw = state_rows.get(key)
-        return raw if isinstance(raw, dict) else None
-
-    discovery_ts = _state_ts(_row("last_discovery_ts"))
-    backfill_ts = _state_ts(_row("last_min_close_ts"), parse_epoch=True)
-    last_tick_ts = _state_ts(_row("last_tick_ts"))
-    if last_tick_ts is None:
-        last_tick_ts = _parse_ts(snapshot.get("latest_tick_ts"))
-    last_ws_tick_ts = _state_ts(_row("last_ws_tick_ts")) or last_tick_ts
-    last_prediction_ts = _state_ts(_row("last_prediction_ts"))
-    latest_prediction_ts = _parse_ts(snapshot.get("latest_prediction_ts"))
-    if latest_prediction_ts is not None and (
-        last_prediction_ts is None or latest_prediction_ts > last_prediction_ts
-    ):
-        last_prediction_ts = latest_prediction_ts
-
-    ws_payload = _ws_health(now, last_ws_tick_ts)
-    ws_heartbeat = _load_ws_heartbeat(_row("ws_heartbeat"), now)
-    call_payload = _rag_call_window_payload(_row("rag_24h_calls"), now)
-    rag_payload = _rag_health_from_ts(now, last_prediction_ts, call_payload)
-    discovery_stale_seconds, backfill_stale_seconds = _ingest_stale_seconds()
-    discovery_payload = _ingest_health_payload(
-        discovery_ts,
-        now,
-        discovery_stale_seconds,
-    )
-    backfill_payload = _ingest_health_payload(
-        backfill_ts,
-        now,
-        backfill_stale_seconds,
-    )
-    queue_stats = snapshot.get("queue") or {}
-    queue_payload = {
-        "pending": int(queue_stats.get("pending") or 0),
-        "running": int(queue_stats.get("running") or 0),
-        "failed": int(queue_stats.get("failed") or 0),
-        "workers": int(queue_stats.get("workers") or 0),
-    }
-    return {
-        "discovery": discovery_payload,
-        "backfill": backfill_payload,
-        "last_tick": _health_time_payload(last_tick_ts, now),
-        "ws": ws_payload,
-        "ws_heartbeat": ws_heartbeat,
-        "rag": rag_payload,
-        "queue": queue_payload,
-    }
+    return _build_snapshot_health_payload(snapshot, now)
 
 
 def _load_ws_heartbeat(

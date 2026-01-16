@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_strike_period ON events(strike_period);
+CREATE INDEX IF NOT EXISTS idx_events_category_lower ON events(LOWER(category));
 
 CREATE TABLE IF NOT EXISTS markets (
   ticker TEXT PRIMARY KEY,
@@ -82,6 +83,7 @@ CREATE TABLE IF NOT EXISTS active_markets (
 
 CREATE INDEX IF NOT EXISTS idx_active_markets_event ON active_markets(event_ticker);
 CREATE INDEX IF NOT EXISTS idx_active_markets_close_time ON active_markets(close_time);
+CREATE INDEX IF NOT EXISTS idx_active_markets_status ON active_markets(status);
 
 -- ========= State / cursors =========
 
@@ -156,6 +158,7 @@ CREATE TABLE IF NOT EXISTS market_ticks (
 ) PARTITION BY RANGE (ts);
 
 CREATE INDEX IF NOT EXISTS idx_market_ticks_ticker_ts ON market_ticks(ticker, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_market_ticks_ts ON market_ticks(ts DESC);
 
 DO $$
 DECLARE
@@ -420,7 +423,10 @@ CREATE OR REPLACE FUNCTION portal_snapshot_json(
   p_status TEXT,
   p_sort TEXT,
   p_order TEXT,
-  p_queue_lock_timeout_sec INTEGER
+  p_queue_lock_timeout_sec INTEGER,
+  p_active_offset INTEGER,
+  p_scheduled_offset INTEGER,
+  p_closed_offset INTEGER
 ) RETURNS JSONB
 LANGUAGE plpgsql
 AS $$
@@ -434,6 +440,9 @@ DECLARE
   v_order TEXT := LOWER(COALESCE(p_order, ''));
   v_sort TEXT := LOWER(COALESCE(p_sort, ''));
   v_queue_lock_timeout_sec INTEGER := GREATEST(COALESCE(p_queue_lock_timeout_sec, 900), 10);
+  v_active_offset INTEGER := GREATEST(COALESCE(p_active_offset, 0), 0);
+  v_scheduled_offset INTEGER := GREATEST(COALESCE(p_scheduled_offset, 0), 0);
+  v_closed_offset INTEGER := GREATEST(COALESCE(p_closed_offset, 0), 0);
   active_sort TEXT;
   scheduled_sort TEXT;
   active_order TEXT;
@@ -557,6 +566,7 @@ BEGIN
       FROM active_base
       ORDER BY %s
       LIMIT $1
+      OFFSET $8
     ),
     scheduled AS (
       SELECT
@@ -565,6 +575,7 @@ BEGIN
       FROM scheduled_base
       ORDER BY %s
       LIMIT $1
+      OFFSET $9
     ),
     closed AS (
       SELECT
@@ -573,6 +584,7 @@ BEGIN
       FROM closed_base
       ORDER BY close_time DESC NULLS LAST
       LIMIT $1
+      OFFSET $10
     ),
     counts AS (
       SELECT
@@ -790,7 +802,10 @@ BEGIN
       v_strike,
       v_status,
       p_close_window_hours,
-      v_queue_lock_timeout_sec;
+      v_queue_lock_timeout_sec,
+      v_active_offset,
+      v_scheduled_offset,
+      v_closed_offset;
   RETURN result;
 END;
 $$;

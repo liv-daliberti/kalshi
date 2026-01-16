@@ -14,6 +14,7 @@ from typing import Any
 import psycopg  # pylint: disable=import-error
 from flask import (  # pylint: disable=import-error
     Flask,
+    g,
     jsonify,
     redirect,
     render_template,
@@ -40,6 +41,7 @@ from .db_utils import ensure_schema_compatible, insert_market_tick
 from .db import (
     _db_connection,
     _maybe_prewarm_db_pool,
+    build_event_snapshot,
     fetch_active_event_categories,
     fetch_active_events,
     fetch_closed_events,
@@ -49,6 +51,7 @@ from .db import (
     fetch_strike_periods,
     maybe_refresh_portal_snapshot,
 )
+from .db_timing import get_db_metrics, reset_db_metrics, timed_cursor
 from .market_metadata import (
     _derive_custom_strike,
     _extract_event_metadata,
@@ -59,7 +62,7 @@ from .market_metadata import (
 from .filter_params import build_filter_params
 from .health_utils import _load_portal_health, build_portal_health_from_snapshot
 from .portal_filters import PortalFilters, _parse_portal_filters
-from .portal_limits import clamp_limit
+from .portal_limits import clamp_limit, clamp_page
 from .portal_utils import portal_func as _portal_func
 from .queue_stream_utils import _queue_stream_enabled, _queue_stream_min_reload_ms
 from .formatters import _now_utc, _parse_ts, fmt_ts
@@ -108,9 +111,39 @@ def register_routes(app: Flask) -> None:
     """Register portal routes and request hooks on the Flask app."""
     _maybe_prewarm_db_pool()
     app.context_processor(inject_queue_stream_enabled)
+    app.before_request(start_request_timer)
     app.before_request(ensure_snapshot_polling)
     app.before_request(enforce_login)
+    app.after_request(log_request_timing)
     app.add_url_rule("/", "index", index, methods=["GET"])
+
+
+def start_request_timer() -> None:
+    """Start request timing and reset DB counters."""
+    g.request_start = time.perf_counter()
+    reset_db_metrics()
+
+
+def log_request_timing(response):
+    """Log total and DB time for the request."""
+    start = getattr(g, "request_start", None)
+    if start is None:
+        return response
+    total_ms = (time.perf_counter() - start) * 1000
+    db_ms, db_queries = get_db_metrics()
+    logger.info(
+        "request timing: method=%s path=%s endpoint=%s status=%s "
+        "total_ms=%.1f db_ms=%.1f db_queries=%d",
+        request.method,
+        request.path,
+        request.endpoint,
+        response.status_code,
+        total_ms,
+        db_ms,
+        db_queries,
+    )
+    return response
+
 
 def _human_join(items: list[str]) -> str:
     """Join a list into a human-friendly phrase."""
@@ -156,7 +189,7 @@ def _load_open_market_tickers(
     min_age_sec: int,
 ) -> list[str]:
     """Load tickers for markets that have not closed and are stale enough."""
-    with conn.cursor() as cur:
+    with timed_cursor(conn) as cur:
         cur.execute(
             """
             SELECT am.ticker
@@ -475,11 +508,48 @@ class PortalData:
     error: str | None
 
 
+@dataclass(frozen=True)
+class PortalPaging:
+    """Pagination state for portal event tables."""
+
+    limit: int
+    active_page: int
+    scheduled_page: int
+    closed_page: int
+
+    @property
+    def active_offset(self) -> int:
+        """Return offset for the active events page."""
+        return self.active_page * self.limit
+
+    @property
+    def scheduled_offset(self) -> int:
+        """Return offset for the scheduled events page."""
+        return self.scheduled_page * self.limit
+
+    @property
+    def closed_offset(self) -> int:
+        """Return offset for the closed events page."""
+        return self.closed_page * self.limit
+
+    def as_params(self) -> dict[str, int]:
+        """Serialize paging to URL parameters."""
+        return {
+            "active_page": self.active_page,
+            "scheduled_page": self.scheduled_page,
+            "closed_page": self.closed_page,
+        }
+
+
 def _portal_data_cache_ttl() -> int:
-    return _env_int("WEB_PORTAL_DATA_CACHE_SEC", 5, minimum=0)
+    return _env_int("WEB_PORTAL_DATA_CACHE_SEC", 60, minimum=0)
 
 
-def _portal_data_cache_key(limit: int, filters: PortalFilters) -> tuple[Any, ...]:
+def _portal_data_cache_key(
+    limit: int,
+    filters: PortalFilters,
+    paging: PortalPaging,
+) -> tuple[Any, ...]:
     return (
         limit,
         filters.search,
@@ -489,6 +559,9 @@ def _portal_data_cache_key(limit: int, filters: PortalFilters) -> tuple[Any, ...
         filters.status,
         filters.sort,
         filters.order,
+        paging.active_page,
+        paging.scheduled_page,
+        paging.closed_page,
     )
 
 
@@ -569,6 +642,16 @@ def _portal_filter_fields(filters: PortalFilters) -> list[dict[str, Any]]:
     return fields
 
 
+def _parse_portal_paging(args: dict[str, Any], limit: int) -> PortalPaging:
+    """Parse pagination arguments for the portal tables."""
+    return PortalPaging(
+        limit=limit,
+        active_page=clamp_page(args.get("active_page")),
+        scheduled_page=clamp_page(args.get("scheduled_page")),
+        closed_page=clamp_page(args.get("closed_page")),
+    )
+
+
 def _empty_portal_data(error: str | None = None) -> PortalData:
     """Return an empty portal payload with an optional error."""
     return PortalData(
@@ -615,10 +698,14 @@ def _portal_data_from_snapshot(payload: dict[str, Any]) -> PortalData:
     )
 
 
-def _fetch_portal_data(limit: int, filters: PortalFilters) -> PortalData:
+def _fetch_portal_data(
+    limit: int,
+    filters: PortalFilters,
+    paging: PortalPaging,
+) -> PortalData:
     """Fetch portal data rows and counts."""
     ttl_sec = _portal_data_cache_ttl()
-    cache_key = _portal_data_cache_key(limit, filters)
+    cache_key = _portal_data_cache_key(limit, filters, paging)
     cached = _load_portal_data_cache(cache_key, ttl_sec)
     if cached is not None:
         return cached
@@ -626,7 +713,14 @@ def _fetch_portal_data(limit: int, filters: PortalFilters) -> PortalData:
         if _portal_db_snapshot_enabled():
             try:
                 with _db_connection() as conn:
-                    payload = fetch_portal_snapshot(conn, limit, filters)
+                    payload = fetch_portal_snapshot(
+                        conn,
+                        limit,
+                        filters,
+                        paging.active_offset,
+                        paging.scheduled_offset,
+                        paging.closed_offset,
+                    )
                 if payload:
                     data = _portal_data_from_snapshot(payload)
                     _store_portal_data_cache(cache_key, ttl_sec, data)
@@ -643,9 +737,24 @@ def _fetch_portal_data(limit: int, filters: PortalFilters) -> PortalData:
             active_total, scheduled_total, closed_total = fetch_counts(conn, filters)
             data = PortalData(
                 rows=PortalRows(
-                    active=fetch_active_events(conn, limit, filters),
-                    scheduled=fetch_scheduled_events(conn, limit, filters),
-                    closed=fetch_closed_events(conn, limit, filters),
+                    active=fetch_active_events(
+                        conn,
+                        limit,
+                        filters,
+                        offset=paging.active_offset,
+                    ),
+                    scheduled=fetch_scheduled_events(
+                        conn,
+                        limit,
+                        filters,
+                        offset=paging.scheduled_offset,
+                    ),
+                    closed=fetch_closed_events(
+                        conn,
+                        limit,
+                        filters,
+                        offset=paging.closed_offset,
+                    ),
                 ),
                 totals=PortalTotals(
                     active=active_total,
@@ -670,14 +779,19 @@ def _portal_context(
     *,
     limit: int,
     filters: PortalFilters,
+    paging: PortalPaging,
     scope_note: str | None,
     selected_categories: list[str],
     category_filters: list[dict[str, Any]],
     filter_fields: list[dict[str, Any]],
     data: PortalData,
+    load_more_links: dict[str, str],
 ) -> dict[str, Any]:
     """Build the render context for the portal template."""
     refreshed_at = fmt_ts(datetime.now(timezone.utc))
+    active_has_more = paging.active_offset + limit < data.totals.active
+    scheduled_has_more = paging.scheduled_offset + limit < data.totals.scheduled
+    closed_has_more = paging.closed_offset + limit < data.totals.closed
     return {
         "error": data.error,
         "active_rows": data.rows.active,
@@ -687,6 +801,13 @@ def _portal_context(
         "scheduled_total": data.totals.scheduled,
         "closed_total": data.totals.closed,
         "limit": limit,
+        "active_page": paging.active_page,
+        "scheduled_page": paging.scheduled_page,
+        "closed_page": paging.closed_page,
+        "active_has_more": active_has_more,
+        "scheduled_has_more": scheduled_has_more,
+        "closed_has_more": closed_has_more,
+        "load_more_links": load_more_links,
         "refreshed_at": refreshed_at,
         "logged_in": is_authenticated(),
         "scope_note": scope_note,
@@ -724,6 +845,7 @@ def index():
     db_url = os.getenv("DATABASE_URL")
     limit = clamp_limit(request.args.get("limit") or os.getenv("WEB_PORTAL_LIMIT"))
     filters = _parse_portal_filters(request.args)
+    paging = _parse_portal_paging(request.args, limit)
     filter_fields = _portal_filter_fields(filters)
     category_params = build_filter_params(limit, filters, include_category=False)
     selected_categories = list(filters.categories)
@@ -733,15 +855,17 @@ def index():
         context = _portal_context(
             limit=limit,
             filters=filters,
+            paging=paging,
             scope_note=scope_note,
             selected_categories=selected_categories,
             category_filters=[],
             filter_fields=filter_fields,
             data=data,
+            load_more_links={},
         )
         return render_template("portal.html", **context)
 
-    data = _fetch_portal_data(limit, filters)
+    data = _fetch_portal_data(limit, filters, paging)
     category_filters = build_category_filters(
         active_categories=data.active_categories,
         selected_categories=selected_categories,
@@ -749,14 +873,36 @@ def index():
         endpoint="index",
         url_for=url_for,
     )
+    base_params = build_filter_params(
+        limit,
+        filters,
+        include_category=True,
+        page_params=paging.as_params(),
+    )
+    load_more_links = {
+        "active": url_for(
+            "index",
+            **{**base_params, "active_page": paging.active_page + 1},
+        ),
+        "scheduled": url_for(
+            "index",
+            **{**base_params, "scheduled_page": paging.scheduled_page + 1},
+        ),
+        "closed": url_for(
+            "index",
+            **{**base_params, "closed_page": paging.closed_page + 1},
+        ),
+    }
     context = _portal_context(
         limit=limit,
         filters=filters,
+        paging=paging,
         scope_note=scope_note,
         selected_categories=selected_categories,
         category_filters=category_filters,
         filter_fields=filter_fields,
         data=data,
+        load_more_links=load_more_links,
     )
     return render_template("portal.html", **context)
 

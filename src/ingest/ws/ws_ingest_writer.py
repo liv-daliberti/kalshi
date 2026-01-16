@@ -21,7 +21,7 @@ from src.ingest.ws.ws_ingest_db_utils import (
     _require_psycopg,
     _safe_rollback,
 )
-from src.ingest.ws.ws_ingest_models import WriterConfig
+from src.ingest.ws.ws_ingest_models import WriterConfig, WriterStatus
 from src.ingest.ws.ws_ingest_utils import _extract_market_id, _resolve_market_ticker
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,7 @@ class _DbBatcher:
         self.flush_seconds = max(0.1, flush_seconds)
         self._tick_buffer: list[dict] = []
         self._lifecycle_buffer: list[dict] = []
+        self._last_error: Exception | None = None
         now = time.monotonic()
         self._last_flush = {
             _DB_WORK_TICK: now,
@@ -83,6 +84,15 @@ class _DbBatcher:
     def _restore_lifecycles(self, lifecycles: list[dict]) -> None:
         self._lifecycle_buffer = lifecycles + self._lifecycle_buffer
 
+    def _record_error(self, exc: Exception) -> None:
+        self._last_error = exc
+
+    def pop_error(self) -> Exception | None:
+        """Return and clear the last DB batcher error."""
+        err = self._last_error
+        self._last_error = None
+        return err
+
     def flush_ticks(self, force: bool = False) -> None:
         """Flush tick batches based on time or when forced."""
         if not force:
@@ -95,9 +105,10 @@ class _DbBatcher:
         try:
             insert_market_ticks(self.conn, ticks)
             self._last_flush[_DB_WORK_TICK] = time.monotonic()
-        except (_psycopg_error_type(), ValueError, TypeError, RuntimeError):
+        except (_psycopg_error_type(), ValueError, TypeError, RuntimeError) as exc:
             logger.exception("batch insert_market_ticks failed (count=%s)", len(ticks))
             _safe_rollback(self.conn)
+            self._record_error(exc)
             self._restore_ticks(ticks)
 
     def flush_lifecycles(self, force: bool = False) -> None:
@@ -112,12 +123,13 @@ class _DbBatcher:
         try:
             insert_lifecycle_events(self.conn, lifecycles)
             self._last_flush[_DB_WORK_LIFECYCLE] = time.monotonic()
-        except (_psycopg_error_type(), ValueError, TypeError, RuntimeError):
+        except (_psycopg_error_type(), ValueError, TypeError, RuntimeError) as exc:
             logger.exception(
                 "batch insert_lifecycle_events failed (count=%s)",
                 len(lifecycles),
             )
             _safe_rollback(self.conn)
+            self._record_error(exc)
             self._restore_lifecycles(lifecycles)
 
     def flush_due(self) -> None:
@@ -198,6 +210,38 @@ def _update_market_id_map(payload: dict, market_id_map: dict[str, str]) -> None:
     if not ticker:
         return
     market_id_map[market_id] = ticker
+
+
+def writer_is_healthy(status: WriterStatus, stale_seconds: float) -> bool:
+    """Return True when the writer heartbeat is within the stale window."""
+    if stale_seconds <= 0:
+        return True
+    last = status.last_heartbeat
+    if last <= 0:
+        return False
+    return (time.monotonic() - last) <= stale_seconds
+
+
+def _touch_status(status: WriterStatus, *, flushed: bool = False) -> None:
+    now = time.monotonic()
+    status.last_heartbeat = now
+    if flushed:
+        status.last_flush = now
+
+
+def _safe_close(conn) -> None:
+    if not conn:
+        return
+    try:
+        conn.close()
+    except (_psycopg_error_type(), RuntimeError):
+        logger.exception("WS DB writer connection close failed")
+
+
+def _safe_rollback_conn(conn) -> None:
+    if not conn:
+        return
+    _safe_rollback(conn)
 
 
 def _upsert_market_safe(conn, market: dict) -> None:
@@ -282,51 +326,132 @@ def _db_writer_loop(
     work_queue: queue.Queue,
     config: WriterConfig,
     stop_event: threading.Event,
+    restart_event: threading.Event,
+    status: WriterStatus,
 ) -> None:
     """Drain WS work items and write them using a dedicated DB connection."""
     psycopg_module = _require_psycopg()
-    conn = psycopg_module.connect(config.database_url)
-    batcher = _DbBatcher(
-        conn,
-        tick_batch_size=config.tick_batch_size,
-        lifecycle_batch_size=config.lifecycle_batch_size,
-        flush_seconds=config.flush_seconds,
-    )
-    deduper = _TickDeduper(
-        enabled=config.dedup_enabled,
-        max_age_seconds=config.dedup_max_age_seconds,
-        fields=config.dedup_fields,
-    )
-    next_flush_at = time.monotonic() + config.flush_seconds
-    try:
-        while not stop_event.is_set():
-            timeout = max(0.0, next_flush_at - time.monotonic())
+    conn = None
+    batcher = None
+    deduper = None
+    backoff = 1.0
+    max_backoff = 30.0
+    _touch_status(status)
+    while not stop_event.is_set():
+        if conn is None:
             try:
-                item = work_queue.get(timeout=timeout)
-            except queue.Empty:
-                batcher.flush_due()
-                next_flush_at = time.monotonic() + config.flush_seconds
+                conn = psycopg_module.connect(config.database_url)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                status.last_error = f"connect: {exc}"
+                _touch_status(status)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
                 continue
-            try:
-                should_stop = _handle_db_item(conn, batcher, deduper, item)
-            except (_psycopg_error_type(), ValueError, TypeError, RuntimeError):
-                logger.exception("WS DB writer failed to process item: %s", item)
+            if batcher is None:
+                batcher = _DbBatcher(
+                    conn,
+                    tick_batch_size=config.tick_batch_size,
+                    lifecycle_batch_size=config.lifecycle_batch_size,
+                    flush_seconds=config.flush_seconds,
+                )
+            else:
+                batcher.conn = conn
+            if deduper is None:
+                deduper = _TickDeduper(
+                    enabled=config.dedup_enabled,
+                    max_age_seconds=config.dedup_max_age_seconds,
+                    fields=config.dedup_fields,
+                )
+            status.last_error = None
+            status.last_connect = time.monotonic()
+            status.reconnects += 1
+            _touch_status(status)
+            backoff = 1.0
+
+        next_flush_at = time.monotonic() + config.flush_seconds
+        try:
+            while not stop_event.is_set():
+                if restart_event.is_set():
+                    restart_event.clear()
+                    logger.warning("WS DB writer restart requested")
+                    _safe_rollback_conn(conn)
+                    _safe_close(conn)
+                    conn = None
+                    break
+                timeout = max(0.0, next_flush_at - time.monotonic())
+                try:
+                    item = work_queue.get(timeout=timeout)
+                except queue.Empty:
+                    batcher.flush_due()
+                    _touch_status(status, flushed=True)
+                    error = batcher.pop_error()
+                    if error:
+                        status.last_error = f"flush: {error}"
+                        _safe_rollback_conn(conn)
+                        _safe_close(conn)
+                        conn = None
+                        break
+                    next_flush_at = time.monotonic() + config.flush_seconds
+                    continue
+                reconnect = False
                 should_stop = False
-            finally:
-                work_queue.task_done()
-            if should_stop:
+                try:
+                    should_stop = _handle_db_item(conn, batcher, deduper, item)
+                except _psycopg_error_type() as exc:
+                    status.last_error = f"db item: {exc}"
+                    logger.exception("WS DB writer failed to process item: %s", item)
+                    _safe_rollback_conn(conn)
+                    reconnect = True
+                except (ValueError, TypeError, RuntimeError) as exc:
+                    status.last_error = f"item: {exc}"
+                    logger.exception("WS DB writer failed to process item: %s", item)
+                finally:
+                    work_queue.task_done()
+                _touch_status(status)
+                error = batcher.pop_error()
+                if error:
+                    status.last_error = f"flush: {error}"
+                    reconnect = True
+                if should_stop:
+                    stop_event.set()
+                    break
+                if reconnect:
+                    _safe_rollback_conn(conn)
+                    _safe_close(conn)
+                    conn = None
+                    break
+                if time.monotonic() >= next_flush_at:
+                    batcher.flush_due()
+                    _touch_status(status, flushed=True)
+                    error = batcher.pop_error()
+                    if error:
+                        status.last_error = f"flush: {error}"
+                        _safe_rollback_conn(conn)
+                        _safe_close(conn)
+                        conn = None
+                        break
+                    next_flush_at = time.monotonic() + config.flush_seconds
+            if stop_event.is_set():
                 break
-            if time.monotonic() >= next_flush_at:
-                batcher.flush_due()
-                next_flush_at = time.monotonic() + config.flush_seconds
-    except (_psycopg_error_type(), RuntimeError):
-        logger.exception("WS DB writer crashed")
-    finally:
+        except (_psycopg_error_type(), RuntimeError) as exc:
+            status.last_error = f"loop: {exc}"
+            logger.exception("WS DB writer loop error; reconnecting")
+            _safe_rollback_conn(conn)
+            _safe_close(conn)
+            conn = None
+            time.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            status.last_error = f"fatal: {exc}"
+            logger.exception("WS DB writer crashed; retrying")
+            _safe_rollback_conn(conn)
+            _safe_close(conn)
+            conn = None
+            time.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+    if batcher is not None:
         try:
             batcher.flush_all()
         except (_psycopg_error_type(), RuntimeError):
             logger.exception("WS DB writer final flush failed")
-        try:
-            conn.close()
-        except (_psycopg_error_type(), RuntimeError):
-            logger.exception("WS DB writer connection close failed")
+    _safe_close(conn)

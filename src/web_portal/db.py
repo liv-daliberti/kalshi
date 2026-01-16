@@ -41,6 +41,7 @@ from .formatters import (
     fmt_time_remaining,
     fmt_ts,
 )
+from .db_timing import timed_cursor
 from .portal_utils import portal_attr as _portal_attr
 from .portal_utils import portal_func as _portal_func
 from .portal_utils import portal_module as _portal_module
@@ -198,7 +199,7 @@ def _portal_snapshot_refresh_on_queue() -> bool:
 
 
 def _portal_snapshot_view_exists(conn: psycopg.Connection) -> bool:
-    with conn.cursor() as cur:
+    with timed_cursor(conn) as cur:
         cur.execute("SELECT to_regclass('portal_event_rollup')")
         row = cur.fetchone()
     return bool(row and row[0])
@@ -341,7 +342,7 @@ def refresh_portal_snapshot(*, concurrent: bool = True) -> None:
                 raise RuntimeError(
                     "portal_event_rollup missing; run migrator or enable DB_INIT_SCHEMA."
                 )
-            with conn.cursor() as cur:
+            with timed_cursor(conn) as cur:
                 cur.execute(query if concurrent else fallback_query)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         if concurrent:
@@ -350,7 +351,7 @@ def refresh_portal_snapshot(*, concurrent: bool = True) -> None:
                     raise RuntimeError(
                         "portal_event_rollup missing; run migrator or enable DB_INIT_SCHEMA."
                     )
-                with conn.cursor() as cur:
+                with timed_cursor(conn) as cur:
                     cur.execute(fallback_query)
             return
         raise
@@ -414,6 +415,9 @@ def fetch_portal_snapshot(
     conn: psycopg.Connection,
     limit: int,
     filters: "PortalFilters",
+    active_offset: int = 0,
+    scheduled_offset: int = 0,
+    closed_offset: int = 0,
 ) -> dict[str, Any] | None:
     """Fetch the portal snapshot JSON payload from the database."""
     close_window_hours = filters.close_window_hours
@@ -421,10 +425,10 @@ def fetch_portal_snapshot(
     queue_timeout = _env_int("WORK_QUEUE_LOCK_TIMEOUT_SECONDS", 900, minimum=10)
     if not _ensure_portal_snapshot_schema(conn):
         return None
-    with conn.cursor() as cur:
+    with timed_cursor(conn) as cur:
         cur.execute(
             """
-            SELECT portal_snapshot_json(%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            SELECT portal_snapshot_json(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 limit,
@@ -436,6 +440,9 @@ def fetch_portal_snapshot(
                 filters.sort,
                 filters.order,
                 queue_timeout,
+                active_offset,
+                scheduled_offset,
+                closed_offset,
             ),
         )
         row = cur.fetchone()
@@ -494,7 +501,7 @@ def _fetch_state_rows(
     """Fetch ingest_state rows keyed by name."""
     if not keys:
         return {}
-    with conn.cursor(row_factory=dict_row) as cur:
+    with timed_cursor(conn, row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT key, value, updated_at
@@ -561,7 +568,7 @@ def _fetch_event_count(
           {having_sql}
         ) counted
         """
-    with conn.cursor() as cur:
+    with timed_cursor(conn) as cur:
         cur.execute(query, (*params, *having_params))
         row = cur.fetchone()
     return int(row[0] or 0)
@@ -612,6 +619,8 @@ def fetch_active_events(
     conn: psycopg.Connection,
     limit: int,
     filters: "PortalFilters",
+    *,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Fetch active event rows (at least one market is currently open)."""
     where_sql, params = _build_event_where(filters)
@@ -660,9 +669,10 @@ def fetch_active_events(
         {having_sql}
         ORDER BY {order_by}
         LIMIT %s
+        OFFSET %s
         """
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(query, (*params, *having_params, limit))
+    with timed_cursor(conn, row_factory=dict_row) as cur:
+        cur.execute(query, (*params, *having_params, limit, offset))
         rows = cur.fetchall()
     time_remaining = _portal_func("fmt_time_remaining", fmt_time_remaining)
     return [
@@ -678,6 +688,8 @@ def fetch_scheduled_events(
     conn: psycopg.Connection,
     limit: int,
     filters: "PortalFilters",
+    *,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Fetch scheduled event rows (all markets open in the future)."""
     where_sql, params = _build_event_where(filters)
@@ -717,9 +729,10 @@ def fetch_scheduled_events(
         {having_sql}
         ORDER BY {order_by}
         LIMIT %s
+        OFFSET %s
         """
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(query, (*params, *having_params, limit))
+    with timed_cursor(conn, row_factory=dict_row) as cur:
+        cur.execute(query, (*params, *having_params, limit, offset))
         rows = cur.fetchall()
     return [build_event_snapshot(row) for row in rows]
 
@@ -728,6 +741,8 @@ def fetch_closed_events(
     conn: psycopg.Connection,
     limit: int,
     filters: "PortalFilters",
+    *,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Fetch closed event rows (all markets closed)."""
     where_sql, params = _build_event_where(filters)
@@ -766,16 +781,17 @@ def fetch_closed_events(
         {having_sql}
         ORDER BY {order_by}
         LIMIT %s
+        OFFSET %s
         """
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(query, (*params, *having_params, limit))
+    with timed_cursor(conn, row_factory=dict_row) as cur:
+        cur.execute(query, (*params, *having_params, limit, offset))
         rows = cur.fetchall()
     return [build_event_snapshot(row) for row in rows]
 
 
 def fetch_event_categories(conn: psycopg.Connection) -> list[str]:
     """Fetch distinct event categories."""
-    with conn.cursor() as cur:
+    with timed_cursor(conn) as cur:
         cur.execute(
             """
             SELECT DISTINCT category
@@ -790,7 +806,7 @@ def fetch_event_categories(conn: psycopg.Connection) -> list[str]:
 
 def fetch_strike_periods(conn: psycopg.Connection) -> list[str]:
     """Fetch distinct strike periods."""
-    with conn.cursor() as cur:
+    with timed_cursor(conn) as cur:
         cur.execute(
             """
             SELECT DISTINCT strike_period
@@ -841,7 +857,7 @@ def fetch_active_event_categories(
         WHERE event_category IS NOT NULL AND event_category <> ''
         ORDER BY event_category
         """
-    with conn.cursor() as cur:
+    with timed_cursor(conn) as cur:
         cur.execute(query, (*params, *having_params))
         rows = cur.fetchall()
     return [row[0] for row in rows if row and row[0]]

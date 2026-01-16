@@ -380,13 +380,20 @@ Optional environment variables:
 - `WEB_PORTAL_PORT` (default `8000`)
 - `WEB_PORTAL_LIMIT` (default `200`, max `2000`)
 - `WEB_PORTAL_PASSWORD` (required to log in)
-- `WEB_PORTAL_SECRET_KEY` (recommended; session signing key)
+- `WEB_PORTAL_SECRET_KEY` (required; session signing key)
 - `WEB_DB_POOL_ENABLE` (default `1`; set to `0` to disable pooled DB connections)
 - `WEB_DB_POOL_MIN` (default `2`; reserved DB connections per web worker)
 - `WEB_DB_POOL_MAX` (default `8`; cap DB connections per web worker)
 - `WEB_DB_POOL_TIMEOUT` (default `3`; seconds to wait for a pooled connection)
 - `WEB_DB_POOL_PREWARM` (default `1`; open reserved connections at startup)
 - `WEB_PORTAL_SNAPSHOT_ALLOW_CLOSED` (default `0`; set to `1` to allow snapshots for closed markets/events)
+- `WEB_PORTAL_TRUST_PROXY` (default unset; set to `1`/`2` to trust that many proxy hops)
+- `WEB_PORTAL_COOKIE_SECURE` (default unset; set to `1` for HTTPS cookies)
+- `WEB_PORTAL_COOKIE_SAMESITE` (default unset; set to `Lax`, `Strict`, or `None`)
+- `WEB_PORTAL_COOKIE_HTTPONLY` (default unset; set to `1` to force HttpOnly)
+- `WEB_PORTAL_COOKIE_DOMAIN` (default unset; set to a parent domain if needed)
+- `WEB_PORTAL_COOKIE_PATH` (default unset; set to `/` or a subpath)
+- `WEB_PORTAL_COOKIE_NAME` (default unset; override the session cookie name)
 
 The portal only needs `DATABASE_URL` set; it does not require Kalshi API credentials.
 
@@ -404,6 +411,22 @@ Override defaults with environment variables if needed, for example:
 ```bash
 WEB_PORTAL_TIMEOUT=180 WEB_PORTAL_THREADS=8 gunicorn --factory -w 2 -b 0.0.0.0:8123 src.web_portal.app:create_app
 ```
+
+### Azure App Service deployment
+
+If you want GitHub Actions to configure Azure App Service settings during
+deploys, create a service principal and store the JSON in `AZURE_CREDENTIALS`:
+
+```bash
+az ad sp create-for-rbac \
+  --name "kalshi-data-ingestor-deploy" \
+  --role "Contributor" \
+  --scopes "/subscriptions/179a1c0b-5228-4f8e-904d-c6bb1072f1eb/resourceGroups/liv" \
+  --sdk-auth
+```
+
+Save the command output as the GitHub secret `AZURE_CREDENTIALS`, and add
+`WEB_PORTAL_SECRET_KEY` as a secret for deployments.
 
 ---
 

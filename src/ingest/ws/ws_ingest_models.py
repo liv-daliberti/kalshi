@@ -22,6 +22,17 @@ class WriterConfig:
     dedup_fields: tuple[str, ...]
 
 
+@dataclass
+class WriterStatus:
+    """Runtime status for the WS DB writer thread."""
+
+    last_heartbeat: float = 0.0
+    last_flush: float = 0.0
+    last_connect: float = 0.0
+    last_error: str | None = None
+    reconnects: int = 0
+
+
 @dataclass(frozen=True)
 class WsLoopOptions:
     """Optional overrides for WS loop settings."""
@@ -82,6 +93,8 @@ class WriterState:
 
     work_queue: queue.Queue
     stop_event: threading.Event
+    restart_event: threading.Event
+    status: WriterStatus
     thread: threading.Thread
 
 

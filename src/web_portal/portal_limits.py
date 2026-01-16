@@ -14,3 +14,12 @@ def clamp_limit(raw: Any) -> int:
     except (TypeError, ValueError):
         return DEFAULT_LIMIT
     return max(1, min(limit, MAX_LIMIT))
+
+
+def clamp_page(raw: Any) -> int:
+    """Clamp a raw page value to zero or higher."""
+    try:
+        page = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, page)

@@ -138,6 +138,62 @@ class TestBackfillPass(unittest.TestCase):
         for _, kwargs in get_candles.call_args_list:
             self.assertEqual(kwargs["period_interval_minutes"], 1)
 
+    def test_backfill_event_market_failure_isolated(self) -> None:
+        event = {
+            "strike_period": "hour",
+            "event_ticker": "EV1",
+            "series_ticker": "SR1",
+            "markets": [
+                {"ticker": "M1"},
+                {"ticker": "M2"},
+            ],
+        }
+
+        class RollbackConn:
+            def __init__(self):
+                self.rollbacks = 0
+
+            def rollback(self):
+                self.rollbacks += 1
+
+        def fake_upsert_market(_conn, market):
+            if market.get("ticker") == "M1":
+                raise RuntimeError("boom")
+
+        def fake_backfill_market(_conn, _client, _cfg, context, force_full=False):
+            if context.market.get("ticker") == "M2":
+                return 2
+            return 0
+
+        cfg = backfill.BackfillConfig(
+            strike_periods=("hour",),
+            event_statuses=("closed",),
+            minutes_hour=1,
+            minutes_day=60,
+            lookback_hours=2,
+        )
+        conn = RollbackConn()
+        ctx = backfill.EventBackfillContext(
+            event=event,
+            strike_period="hour",
+            queue_cfg=None,
+            publisher=None,
+        )
+
+        with patch("src.jobs.backfill.upsert_event"), \
+             patch("src.jobs.backfill.upsert_market", side_effect=fake_upsert_market), \
+             patch("src.jobs.backfill._backfill_market", side_effect=fake_backfill_market):
+            markets, candles, queued = backfill._backfill_event(
+                conn,
+                client=object(),
+                cfg=cfg,
+                context=ctx,
+            )
+
+        self.assertEqual(markets, 1)
+        self.assertEqual(candles, 2)
+        self.assertEqual(queued, 0)
+
     def test_interval_minutes_for_strike(self) -> None:
         self.assertEqual(backfill._interval_minutes_for_strike("hour", 1, 60), 1)
         self.assertEqual(backfill._interval_minutes_for_strike("day", 1, 60), 60)

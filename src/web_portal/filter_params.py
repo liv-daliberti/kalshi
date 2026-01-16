@@ -10,6 +10,7 @@ def build_filter_params(
     filters: "PortalFilters",
     *,
     include_category: bool = True,
+    page_params: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Build query parameters for filter links."""
     params: dict[str, Any] = {"limit": limit}
@@ -27,4 +28,8 @@ def build_filter_params(
         params["sort"] = filters.sort
     if filters.order:
         params["order"] = filters.order
+    if page_params:
+        for key, value in page_params.items():
+            if value:
+                params[key] = value
     return params

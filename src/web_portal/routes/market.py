@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from datetime import datetime
 
 from flask import Blueprint, jsonify, render_template, request  # pylint: disable=import-error
@@ -15,6 +17,7 @@ from src.queue.work_queue import enqueue_job
 from ..backfill_config import BackfillConfig, _load_backfill_config
 from ..config import _env_bool, _env_float, _env_int
 from ..db import _db_connection, fetch_market_detail
+from ..db_timing import timed_cursor
 from ..db_utils import insert_market_tick
 from ..formatters import _parse_ts
 from ..snapshot_utils import (
@@ -27,6 +30,36 @@ from ..snapshot_utils import (
 
 bp = Blueprint("market", __name__)
 logger = logging.getLogger(__name__)
+_MARKET_DETAIL_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
+_MARKET_DETAIL_CACHE_LOCK = threading.Lock()
+
+
+def _market_detail_cache_ttl() -> int:
+    return _env_int("WEB_PORTAL_MARKET_DETAIL_CACHE_SEC", 60, minimum=0)
+
+
+def _load_market_detail_cache(ticker: str) -> dict[str, object] | None:
+    ttl_sec = _market_detail_cache_ttl()
+    if ttl_sec <= 0:
+        return None
+    now = time.monotonic()
+    with _MARKET_DETAIL_CACHE_LOCK:
+        cached = _MARKET_DETAIL_CACHE.get(ticker)
+        if not cached:
+            return None
+        cached_ts, payload = cached
+        if now - cached_ts > ttl_sec:
+            _MARKET_DETAIL_CACHE.pop(ticker, None)
+            return None
+        return payload
+
+
+def _store_market_detail_cache(ticker: str, payload: dict[str, object]) -> None:
+    ttl_sec = _market_detail_cache_ttl()
+    if ttl_sec <= 0:
+        return
+    with _MARKET_DETAIL_CACHE_LOCK:
+        _MARKET_DETAIL_CACHE[ticker] = (time.monotonic(), payload)
 
 
 def _backfill_mode() -> str:
@@ -50,7 +83,7 @@ def _backfill_mode_error(mode: str) -> tuple[dict[str, str], int] | None:
 
 
 def _fetch_market_row(conn, ticker: str) -> dict | None:
-    with conn.cursor(row_factory=dict_row) as cur:
+    with timed_cursor(conn, row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT
@@ -188,6 +221,14 @@ def market_detail(ticker: str):
             market=None,
         )
 
+    cached = _load_market_detail_cache(ticker)
+    if cached is not None:
+        return render_template(
+            "market_detail.html",
+            error=None,
+            market=cached,
+        )
+
     error = None
     market = None
     try:
@@ -195,6 +236,8 @@ def market_detail(ticker: str):
             market = fetch_market_detail(conn, ticker)
             if market is None:
                 error = "Market not found."
+            else:
+                _store_market_detail_cache(ticker, market)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.exception("market detail query failed")
         error = str(exc)

@@ -15,6 +15,7 @@ import functools
 from collections.abc import Mapping
 from typing import Any, Callable, Iterable, Iterator, Optional, Tuple
 
+from src.core.loop_utils import log_metric as _log_metric
 from src.kalshi.kalshi_rest_rate_limit import (
     _candlesticks_apply_cooldown,
     _candlesticks_wait,
@@ -419,13 +420,31 @@ def _load_retry_config(prefix: str) -> RetryConfig:
     )
 
 
+def _is_retryable_status(status: Optional[int]) -> bool:
+    if status is None:
+        return False
+    if status in {408, 425, 429}:
+        return True
+    return 500 <= status <= 599
+
+
+def _is_transient_exception(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    name = exc.__class__.__name__.lower()
+    if "timeout" in name or "temporarilyunavailable" in name:
+        return True
+    module = exc.__class__.__module__.lower()
+    return module.startswith(("urllib3", "requests", "httpx", "socket"))
+
+
 def _call_with_retries(
     func: Callable[[], Any],
     retry_cfg: RetryConfig,
     context: str,
     rate_limit_hook: Optional[Callable[[float], None]] = None,
 ) -> tuple[bool, Any]:
-    """Call a function with 429 retry handling.
+    """Call a function with 429 + transient retry handling.
 
     :param func: Zero-arg callable to invoke.
     :type func: collections.abc.Callable[[], Any]
@@ -452,31 +471,69 @@ def _call_with_retries(
                 )
                 return False, None
             status = _extract_status(exc)
-            if status != 429:
+            if status == 429:
+                if attempt >= retry_cfg.max_retries:
+                    logger.warning(
+                        "%s rate limited; giving up after %d retries",
+                        context,
+                        retry_cfg.max_retries,
+                    )
+                    return False, None
+                sleep_s = min(retry_cfg.max_sleep, retry_cfg.base_sleep * (2 ** attempt))
+                sleep_s += random.uniform(0.0, min(retry_cfg.base_sleep, 1.0))
+                retry_after = _extract_retry_after(exc)
+                if retry_after is not None:
+                    sleep_s = max(sleep_s, retry_after)
+                    suffix = f" (retry-after={retry_after:.2f}s)"
+                else:
+                    suffix = ""
+                if rate_limit_hook is not None:
+                    rate_limit_hook(sleep_s)
+                rest_apply_cooldown(sleep_s)
+                _log_metric(
+                    logger,
+                    "kalshi.retry",
+                    context=context,
+                    kind="rate_limit",
+                    attempt=attempt + 1,
+                    sleep_s=round(sleep_s, 2),
+                    status=429,
+                )
+                logger.warning(
+                    "%s rate limited; retrying in %.2fs%s",
+                    context,
+                    sleep_s,
+                    suffix,
+                )
+                time.sleep(sleep_s)
+                attempt += 1
+                continue
+            if not (_is_retryable_status(status) or _is_transient_exception(exc)):
                 raise
             if attempt >= retry_cfg.max_retries:
                 logger.warning(
-                    "%s rate limited; giving up after %d retries",
+                    "%s transient error; giving up after %d retries (status=%s)",
                     context,
                     retry_cfg.max_retries,
+                    status,
                 )
                 return False, None
             sleep_s = min(retry_cfg.max_sleep, retry_cfg.base_sleep * (2 ** attempt))
             sleep_s += random.uniform(0.0, min(retry_cfg.base_sleep, 1.0))
-            retry_after = _extract_retry_after(exc)
-            if retry_after is not None:
-                sleep_s = max(sleep_s, retry_after)
-                suffix = f" (retry-after={retry_after:.2f}s)"
-            else:
-                suffix = ""
-            if rate_limit_hook is not None:
-                rate_limit_hook(sleep_s)
-            rest_apply_cooldown(sleep_s)
+            _log_metric(
+                logger,
+                "kalshi.retry",
+                context=context,
+                kind="transient",
+                attempt=attempt + 1,
+                sleep_s=round(sleep_s, 2),
+                status=status,
+            )
             logger.warning(
-                "%s rate limited; retrying in %.2fs%s",
+                "%s transient error; retrying in %.2fs (status=%s)",
                 context,
                 sleep_s,
-                suffix,
+                status,
             )
             time.sleep(sleep_s)
             attempt += 1

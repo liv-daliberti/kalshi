@@ -20,6 +20,7 @@ from src.db.sql_fragments import (
 )
 
 from .config import _env_int
+from .db_timing import timed_cursor
 from .filter_sql import build_filter_where
 from .formatters import (
     _derive_yes_price,
@@ -295,7 +296,7 @@ def _fetch_opportunity_rows(
         ORDER BY p.created_at DESC NULLS LAST, t.ts DESC NULLS LAST
         LIMIT %s
         """
-    with conn.cursor(row_factory=dict_row) as cur:
+    with timed_cursor(conn, row_factory=dict_row) as cur:
         cur.execute(query, (*params, *criteria_params, scan_limit))
         return cur.fetchall()
 

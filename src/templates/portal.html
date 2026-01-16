@@ -294,6 +294,29 @@
         box-shadow: 0 10px 20px var(--glow);
       }
 
+      .load-more-row {
+        margin-top: 12px;
+        display: flex;
+        justify-content: flex-end;
+      }
+
+      .load-more-btn {
+        text-decoration: none;
+        background: var(--surface-2);
+        border: 1px solid var(--border);
+        color: var(--ink);
+        padding: 8px 14px;
+        border-radius: 999px;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        box-shadow: 0 10px 18px var(--shadow);
+      }
+
+      .load-more-btn:hover {
+        background: var(--surface);
+      }
+
       .filter-card {
         background: var(--surface-2);
         border-radius: 20px;
@@ -740,17 +763,20 @@
           <div class="stat-card">
             <div class="stat-label">Active events</div>
             <div class="stat-value">{{ active_total }}</div>
-            <div class="stat-meta">Showing {{ active_rows | length }}</div>
+            {% set active_shown = (active_page * limit) + (active_rows | length) %}
+            <div class="stat-meta">Showing {{ active_shown }} of {{ active_total }}</div>
           </div>
           <div class="stat-card">
             <div class="stat-label">Closed events</div>
             <div class="stat-value">{{ closed_total }}</div>
-            <div class="stat-meta">Showing {{ closed_rows | length }}</div>
+            {% set closed_shown = (closed_page * limit) + (closed_rows | length) %}
+            <div class="stat-meta">Showing {{ closed_shown }} of {{ closed_total }}</div>
           </div>
           <div class="stat-card">
             <div class="stat-label">Scheduled events</div>
             <div class="stat-value">{{ scheduled_total }}</div>
-            <div class="stat-meta">Showing {{ scheduled_rows | length }}</div>
+            {% set scheduled_shown = (scheduled_page * limit) + (scheduled_rows | length) %}
+            <div class="stat-meta">Showing {{ scheduled_shown }} of {{ scheduled_total }}</div>
           </div>
         </div>
       </header>
@@ -957,6 +983,11 @@
             </table>
           </div>
         </div>
+        {% if active_has_more %}
+          <div class="load-more-row">
+            <a class="load-more-btn" href="{{ load_more_links.active }}">Load more</a>
+          </div>
+        {% endif %}
       </section>
 
       <section class="panel">
@@ -1021,6 +1052,11 @@
             </table>
           </div>
         </div>
+        {% if scheduled_has_more %}
+          <div class="load-more-row">
+            <a class="load-more-btn" href="{{ load_more_links.scheduled }}">Load more</a>
+          </div>
+        {% endif %}
       </section>
 
       <section class="panel">
@@ -1086,10 +1122,15 @@
             </table>
           </div>
         </div>
+        {% if closed_has_more %}
+          <div class="load-more-row">
+            <a class="load-more-btn" href="{{ load_more_links.closed }}">Load more</a>
+          </div>
+        {% endif %}
       </section>
 
       <footer class="footer">
-        Use ?limit= to adjust rows per table. Data pulled from events and markets.
+        Use ?limit= and ?active_page= / ?scheduled_page= / ?closed_page= to paginate tables.
       </footer>
     </div>
     <script>

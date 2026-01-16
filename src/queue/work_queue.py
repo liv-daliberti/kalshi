@@ -125,37 +125,53 @@ def _default_queue_for_job_types(job_types: tuple[str, ...]) -> str:
     return "kalshi.ingest"
 
 
-def load_queue_config() -> QueueConfig:
-    """Load queue settings from the environment."""
-    enabled = _parse_bool(os.getenv("WORK_QUEUE_ENABLE"))
-    rabbitmq_url = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+def _load_job_types() -> tuple[str, ...]:
     raw_job_types = os.getenv("WORK_QUEUE_JOB_TYPES")
     if raw_job_types is None:
-        job_types = ("backfill_market",)
-    else:
-        job_types = _parse_csv(raw_job_types)
+        return ("backfill_market",)
+    return _parse_csv(raw_job_types)
+
+
+def _load_rabbitmq_config(job_types: tuple[str, ...]) -> QueueRabbitMQConfig:
+    rabbitmq_url_env = os.getenv("RABBITMQ_URL")
+    rabbitmq_url_env = rabbitmq_url_env.strip() if rabbitmq_url_env else ""
+    publish_default = "1" if rabbitmq_url_env else "0"
+    publish = _parse_bool(os.getenv("WORK_QUEUE_PUBLISH", publish_default))
+    rabbitmq_url = rabbitmq_url_env or (
+        "amqp://guest:guest@localhost:5672/" if publish else ""
+    )
     queue_name = os.getenv("WORK_QUEUE_NAME") or _default_queue_for_job_types(job_types)
     prefetch = _parse_int(os.getenv("WORK_QUEUE_PREFETCH"), 4)
-    poll_seconds = _parse_int(os.getenv("WORK_QUEUE_POLL_SECONDS"), 10)
-    retry_delay_seconds = _parse_int(os.getenv("WORK_QUEUE_RETRY_SECONDS"), 60)
-    lock_timeout_seconds = _parse_int(os.getenv("WORK_QUEUE_LOCK_TIMEOUT_SECONDS"), 900)
-    max_attempts = _parse_int(os.getenv("WORK_QUEUE_MAX_ATTEMPTS"), 5)
-    cleanup_done_hours = _parse_int(os.getenv("WORK_QUEUE_CLEANUP_HOURS"), 24)
-    worker_id = os.getenv("WORK_QUEUE_WORKER_ID") or _default_worker_id()
-    publish = _parse_bool(os.getenv("WORK_QUEUE_PUBLISH", "1"))
-    rabbitmq = QueueRabbitMQConfig(
+    return QueueRabbitMQConfig(
         url=rabbitmq_url,
         queue_name=queue_name,
         prefetch=prefetch,
         publish=publish,
     )
-    timing = QueueTimingConfig(
+
+
+def _load_queue_timing() -> QueueTimingConfig:
+    poll_seconds = _parse_int(os.getenv("WORK_QUEUE_POLL_SECONDS"), 10)
+    retry_delay_seconds = _parse_int(os.getenv("WORK_QUEUE_RETRY_SECONDS"), 60)
+    lock_timeout_seconds = _parse_int(os.getenv("WORK_QUEUE_LOCK_TIMEOUT_SECONDS"), 900)
+    max_attempts = _parse_int(os.getenv("WORK_QUEUE_MAX_ATTEMPTS"), 5)
+    cleanup_done_hours = _parse_int(os.getenv("WORK_QUEUE_CLEANUP_HOURS"), 24)
+    return QueueTimingConfig(
         poll_seconds=poll_seconds,
         retry_delay_seconds=retry_delay_seconds,
         lock_timeout_seconds=lock_timeout_seconds,
         max_attempts=max_attempts,
         cleanup_done_hours=cleanup_done_hours,
     )
+
+
+def load_queue_config() -> QueueConfig:
+    """Load queue settings from the environment."""
+    enabled = _parse_bool(os.getenv("WORK_QUEUE_ENABLE"))
+    job_types = _load_job_types()
+    rabbitmq = _load_rabbitmq_config(job_types)
+    timing = _load_queue_timing()
+    worker_id = os.getenv("WORK_QUEUE_WORKER_ID") or _default_worker_id()
     return QueueConfig(
         enabled=enabled,
         job_types=job_types,

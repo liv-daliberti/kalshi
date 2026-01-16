@@ -10,6 +10,7 @@ import time
 from flask import Blueprint, Response, jsonify, stream_with_context  # pylint: disable=import-error
 
 from ..db import _db_connection, maybe_refresh_portal_snapshot
+from ..db_timing import timed_cursor
 from ..queue_stream_utils import _queue_stream_enabled
 
 bp = Blueprint("stream", __name__)
@@ -28,7 +29,7 @@ def queue_stream():
     def event_stream():
         try:
             with _db_connection(autocommit=True) as conn:
-                with conn.cursor() as cur:
+                with timed_cursor(conn) as cur:
                     cur.execute("LISTEN work_queue_update")
                 last_ping = time.monotonic()
                 while True:

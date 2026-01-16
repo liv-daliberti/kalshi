@@ -25,12 +25,20 @@ from src.db.db import (
 )
 from src.core.env_utils import env_int
 from src.core.guardrails import assert_service_role
+from src.core.loop_utils import log_metric as _log_metric
 from src.jobs.event_filter import EventScanStats, accept_event
 from src.kalshi.kalshi_sdk import iter_events
 
 logger = logging.getLogger(__name__)
 
 _DISCOVERY_HEARTBEAT_KEY = "last_discovery_heartbeat_ts"
+
+
+def _safe_rollback(conn: psycopg.Connection) -> None:
+    try:
+        conn.rollback()
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.warning("discovery_pass: rollback failed")
 
 
 @dataclass
@@ -42,6 +50,7 @@ class DiscoveryHeartbeat:
     last_monotonic: float = 0.0
 
     def beat(self, *, force: bool = False) -> None:
+        """Record a heartbeat to the DB if enough time has elapsed."""
         now = time.monotonic()
         if force or now - self.last_monotonic >= self.interval_s:
             set_state(
@@ -250,17 +259,48 @@ def _process_event(
         return 0, 0, 0
     if _should_skip_event(conn, event, last_discovery_dt):
         return 0, 0, 0
-    upsert_event(conn, event)
+    try:
+        upsert_event(conn, event)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception(
+            "discovery_pass: event upsert failed event_ticker=%s",
+            event.get("event_ticker"),
+        )
+        _log_metric(
+            logger,
+            "discovery.item_error",
+            kind="event_upsert",
+            event_ticker=event.get("event_ticker"),
+        )
+        _safe_rollback(conn)
+        return 0, 0, 0
     markets = event.get("markets") or []
     market_updates = active_updates = 0
     for market in markets:
-        market_delta, active_delta = _process_market(
-            conn,
-            market,
-            last_discovery_dt,
-        )
-        market_updates += market_delta
-        active_updates += active_delta
+        try:
+            market_delta, active_delta = _process_market(
+                conn,
+                market,
+                last_discovery_dt,
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception(
+                "discovery_pass: market upsert failed event=%s market=%s",
+                event.get("event_ticker"),
+                market.get("ticker"),
+            )
+            _log_metric(
+                logger,
+                "discovery.item_error",
+                kind="market_upsert",
+                event_ticker=event.get("event_ticker"),
+                market_ticker=market.get("ticker"),
+            )
+            _safe_rollback(conn)
+            continue
+        else:
+            market_updates += market_delta
+            active_updates += active_delta
     return 1, market_updates, active_updates
 
 
@@ -286,13 +326,27 @@ def _process_event_status(
             **params,
         ):  # with_nested_markets supported
             context.heartbeat.beat()
-            deltas = _process_event(
-                context.conn,
-                event,
-                context.strike_periods,
-                context.stats,
-                context.last_discovery_dt,
-            )
+            try:
+                deltas = _process_event(
+                    context.conn,
+                    event,
+                    context.strike_periods,
+                    context.stats,
+                    context.last_discovery_dt,
+                )
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.exception(
+                    "discovery_pass: event processing failed event_ticker=%s",
+                    event.get("event_ticker"),
+                )
+                _log_metric(
+                    logger,
+                    "discovery.item_error",
+                    kind="event_process",
+                    event_ticker=event.get("event_ticker"),
+                )
+                _safe_rollback(context.conn)
+                continue
             for idx, delta in enumerate(deltas):
                 counts[idx] += delta
     except Exception:  # pylint: disable=broad-exception-caught
@@ -302,6 +356,48 @@ def _process_event_status(
             query_status,
         )
     return counts[0], counts[1], counts[2]
+
+
+def _build_discovery_context(
+    conn: psycopg.Connection,
+    client: Any,
+    strike_periods: tuple[str, ...],
+) -> EventProcessContext:
+    """Build the discovery context and prime heartbeat state."""
+    stats = EventScanStats()
+    last_discovery_dt = _parse_discovery_cursor(get_state(conn, "last_discovery_ts"))
+    heartbeat_interval_s = env_int("DISCOVERY_HEARTBEAT_SECONDS", 60, minimum=5)
+    heartbeat = DiscoveryHeartbeat(conn=conn, interval_s=heartbeat_interval_s)
+    heartbeat.beat(force=True)
+    updated_since_params = _build_updated_since_params(client, last_discovery_dt)
+    if updated_since_params:
+        logger.info(
+            "discovery_pass: using updated-since filter %s",
+            updated_since_params,
+        )
+    return EventProcessContext(
+        conn=conn,
+        client=client,
+        strike_periods=strike_periods,
+        stats=stats,
+        last_discovery_dt=last_discovery_dt,
+        updated_since_params=updated_since_params,
+        heartbeat=heartbeat,
+    )
+
+
+def _run_discovery(
+    context: EventProcessContext,
+    statuses: tuple[str, ...],
+) -> list[int]:
+    """Process all event statuses for a discovery pass."""
+    counts = [0, 0, 0]
+    for event_status in statuses:
+        ev_delta, mk_delta, act_delta = _process_event_status(context, event_status)
+        counts[0] += ev_delta
+        counts[1] += mk_delta
+        counts[2] += act_delta
+    return counts
 
 
 def discovery_pass(
@@ -324,36 +420,9 @@ def discovery_pass(
     :rtype: tuple[int, int, int]
     """
     assert_service_role("rest", "discovery_pass")
-    stats = EventScanStats()
     statuses = event_statuses or ("active",)
-    last_discovery_dt = _parse_discovery_cursor(
-        get_state(conn, "last_discovery_ts")
-    )
-    heartbeat_interval_s = env_int("DISCOVERY_HEARTBEAT_SECONDS", 60, minimum=5)
-    heartbeat = DiscoveryHeartbeat(conn=conn, interval_s=heartbeat_interval_s)
-    heartbeat.beat(force=True)
-    updated_since_params = _build_updated_since_params(client, last_discovery_dt)
-    if updated_since_params:
-        logger.info(
-            "discovery_pass: using updated-since filter %s",
-            updated_since_params,
-        )
-
-    context = EventProcessContext(
-        conn=conn,
-        client=client,
-        strike_periods=strike_periods,
-        stats=stats,
-        last_discovery_dt=last_discovery_dt,
-        updated_since_params=updated_since_params,
-        heartbeat=heartbeat,
-    )
-    counts = [0, 0, 0]
-    for event_status in statuses:
-        ev_delta, mk_delta, act_delta = _process_event_status(context, event_status)
-        counts[0] += ev_delta
-        counts[1] += mk_delta
-        counts[2] += act_delta
+    context = _build_discovery_context(conn, client, strike_periods)
+    counts = _run_discovery(context, statuses)
 
     logger.info(
         "discovery_pass: events=%d markets=%d active_upserts=%d",
@@ -363,21 +432,21 @@ def discovery_pass(
     )
     logger.debug(
         "discovery_debug: raw_events=%d unique_events=%d filtered=%d dupes=%d statuses=%s",
-        stats.raw_events,
-        len(stats.seen_events),
-        stats.filtered_events,
-        stats.dup_events,
+        context.stats.raw_events,
+        len(context.stats.seen_events),
+        context.stats.filtered_events,
+        context.stats.dup_events,
         ",".join(s for s in statuses if s) or "none",
     )
     logger.debug(
         "discovery_debug: strike_periods=%s allowed=%s",
-        stats.summarize_strike_counts(),
+        context.stats.summarize_strike_counts(),
         ",".join(strike_periods) or "none",
     )
     logger.debug(
         "discovery_debug: inferred=%d inferred_strike_periods=%s",
-        stats.inferred_events,
-        stats.summarize_inferred_counts(),
+        context.stats.inferred_events,
+        context.stats.summarize_inferred_counts(),
     )
     try:
         cleaned = cleanup_active_markets(conn)

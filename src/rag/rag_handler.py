@@ -103,6 +103,16 @@ class PredictionContext:
     event_ticker: str
 
 
+@dataclass(frozen=True)
+class PredictionRequest:
+    """Inputs used to build per-event predictions."""
+
+    event: dict[str, Any]
+    markets: list[dict[str, Any]]
+    context: dict[str, Any]
+    prompt: str
+
+
 def load_rag_config() -> RagConfig:
     """Load RAG config values from the environment."""
     embedding_dim = parse_int(os.getenv("RAG_EMBEDDING_DIM"), 384, minimum=16)
@@ -647,25 +657,32 @@ def _predict_market(
 
 
 def _build_prediction_context(
-    event: dict[str, Any],
-    markets: list[dict[str, Any]],
-    context: dict[str, Any],
-    prompt: str,
+    request: PredictionRequest,
     cfg: RagConfig,
     llm_handler: LLMHandler | None,
 ) -> tuple[PredictionContext, list[list[float]]] | None:
     """Assemble the prediction context and query vectors for an event."""
-    event_ticker = event.get("event_ticker")
+    event_ticker = request.event.get("event_ticker")
     if not event_ticker:
         return None
-    stored_docs = _prepare_stored_docs(event, markets, context, cfg, event_ticker)
-    query_texts = _build_query_texts(event, markets, prompt)
+    stored_docs = _prepare_stored_docs(
+        request.event,
+        request.markets,
+        request.context,
+        cfg,
+        event_ticker,
+    )
+    query_texts = _build_query_texts(
+        request.event,
+        request.markets,
+        request.prompt,
+    )
     query_vectors = embed_texts(query_texts, cfg)
     prediction_ctx = PredictionContext(
-        event=event,
+        event=request.event,
         stored_docs=stored_docs,
         cfg=cfg,
-        prompt=prompt,
+        prompt=request.prompt,
         llm_handler=llm_handler,
         event_ticker=event_ticker,
     )
@@ -728,14 +745,13 @@ def predict_event(
             return []
         if allowed_calls < len(eligible_markets):
             eligible_markets = eligible_markets[:allowed_calls]
-    prepared = _build_prediction_context(
-        event,
-        eligible_markets,
-        context,
-        prompt,
-        cfg,
-        llm_handler,
+    request = PredictionRequest(
+        event=event,
+        markets=eligible_markets,
+        context=context,
+        prompt=prompt,
     )
+    prepared = _build_prediction_context(request, cfg, llm_handler)
     if prepared is None:
         return []
     prediction_ctx, query_vectors = prepared

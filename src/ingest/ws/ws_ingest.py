@@ -39,6 +39,7 @@ from src.ingest.ws.ws_ingest_models import (
     SubscriptionContext,
     SubscriptionState,
     WriterState,
+    WriterStatus,
     WsLoopConfig,
     WsLoopOptions,
     WsLoopState,
@@ -66,6 +67,7 @@ from src.ingest.ws.ws_ingest_writer import (
     _db_writer_loop,
     _queue_put_nowait,
     _update_market_id_map,
+    writer_is_healthy,
 )
 
 
@@ -123,15 +125,41 @@ def _ws_error_types(ws_lib) -> tuple[type[BaseException], ...]:
     return tuple(dict.fromkeys(errors))
 
 
-def _start_db_writer(config: WsLoopConfig) -> WriterState:
-    work_queue: queue.Queue = queue.Queue(maxsize=config.runtime.queue_maxsize)
+def _ws_expected_error_types(ws_lib) -> tuple[type[BaseException], ...]:
+    ws_exceptions = getattr(ws_lib, "exceptions", None)
+    expected_errors: list[type[BaseException]] = [
+        ConnectionResetError,
+        asyncio.TimeoutError,
+    ]
+    if ws_exceptions is None:
+        return tuple(expected_errors)
+    for name in ("ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK"):
+        exc_type = getattr(ws_exceptions, name, None)
+        if isinstance(exc_type, type) and issubclass(exc_type, BaseException):
+            expected_errors.append(exc_type)
+    return tuple(dict.fromkeys(expected_errors))
+
+
+def _start_db_writer(
+    config: WsLoopConfig,
+    *,
+    work_queue: queue.Queue | None = None,
+    status: WriterStatus | None = None,
+) -> WriterState:
+    if work_queue is None:
+        work_queue = queue.Queue(maxsize=config.runtime.queue_maxsize)
+    if status is None:
+        status = WriterStatus()
     stop_event = threading.Event()
+    restart_event = threading.Event()
     writer_thread = threading.Thread(
         target=_db_writer_loop,
         args=(
             work_queue,
             config.writer,
             stop_event,
+            restart_event,
+            status,
         ),
         daemon=True,
     )
@@ -139,8 +167,31 @@ def _start_db_writer(config: WsLoopConfig) -> WriterState:
     return WriterState(
         work_queue=work_queue,
         stop_event=stop_event,
+        restart_event=restart_event,
+        status=status,
         thread=writer_thread,
     )
+
+
+async def _monitor_writer_loop(writer_ref: dict[str, WriterState], config: WsLoopConfig) -> None:
+    interval = env_int("WS_WRITER_MONITOR_SECONDS", 30, minimum=5)
+    stale_seconds = env_int("WS_WRITER_STALE_SECONDS", max(interval * 4, 60), minimum=10)
+    while True:
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+        state = writer_ref["state"]
+        if not state.thread.is_alive():
+            logger.warning("WS DB writer thread stopped; restarting")
+            writer_ref["state"] = _start_db_writer(
+                config,
+                work_queue=state.work_queue,
+            )
+            continue
+        if not writer_is_healthy(state.status, stale_seconds):
+            logger.warning("WS DB writer heartbeat stale; requesting restart")
+            state.restart_event.set()
 
 
 def _build_ws_connect_kwargs(
@@ -618,9 +669,12 @@ async def ws_loop(
     options = _resolve_ws_loop_options(options, **kwargs)
     config = _build_ws_loop_config(conn, options)
     writer_state = _start_db_writer(config)
+    writer_ref = {"state": writer_state}
+    monitor_task = asyncio.create_task(_monitor_writer_loop(writer_ref, config))
     state = WsLoopState()
     ws_lib = _load_websockets()
     ws_errors = _ws_error_types(ws_lib)
+    ws_expected_errors = _ws_expected_error_types(ws_lib)
     session_context = WsSessionContext(
         conn=conn,
         work_queue=writer_state.work_queue,
@@ -633,6 +687,29 @@ async def ws_loop(
         while True:
             try:
                 await _run_ws_connection(ws_lib, session_context, state)
+            except ws_expected_errors as exc:
+                state.error_total += 1
+                state.consecutive_failures += 1
+                logger.warning("WS disconnected; reconnecting soon: %s", exc)
+                _log_metric(
+                    logger,
+                    "ws.reconnect",
+                    errors_total=state.error_total,
+                    consecutive_failures=state.consecutive_failures,
+                    backoff_s=state.backoff,
+                )
+                if state.consecutive_failures >= config.failure.threshold:
+                    logger.warning(
+                        "WS circuit open failures=%d cooldown_s=%.1f",
+                        state.consecutive_failures,
+                        config.failure.cooldown,
+                    )
+                    await asyncio.sleep(config.failure.cooldown)
+                    state.consecutive_failures = 0
+                    state.backoff = 1
+                    continue
+                await asyncio.sleep(state.backoff)
+                state.backoff = min(state.backoff * 2, 60)
             except ws_errors:
                 state.error_total += 1
                 state.consecutive_failures += 1
@@ -656,10 +733,18 @@ async def ws_loop(
                     continue
                 await asyncio.sleep(state.backoff)
                 state.backoff = min(state.backoff * 2, 60)
+            except Exception:  # pylint: disable=broad-exception-caught
+                state.error_total += 1
+                state.consecutive_failures += 1
+                logger.exception("WS fatal error; restarting loop")
+                await asyncio.sleep(5)
     finally:
-        writer_state.stop_event.set()
+        monitor_task.cancel()
+        await asyncio.gather(monitor_task, return_exceptions=True)
+        current_writer = writer_ref["state"]
+        current_writer.stop_event.set()
         try:
-            writer_state.work_queue.put_nowait(_DB_WORK_STOP)
+            current_writer.work_queue.put_nowait(_DB_WORK_STOP)
         except queue.Full:
             pass
-        writer_state.thread.join(timeout=5)
+        current_writer.thread.join(timeout=5)

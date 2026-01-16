@@ -76,12 +76,13 @@ class FakeThread:
 
 
 class ToggleEvent:
-    def __init__(self):
+    def __init__(self, limit=2):
         self.calls = 0
+        self.limit = limit
 
     def is_set(self):
         self.calls += 1
-        return self.calls > 1
+        return self.calls > self.limit
 
     def set(self):
         return None
@@ -430,11 +431,16 @@ class TestWsIngestDbWriter(unittest.TestCase):
             def flush_all(self):
                 self.flush_all_calls += 1
 
+            def pop_error(self):
+                return None
+
         class FakeDeduper:
             def __init__(self, *args, **kwargs):
                 return None
 
         stop_event = ToggleEvent()
+        restart_event = threading.Event()
+        status = ws_ingest_models.WriterStatus()
         batcher = FakeBatcher()
         config = ws_ingest_models.WriterConfig(
             database_url="db",
@@ -453,6 +459,8 @@ class TestWsIngestDbWriter(unittest.TestCase):
                 EmptyQueue(),
                 config,
                 stop_event,
+                restart_event,
+                status,
             )
         self.assertEqual(batcher.flush_due_calls, 1)
         self.assertEqual(batcher.flush_all_calls, 1)
@@ -465,6 +473,8 @@ class TestWsIngestDbWriter(unittest.TestCase):
         work_queue.put((ws_ingest_writer._DB_WORK_LIFECYCLE, {"market_ticker": "M1"}, {"ticker": "M1"}, "M1"))
         work_queue.put(ws_ingest_writer._DB_WORK_STOP)
         stop_event = threading.Event()
+        restart_event = threading.Event()
+        status = ws_ingest_models.WriterStatus()
 
         class FakeBatcher:
             def __init__(self, *_args, **_kwargs):
@@ -480,6 +490,9 @@ class TestWsIngestDbWriter(unittest.TestCase):
                 return None
 
             def flush_all(self):
+                return None
+
+            def pop_error(self):
                 return None
 
         class FakeDeduper:
@@ -512,6 +525,8 @@ class TestWsIngestDbWriter(unittest.TestCase):
                 work_queue,
                 config,
                 stop_event,
+                restart_event,
+                status,
             )
         self.assertGreaterEqual(log_exc.call_count, 2)
 
@@ -520,6 +535,8 @@ class TestWsIngestDbWriter(unittest.TestCase):
         work_queue.put((ws_ingest_writer._DB_WORK_TICK, {"ticker": "M1"}, None, None))
         work_queue.put(ws_ingest_writer._DB_WORK_STOP)
         stop_event = threading.Event()
+        restart_event = threading.Event()
+        status = ws_ingest_models.WriterStatus()
 
         class FakeBatcher:
             def __init__(self, *_args, **_kwargs):
@@ -537,6 +554,9 @@ class TestWsIngestDbWriter(unittest.TestCase):
 
             def flush_all(self):
                 self.flush_all_calls += 1
+
+            def pop_error(self):
+                return None
 
         class FakeDeduper:
             def __init__(self, *args, **kwargs):
@@ -577,6 +597,8 @@ class TestWsIngestDbWriter(unittest.TestCase):
                 work_queue,
                 config,
                 stop_event,
+                restart_event,
+                status,
             )
         self.assertEqual(batcher.flush_due_calls, 1)
         self.assertEqual(batcher.flush_all_calls, 1)
@@ -584,7 +606,10 @@ class TestWsIngestDbWriter(unittest.TestCase):
     def test_db_writer_loop_crash_and_finalize(self) -> None:
         work_queue = queue.Queue()
         work_queue.put((ws_ingest_writer._DB_WORK_TICK, {"ticker": "M1"}, None, None))
+        work_queue.put(ws_ingest_writer._DB_WORK_STOP)
         stop_event = threading.Event()
+        restart_event = threading.Event()
+        status = ws_ingest_models.WriterStatus()
 
         class FakeBatcher:
             def __init__(self, *_args, **_kwargs):
@@ -601,6 +626,9 @@ class TestWsIngestDbWriter(unittest.TestCase):
 
             def flush_all(self):
                 raise RuntimeError("final flush failed")
+
+            def pop_error(self):
+                return None
 
         class FakeDeduper:
             def __init__(self, *args, **kwargs):
@@ -644,6 +672,8 @@ class TestWsIngestDbWriter(unittest.TestCase):
                 work_queue,
                 config,
                 stop_event,
+                restart_event,
+                status,
             )
         self.assertGreaterEqual(log_exc.call_count, 2)
 

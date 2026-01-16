@@ -64,7 +64,58 @@ class TestDiscoveryPass(unittest.TestCase):
         self.assertEqual(kwargs["ticker"], "M1")
         self.assertEqual(kwargs["event_ticker"], "EV1")
         self.assertEqual(kwargs["close_time"], "parsed")
-        self.assertEqual(set_state.call_count, 1)
+        set_state.assert_any_call(
+            unittest.mock.ANY,
+            "last_discovery_ts",
+            unittest.mock.ANY,
+        )
+
+    def test_discovery_pass_event_failure_isolated(self) -> None:
+        events = [
+            {
+                "strike_period": "hour",
+                "event_ticker": "EV_BAD",
+                "markets": [
+                    {"ticker": "MB1", "event_ticker": "EV_BAD", "status": "open"},
+                ],
+            },
+            {
+                "strike_period": "hour",
+                "event_ticker": "EV_OK",
+                "markets": [
+                    {
+                        "ticker": "M2",
+                        "event_ticker": "EV_OK",
+                        "status": "open",
+                        "close_time": "2024-01-01T01:00:00Z",
+                    },
+                ],
+            },
+        ]
+
+        def fake_upsert_event(_conn, event):
+            if event.get("event_ticker") == "EV_BAD":
+                raise RuntimeError("boom")
+
+        with patch("src.jobs.discovery.iter_events", return_value=events), \
+             patch("src.jobs.discovery.upsert_event", side_effect=fake_upsert_event) as upsert_event, \
+             patch("src.jobs.discovery.upsert_market") as upsert_market, \
+             patch("src.jobs.discovery.upsert_active_market") as upsert_active_market, \
+             patch("src.jobs.discovery.get_state", return_value=None), \
+             patch("src.jobs.discovery.set_state"), \
+             patch("src.jobs.discovery.cleanup_active_markets", return_value=0), \
+             patch("src.jobs.discovery.parse_ts_iso", return_value="parsed"):
+            result = discovery.discovery_pass(
+                conn=object(),
+                client=object(),
+                strike_periods=("hour",),
+                event_statuses=("open",),
+            )
+
+        self.assertEqual(result, (1, 1, 1))
+        self.assertEqual(upsert_event.call_count, 2)
+        self.assertEqual(upsert_market.call_count, 1)
+        self.assertEqual(upsert_active_market.call_count, 1)
 
     def test_resolve_events_method(self) -> None:
         class ClientWithIter:
@@ -336,7 +387,11 @@ class TestDiscoveryPassEdgeCases(unittest.TestCase):
         self.assertEqual(kwargs["status"], "open")
         self.assertEqual(kwargs["updated_after_ts"], int(last_dt.timestamp()))
         self.assertTrue(kwargs["with_nested_markets"])
-        set_state.assert_called_once()
+        set_state.assert_any_call(
+            unittest.mock.ANY,
+            "last_discovery_ts",
+            unittest.mock.ANY,
+        )
 
     def test_discovery_pass_handles_iter_errors_and_cleanup_errors(self) -> None:
         with patch("src.jobs.discovery.iter_events", side_effect=RuntimeError("boom")), \
@@ -350,7 +405,11 @@ class TestDiscoveryPassEdgeCases(unittest.TestCase):
                 event_statuses=("open",),
             )
         self.assertEqual(result, (0, 0, 0))
-        set_state.assert_called_once()
+        set_state.assert_any_call(
+            unittest.mock.ANY,
+            "last_discovery_ts",
+            unittest.mock.ANY,
+        )
 
     def test_discovery_pass_logs_cleanup_count(self) -> None:
         with patch("src.jobs.discovery.iter_events", return_value=[]), \
@@ -364,4 +423,8 @@ class TestDiscoveryPassEdgeCases(unittest.TestCase):
                 event_statuses=("open",),
             )
         self.assertEqual(result, (0, 0, 0))
-        set_state.assert_called_once()
+        set_state.assert_any_call(
+            unittest.mock.ANY,
+            "last_discovery_ts",
+            unittest.mock.ANY,
+        )

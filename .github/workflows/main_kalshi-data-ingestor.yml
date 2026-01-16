@@ -40,6 +40,10 @@ jobs:
           path: |
             .
             !antenv/
+            !.env
+            !.env.*
+            !configs/env/*.env
+            !configs/env/*.env.example
       # 
       # If you prefer to disable the Oryx build process during deployment, follow these steps:
       # 1. Remove the SCM_DO_BUILD_DURING_DEPLOYMENT app setting from your Azure App Service Environment variables.
@@ -55,6 +59,65 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: python-app
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Ensure CDN compression is enabled
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            set -euo pipefail
+            az account set --subscription "179a1c0b-5228-4f8e-904d-c6bb1072f1eb"
+            RESOURCE_GROUP="liv"
+            APP_NAME="Kalshi-Data-Ingestor"
+            PROFILE_NAME="kalshi-cdn"
+            ENDPOINT_NAME="kalshi-ingestor-cdn"
+            ORIGIN_HOST=$(az webapp show -g "$RESOURCE_GROUP" -n "$APP_NAME" --query defaultHostName -o tsv)
+            if ! az cdn profile show -g "$RESOURCE_GROUP" -n "$PROFILE_NAME" >/dev/null 2>&1; then
+              az cdn profile create -g "$RESOURCE_GROUP" -n "$PROFILE_NAME" --sku Standard_Microsoft
+            fi
+            if ! az cdn endpoint show -g "$RESOURCE_GROUP" --profile-name "$PROFILE_NAME" -n "$ENDPOINT_NAME" >/dev/null 2>&1; then
+              az cdn endpoint create \
+                -g "$RESOURCE_GROUP" \
+                --profile-name "$PROFILE_NAME" \
+                -n "$ENDPOINT_NAME" \
+                --origin "$ORIGIN_HOST" \
+                --origin-host-header "$ORIGIN_HOST"
+            fi
+            az cdn endpoint update \
+              -g "$RESOURCE_GROUP" \
+              --profile-name "$PROFILE_NAME" \
+              -n "$ENDPOINT_NAME" \
+              --is-compression-enabled true \
+              --content-types-to-compress \
+                "text/html" \
+                "text/css" \
+                "application/javascript" \
+                "application/json" \
+                "image/svg+xml" \
+                "font/woff2"
+
+      - name: Configure app settings
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            az account set --subscription "179a1c0b-5228-4f8e-904d-c6bb1072f1eb"
+            az webapp config appsettings set \
+              --resource-group "liv" \
+              --name "Kalshi-Data-Ingestor" \
+              --settings \
+                WEB_PORTAL_SECRET_KEY=${{ secrets.WEB_PORTAL_SECRET_KEY }} \
+                WEB_PORTAL_TRUST_PROXY=1 \
+                WEB_PORTAL_COOKIE_SAMESITE=None \
+                WEB_PORTAL_STATIC_CACHE_MAX_AGE_SEC=3600 \
+                WEB_PORTAL_COOKIE_SECURE=1
+            az webapp config set \
+              --resource-group "liv" \
+              --name "Kalshi-Data-Ingestor" \
+              --startup-file "bash scripts/start_kalshi_appservice.sh"
       
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3

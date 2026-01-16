@@ -12,6 +12,7 @@ from .kalshi import _get_market_data as _fetch_market_data
 from .portal_utils import portal_func as _portal_func
 from .portal_utils import portal_logger as _portal_logger_util
 from .portal_types import PsycopgConnection
+from .db_timing import timed_cursor
 
 
 def _portal_logger():
@@ -92,7 +93,7 @@ def _update_market_extras(
     SET {", ".join(updates)}
     WHERE ticker = %(ticker)s
     """
-    with conn.cursor() as cur:
+    with timed_cursor(conn) as cur:
         cur.execute(sql, params)
 
 
@@ -110,7 +111,7 @@ def _update_event_metadata(
         updated_at = NOW()
     WHERE event_ticker = %(event_ticker)s
     """
-    with conn.cursor() as cur:
+    with timed_cursor(conn) as cur:
         cur.execute(
             sql,
             {

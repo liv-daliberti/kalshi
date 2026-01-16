@@ -50,6 +50,16 @@ def build_archive_closed_config(settings) -> ArchiveClosedConfig:
     )
 
 
+def _load_missing_tickers(primary_conn: psycopg.Connection, settings) -> set[str]:
+    """Collect market tickers to exclude from archiving."""
+    cleanup_cfg = build_closed_cleanup_config(settings)
+    missing_settlement, missing_candles = _load_missing_closed_markets(
+        primary_conn,
+        cleanup_cfg,
+    )
+    return set(missing_settlement) | set(missing_candles)
+
+
 def _copy_rows(
     primary_conn: psycopg.Connection,
     backup_conn: psycopg.Connection,
@@ -210,7 +220,12 @@ def _create_backup_targets(
         )
 
 
-def _count_tables(conn: psycopg.Connection, *, event_table: str, market_table: str) -> dict[str, int]:
+def _count_tables(
+    conn: psycopg.Connection,
+    *,
+    event_table: str,
+    market_table: str,
+) -> dict[str, int]:
     counts: dict[str, int] = {}
     with conn.cursor() as cur:
         cur.execute(
@@ -459,6 +474,299 @@ def _delete_archived_rows(conn: psycopg.Connection) -> dict[str, int]:
     return counts
 
 
+def _archive_selected_targets(
+    primary_conn: psycopg.Connection,
+    backup_conn: psycopg.Connection,
+    cfg: ArchiveClosedConfig,
+    events: list[str],
+    markets: list[tuple[str, str]],
+) -> tuple[dict[str, int], dict[str, int]]:
+    _create_backup_targets(backup_conn, events, markets)
+    _lock_targets(primary_conn)
+    expected_counts = _count_tables(
+        primary_conn,
+        event_table="eligible_events",
+        market_table="eligible_markets",
+    )
+
+    archived_rows: dict[str, int] = {}
+    archived_rows["events"] = _copy_rows(
+        primary_conn,
+        backup_conn,
+        select_sql="""
+            SELECT event_ticker, series_ticker, title, sub_title, category,
+                   mutually_exclusive, collateral_return_type, available_on_brokers,
+                   product_metadata, strike_date, strike_period, updated_at
+            FROM events e
+            JOIN eligible_events ee ON ee.event_ticker = e.event_ticker
+        """,
+        insert_sql="""
+            INSERT INTO events(
+              event_ticker, series_ticker, title, sub_title, category,
+              mutually_exclusive, collateral_return_type, available_on_brokers,
+              product_metadata, strike_date, strike_period, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """,
+        batch_size=cfg.batch_size,
+        label="events",
+    )
+    archived_rows["markets"] = _copy_rows(
+        primary_conn,
+        backup_conn,
+        select_sql="""
+            SELECT ticker, event_ticker, market_type, title, subtitle,
+                   yes_sub_title, no_sub_title, category, response_price_units,
+                   created_time, open_time, close_time, expiration_time,
+                   latest_expiration_time, expected_expiration_time,
+                   settlement_timer_seconds, can_close_early, early_close_condition,
+                   rules_primary, rules_secondary, tick_size, risk_limit_cents,
+                   price_level_structure, price_ranges, strike_type, floor_strike,
+                   cap_strike, functional_strike, custom_strike,
+                   mve_collection_ticker, mve_selected_legs,
+                   primary_participant_key,
+                   settlement_value, settlement_value_dollars, settlement_ts,
+                   updated_at
+            FROM markets m
+            JOIN eligible_markets em ON em.ticker = m.ticker
+        """,
+        insert_sql="""
+            INSERT INTO markets(
+              ticker, event_ticker, market_type, title, subtitle,
+              yes_sub_title, no_sub_title, category, response_price_units,
+              created_time, open_time, close_time, expiration_time,
+              latest_expiration_time, expected_expiration_time,
+              settlement_timer_seconds, can_close_early, early_close_condition,
+              rules_primary, rules_secondary, tick_size, risk_limit_cents,
+              price_level_structure, price_ranges, strike_type, floor_strike,
+              cap_strike, functional_strike, custom_strike,
+              mve_collection_ticker, mve_selected_legs,
+              primary_participant_key,
+              settlement_value, settlement_value_dollars, settlement_ts,
+              updated_at
+            )
+            VALUES (
+              %s, %s, %s, %s, %s, %s, %s, %s, %s,
+              %s, %s, %s, %s, %s, %s, %s,
+              %s, %s, %s, %s, %s, %s,
+              %s, %s, %s, %s, %s, %s, %s,
+              %s, %s,
+              %s,
+              %s, %s, %s,
+              %s
+            )
+            ON CONFLICT DO NOTHING
+        """,
+        batch_size=cfg.batch_size,
+        label="markets",
+    )
+    archived_rows["prediction_runs"] = _copy_rows(
+        primary_conn,
+        backup_conn,
+        select_sql="""
+            SELECT id, event_ticker, run_ts, prompt, agent, model, status, error, metadata
+            FROM prediction_runs pr
+            JOIN eligible_events ee ON ee.event_ticker = pr.event_ticker
+        """,
+        insert_sql="""
+            INSERT INTO prediction_runs(
+              id, event_ticker, run_ts, prompt, agent, model, status, error, metadata
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """,
+        batch_size=cfg.batch_size,
+        label="prediction_runs",
+    )
+    archived_rows["market_predictions"] = _copy_rows(
+        primary_conn,
+        backup_conn,
+        select_sql="""
+            SELECT mp.id, mp.run_id, mp.event_ticker, mp.market_ticker,
+                   mp.predicted_yes_prob, mp.confidence, mp.rationale, mp.raw,
+                   mp.created_at
+            FROM market_predictions mp
+            LEFT JOIN eligible_markets em ON em.ticker = mp.market_ticker
+            LEFT JOIN eligible_events ee ON ee.event_ticker = mp.event_ticker
+            WHERE em.ticker IS NOT NULL OR ee.event_ticker IS NOT NULL
+        """,
+        insert_sql="""
+            INSERT INTO market_predictions(
+              id, run_id, event_ticker, market_ticker,
+              predicted_yes_prob, confidence, rationale, raw, created_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """,
+        batch_size=cfg.batch_size,
+        label="market_predictions",
+    )
+    archived_rows["rag_documents"] = _copy_rows(
+        primary_conn,
+        backup_conn,
+        select_sql="""
+            SELECT rd.id, rd.source, rd.source_id, rd.event_ticker, rd.market_ticker,
+                   rd.content, rd.embedding, rd.metadata, rd.created_at, rd.updated_at
+            FROM rag_documents rd
+            LEFT JOIN eligible_markets em ON em.ticker = rd.market_ticker
+            LEFT JOIN eligible_events ee ON ee.event_ticker = rd.event_ticker
+            WHERE em.ticker IS NOT NULL OR ee.event_ticker IS NOT NULL
+        """,
+        insert_sql="""
+            INSERT INTO rag_documents(
+              id, source, source_id, event_ticker, market_ticker,
+              content, embedding, metadata, created_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """,
+        batch_size=cfg.batch_size,
+        label="rag_documents",
+    )
+    archived_rows["active_markets"] = _copy_rows(
+        primary_conn,
+        backup_conn,
+        select_sql="""
+            SELECT am.ticker, am.event_ticker, am.close_time, am.status,
+                   am.last_seen_ts, am.updated_at
+            FROM active_markets am
+            JOIN eligible_markets em ON em.ticker = am.ticker
+        """,
+        insert_sql="""
+            INSERT INTO active_markets(
+              ticker, event_ticker, close_time, status, last_seen_ts, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """,
+        batch_size=cfg.batch_size,
+        label="active_markets",
+    )
+    archived_rows["market_ticks"] = _copy_rows(
+        primary_conn,
+        backup_conn,
+        select_sql="""
+            SELECT id, ts, ticker, price, yes_bid, yes_ask,
+                   price_dollars, yes_bid_dollars, yes_ask_dollars, no_bid_dollars,
+                   volume, open_interest, dollar_volume, dollar_open_interest,
+                   implied_yes_mid, sid, raw
+            FROM market_ticks mt
+            JOIN eligible_markets em ON em.ticker = mt.ticker
+        """,
+        insert_sql="""
+            INSERT INTO market_ticks(
+              id, ts, ticker, price, yes_bid, yes_ask,
+              price_dollars, yes_bid_dollars, yes_ask_dollars, no_bid_dollars,
+              volume, open_interest, dollar_volume, dollar_open_interest,
+              implied_yes_mid, sid, raw
+            )
+            VALUES (
+              %s, %s, %s, %s, %s, %s,
+              %s, %s, %s, %s,
+              %s, %s, %s, %s,
+              %s, %s, %s
+            )
+            ON CONFLICT DO NOTHING
+        """,
+        batch_size=cfg.batch_size,
+        label="market_ticks",
+    )
+    archived_rows["market_candles"] = _copy_rows(
+        primary_conn,
+        backup_conn,
+        select_sql="""
+            SELECT market_ticker, period_interval_minutes, end_period_ts, start_period_ts,
+                   open, high, low, close, volume, open_interest, raw
+            FROM market_candles mc
+            JOIN eligible_markets em ON em.ticker = mc.market_ticker
+        """,
+        insert_sql="""
+            INSERT INTO market_candles(
+              market_ticker, period_interval_minutes, end_period_ts, start_period_ts,
+              open, high, low, close, volume, open_interest, raw
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """,
+        batch_size=cfg.batch_size,
+        label="market_candles",
+    )
+    archived_rows["lifecycle_events"] = _copy_rows(
+        primary_conn,
+        backup_conn,
+        select_sql="""
+            SELECT id, ts, market_ticker, event_type, open_ts, close_ts, raw
+            FROM lifecycle_events le
+            JOIN eligible_markets em ON em.ticker = le.market_ticker
+        """,
+        insert_sql="""
+            INSERT INTO lifecycle_events(
+              id, ts, market_ticker, event_type, open_ts, close_ts, raw
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """,
+        batch_size=cfg.batch_size,
+        label="lifecycle_events",
+    )
+    archived_rows["work_queue"] = _copy_rows(
+        primary_conn,
+        backup_conn,
+        select_sql="""
+            SELECT id, job_type, payload, status, attempts, max_attempts,
+                   available_at, locked_by, locked_at, last_error, created_at, updated_at
+            FROM work_queue w
+            JOIN eligible_markets em
+              ON w.job_type = 'backfill_market'
+             AND (w.payload->'market'->>'ticker') = em.ticker
+        """,
+        insert_sql="""
+            INSERT INTO work_queue(
+              id, job_type, payload, status, attempts, max_attempts,
+              available_at, locked_by, locked_at, last_error, created_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """,
+        batch_size=cfg.batch_size,
+        label="work_queue",
+    )
+    archived_rows["ingest_state"] = _copy_rows(
+        primary_conn,
+        backup_conn,
+        select_sql="""
+            SELECT s.key, s.value, s.updated_at
+            FROM ingest_state s
+            JOIN eligible_markets em
+              ON s.key LIKE ('backfill_last_ts:' || em.ticker || ':%')
+        """,
+        insert_sql="""
+            INSERT INTO ingest_state(key, value, updated_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """,
+        batch_size=cfg.batch_size,
+        label="ingest_state",
+    )
+
+    backup_counts = _count_tables(
+        backup_conn,
+        event_table="archive_events",
+        market_table="archive_markets",
+    )
+    for table, expected in expected_counts.items():
+        if backup_counts.get(table, 0) < expected:
+            raise RuntimeError(
+                "archive verification failed: "
+                f"table={table} expected={expected} backup={backup_counts.get(table, 0)}"
+            )
+
+    deleted_rows = _delete_archived_rows(primary_conn)
+    primary_conn.commit()
+    return archived_rows, deleted_rows
+
+
 def archive_closed_events(
     primary_conn: psycopg.Connection,
     backup_conn: psycopg.Connection,
@@ -467,9 +775,7 @@ def archive_closed_events(
 ) -> ArchiveClosedStats | None:
     """Archive closed events older than the cutoff into the backup DB."""
     ensure_schema_compatible(backup_conn)
-    cleanup_cfg = build_closed_cleanup_config(settings)
-    missing_settlement, missing_candles = _load_missing_closed_markets(primary_conn, cleanup_cfg)
-    missing_tickers = set(missing_settlement) | set(missing_candles)
+    missing_tickers = _load_missing_tickers(primary_conn, settings)
 
     try:
         events, markets = _prepare_archive_targets(
@@ -482,289 +788,13 @@ def archive_closed_events(
             primary_conn.rollback()
             return None
 
-        _create_backup_targets(backup_conn, events, markets)
-        _lock_targets(primary_conn)
-        expected_counts = _count_tables(
-            primary_conn,
-            event_table="eligible_events",
-            market_table="eligible_markets",
-        )
-
-        archived_rows: dict[str, int] = {}
-        archived_rows["events"] = _copy_rows(
+        archived_rows, deleted_rows = _archive_selected_targets(
             primary_conn,
             backup_conn,
-            select_sql="""
-                SELECT event_ticker, series_ticker, title, sub_title, category,
-                       mutually_exclusive, collateral_return_type, available_on_brokers,
-                       product_metadata, strike_date, strike_period, updated_at
-                FROM events e
-                JOIN eligible_events ee ON ee.event_ticker = e.event_ticker
-            """,
-            insert_sql="""
-                INSERT INTO events(
-                  event_ticker, series_ticker, title, sub_title, category,
-                  mutually_exclusive, collateral_return_type, available_on_brokers,
-                  product_metadata, strike_date, strike_period, updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """,
-            batch_size=cfg.batch_size,
-            label="events",
+            cfg,
+            events,
+            markets,
         )
-        archived_rows["markets"] = _copy_rows(
-            primary_conn,
-            backup_conn,
-            select_sql="""
-                SELECT ticker, event_ticker, market_type, title, subtitle,
-                       yes_sub_title, no_sub_title, category, response_price_units,
-                       created_time, open_time, close_time, expiration_time,
-                       latest_expiration_time, expected_expiration_time,
-                       settlement_timer_seconds, can_close_early, early_close_condition,
-                       rules_primary, rules_secondary, tick_size, risk_limit_cents,
-                       price_level_structure, price_ranges, strike_type, floor_strike,
-                       cap_strike, functional_strike, custom_strike,
-                       mve_collection_ticker, mve_selected_legs,
-                       primary_participant_key,
-                       settlement_value, settlement_value_dollars, settlement_ts,
-                       updated_at
-                FROM markets m
-                JOIN eligible_markets em ON em.ticker = m.ticker
-            """,
-            insert_sql="""
-                INSERT INTO markets(
-                  ticker, event_ticker, market_type, title, subtitle,
-                  yes_sub_title, no_sub_title, category, response_price_units,
-                  created_time, open_time, close_time, expiration_time,
-                  latest_expiration_time, expected_expiration_time,
-                  settlement_timer_seconds, can_close_early, early_close_condition,
-                  rules_primary, rules_secondary, tick_size, risk_limit_cents,
-                  price_level_structure, price_ranges, strike_type, floor_strike,
-                  cap_strike, functional_strike, custom_strike,
-                  mve_collection_ticker, mve_selected_legs,
-                  primary_participant_key,
-                  settlement_value, settlement_value_dollars, settlement_ts,
-                  updated_at
-                )
-                VALUES (
-                  %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                  %s, %s, %s, %s, %s, %s, %s,
-                  %s, %s, %s, %s, %s, %s,
-                  %s, %s, %s, %s, %s, %s, %s,
-                  %s, %s,
-                  %s,
-                  %s, %s, %s,
-                  %s
-                )
-                ON CONFLICT DO NOTHING
-            """,
-            batch_size=cfg.batch_size,
-            label="markets",
-        )
-        archived_rows["prediction_runs"] = _copy_rows(
-            primary_conn,
-            backup_conn,
-            select_sql="""
-                SELECT id, event_ticker, run_ts, prompt, agent, model, status, error, metadata
-                FROM prediction_runs pr
-                JOIN eligible_events ee ON ee.event_ticker = pr.event_ticker
-            """,
-            insert_sql="""
-                INSERT INTO prediction_runs(
-                  id, event_ticker, run_ts, prompt, agent, model, status, error, metadata
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """,
-            batch_size=cfg.batch_size,
-            label="prediction_runs",
-        )
-        archived_rows["market_predictions"] = _copy_rows(
-            primary_conn,
-            backup_conn,
-            select_sql="""
-                SELECT mp.id, mp.run_id, mp.event_ticker, mp.market_ticker,
-                       mp.predicted_yes_prob, mp.confidence, mp.rationale, mp.raw,
-                       mp.created_at
-                FROM market_predictions mp
-                LEFT JOIN eligible_markets em ON em.ticker = mp.market_ticker
-                LEFT JOIN eligible_events ee ON ee.event_ticker = mp.event_ticker
-                WHERE em.ticker IS NOT NULL OR ee.event_ticker IS NOT NULL
-            """,
-            insert_sql="""
-                INSERT INTO market_predictions(
-                  id, run_id, event_ticker, market_ticker,
-                  predicted_yes_prob, confidence, rationale, raw, created_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """,
-            batch_size=cfg.batch_size,
-            label="market_predictions",
-        )
-        archived_rows["rag_documents"] = _copy_rows(
-            primary_conn,
-            backup_conn,
-            select_sql="""
-                SELECT rd.id, rd.source, rd.source_id, rd.event_ticker, rd.market_ticker,
-                       rd.content, rd.embedding, rd.metadata, rd.created_at, rd.updated_at
-                FROM rag_documents rd
-                LEFT JOIN eligible_markets em ON em.ticker = rd.market_ticker
-                LEFT JOIN eligible_events ee ON ee.event_ticker = rd.event_ticker
-                WHERE em.ticker IS NOT NULL OR ee.event_ticker IS NOT NULL
-            """,
-            insert_sql="""
-                INSERT INTO rag_documents(
-                  id, source, source_id, event_ticker, market_ticker,
-                  content, embedding, metadata, created_at, updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """,
-            batch_size=cfg.batch_size,
-            label="rag_documents",
-        )
-        archived_rows["active_markets"] = _copy_rows(
-            primary_conn,
-            backup_conn,
-            select_sql="""
-                SELECT am.ticker, am.event_ticker, am.close_time, am.status,
-                       am.last_seen_ts, am.updated_at
-                FROM active_markets am
-                JOIN eligible_markets em ON em.ticker = am.ticker
-            """,
-            insert_sql="""
-                INSERT INTO active_markets(
-                  ticker, event_ticker, close_time, status, last_seen_ts, updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """,
-            batch_size=cfg.batch_size,
-            label="active_markets",
-        )
-        archived_rows["market_ticks"] = _copy_rows(
-            primary_conn,
-            backup_conn,
-            select_sql="""
-                SELECT id, ts, ticker, price, yes_bid, yes_ask,
-                       price_dollars, yes_bid_dollars, yes_ask_dollars, no_bid_dollars,
-                       volume, open_interest, dollar_volume, dollar_open_interest,
-                       implied_yes_mid, sid, raw
-                FROM market_ticks mt
-                JOIN eligible_markets em ON em.ticker = mt.ticker
-            """,
-            insert_sql="""
-                INSERT INTO market_ticks(
-                  id, ts, ticker, price, yes_bid, yes_ask,
-                  price_dollars, yes_bid_dollars, yes_ask_dollars, no_bid_dollars,
-                  volume, open_interest, dollar_volume, dollar_open_interest,
-                  implied_yes_mid, sid, raw
-                )
-                VALUES (
-                  %s, %s, %s, %s, %s, %s,
-                  %s, %s, %s, %s,
-                  %s, %s, %s, %s,
-                  %s, %s, %s
-                )
-                ON CONFLICT DO NOTHING
-            """,
-            batch_size=cfg.batch_size,
-            label="market_ticks",
-        )
-        archived_rows["market_candles"] = _copy_rows(
-            primary_conn,
-            backup_conn,
-            select_sql="""
-                SELECT market_ticker, period_interval_minutes, end_period_ts, start_period_ts,
-                       open, high, low, close, volume, open_interest, raw
-                FROM market_candles mc
-                JOIN eligible_markets em ON em.ticker = mc.market_ticker
-            """,
-            insert_sql="""
-                INSERT INTO market_candles(
-                  market_ticker, period_interval_minutes, end_period_ts, start_period_ts,
-                  open, high, low, close, volume, open_interest, raw
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """,
-            batch_size=cfg.batch_size,
-            label="market_candles",
-        )
-        archived_rows["lifecycle_events"] = _copy_rows(
-            primary_conn,
-            backup_conn,
-            select_sql="""
-                SELECT id, ts, market_ticker, event_type, open_ts, close_ts, raw
-                FROM lifecycle_events le
-                JOIN eligible_markets em ON em.ticker = le.market_ticker
-            """,
-            insert_sql="""
-                INSERT INTO lifecycle_events(
-                  id, ts, market_ticker, event_type, open_ts, close_ts, raw
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """,
-            batch_size=cfg.batch_size,
-            label="lifecycle_events",
-        )
-        archived_rows["work_queue"] = _copy_rows(
-            primary_conn,
-            backup_conn,
-            select_sql="""
-                SELECT id, job_type, payload, status, attempts, max_attempts,
-                       available_at, locked_by, locked_at, last_error, created_at, updated_at
-                FROM work_queue w
-                JOIN eligible_markets em
-                  ON w.job_type = 'backfill_market'
-                 AND (w.payload->'market'->>'ticker') = em.ticker
-            """,
-            insert_sql="""
-                INSERT INTO work_queue(
-                  id, job_type, payload, status, attempts, max_attempts,
-                  available_at, locked_by, locked_at, last_error, created_at, updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """,
-            batch_size=cfg.batch_size,
-            label="work_queue",
-        )
-        archived_rows["ingest_state"] = _copy_rows(
-            primary_conn,
-            backup_conn,
-            select_sql="""
-                SELECT s.key, s.value, s.updated_at
-                FROM ingest_state s
-                JOIN eligible_markets em
-                  ON s.key LIKE ('backfill_last_ts:' || em.ticker || ':%')
-            """,
-            insert_sql="""
-                INSERT INTO ingest_state(key, value, updated_at)
-                VALUES (%s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """,
-            batch_size=cfg.batch_size,
-            label="ingest_state",
-        )
-
-        backup_counts = _count_tables(
-            backup_conn,
-            event_table="archive_events",
-            market_table="archive_markets",
-        )
-        for table, expected in expected_counts.items():
-            if backup_counts.get(table, 0) < expected:
-                raise RuntimeError(
-                    "archive verification failed: "
-                    f"table={table} expected={expected} backup={backup_counts.get(table, 0)}"
-                )
-
-        deleted_rows = _delete_archived_rows(primary_conn)
-        primary_conn.commit()
         logger.info(
             "archive delete: events=%d markets=%d",
             len(events),

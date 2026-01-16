@@ -17,6 +17,7 @@ from src.core.number_utils import (
 )
 
 from .config import _env_bool
+from .db_timing import timed_cursor
 from .db_utils import implied_yes_mid_cents
 from .formatters import _coerce_int, _to_cents, fmt_money, fmt_num, fmt_ts
 from .kalshi import _get_market_data
@@ -24,7 +25,7 @@ from .kalshi_sdk import rest_apply_cooldown, rest_backoff_remaining
 
 
 def _load_latest_tick(conn: psycopg.Connection, ticker: str) -> dict[str, Any] | None:
-    with conn.cursor(row_factory=dict_row) as cur:
+    with timed_cursor(conn, row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT ts, implied_yes_mid, price_dollars, yes_bid_dollars, yes_ask_dollars,
@@ -85,7 +86,7 @@ def _prefer_tick_snapshot(
 
 def _market_is_closed(conn: psycopg.Connection, ticker: str) -> bool:
     """Return True when the market has closed."""
-    with conn.cursor() as cur:
+    with timed_cursor(conn) as cur:
         cur.execute(
             """
             SELECT close_time

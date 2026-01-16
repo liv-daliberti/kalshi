@@ -14,6 +14,7 @@ from .formatters import (
     clamp_probability,
 )
 from .db_row import DICT_ROW
+from .db_timing import timed_cursor
 from .portal_utils import portal_func as _portal_func
 from .portal_types import PsycopgConnection
 
@@ -56,7 +57,7 @@ def _build_event_sparklines(
     if not tickers:
         return {}
     max_points = _env_int("WEB_PORTAL_EVENT_SPARKLINE_POINTS", 24, minimum=4)
-    with conn.cursor(row_factory=DICT_ROW) as cur:
+    with timed_cursor(conn, row_factory=DICT_ROW) as cur:
         cur.execute(
             """
             SELECT ticker, ts, implied_yes_mid, price_dollars, yes_bid_dollars, yes_ask_dollars
@@ -187,7 +188,7 @@ def _series_from_candles(
     max_points: int,
     total_outcomes: int,
 ) -> tuple[list[dict[str, Any]], str | None]:
-    with conn.cursor(row_factory=DICT_ROW) as cur:
+    with timed_cursor(conn, row_factory=DICT_ROW) as cur:
         cur.execute(
             """
             SELECT market_ticker, end_period_ts, close
@@ -245,7 +246,7 @@ def _series_from_ticks(
     total_outcomes: int,
 ) -> tuple[list[dict[str, Any]], str | None]:
     yes_price_fn = _portal_func("_derive_yes_price", _derive_yes_price)
-    with conn.cursor(row_factory=DICT_ROW) as cur:
+    with timed_cursor(conn, row_factory=DICT_ROW) as cur:
         cur.execute(
             """
             SELECT ticker, ts, implied_yes_mid, price_dollars, yes_bid_dollars, yes_ask_dollars

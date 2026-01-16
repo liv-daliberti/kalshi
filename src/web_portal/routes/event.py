@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from src.db.db import get_state, set_state
 from ..config import _env_int
 from ..db import _db_connection
 from ..db_details import fetch_event_detail
+from ..db_timing import timed_cursor
 from ..db_utils import insert_market_tick
 from ..snapshot_utils import (
     _prefer_tick_snapshot,
@@ -27,6 +29,36 @@ from ..snapshot_utils import (
 
 bp = Blueprint("event", __name__)
 logger = logging.getLogger(__name__)
+_EVENT_DETAIL_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_EVENT_DETAIL_CACHE_LOCK = threading.Lock()
+
+
+def _event_detail_cache_ttl() -> int:
+    return _env_int("WEB_PORTAL_EVENT_DETAIL_CACHE_SEC", 60, minimum=0)
+
+
+def _load_event_detail_cache(event_ticker: str) -> dict[str, Any] | None:
+    ttl_sec = _event_detail_cache_ttl()
+    if ttl_sec <= 0:
+        return None
+    now = time.monotonic()
+    with _EVENT_DETAIL_CACHE_LOCK:
+        cached = _EVENT_DETAIL_CACHE.get(event_ticker)
+        if not cached:
+            return None
+        cached_ts, payload = cached
+        if now - cached_ts > ttl_sec:
+            _EVENT_DETAIL_CACHE.pop(event_ticker, None)
+            return None
+        return payload
+
+
+def _store_event_detail_cache(event_ticker: str, payload: dict[str, Any]) -> None:
+    ttl_sec = _event_detail_cache_ttl()
+    if ttl_sec <= 0:
+        return
+    with _EVENT_DETAIL_CACHE_LOCK:
+        _EVENT_DETAIL_CACHE[event_ticker] = (time.monotonic(), payload)
 
 
 @dataclass(frozen=True)
@@ -81,7 +113,7 @@ def _load_event_market_rows(
     event_ticker: str,
     allow_closed: bool,
 ) -> list[dict[str, Any]]:
-    with conn.cursor(row_factory=dict_row) as cur:
+    with timed_cursor(conn, row_factory=dict_row) as cur:
         if allow_closed:
             cur.execute(
                 """
@@ -107,7 +139,7 @@ def _load_event_market_rows(
 
 
 def _event_exists(conn: "psycopg.Connection", event_ticker: str) -> bool:
-    with conn.cursor() as cur:
+    with timed_cursor(conn) as cur:
         cur.execute("SELECT 1 FROM events WHERE event_ticker = %s", (event_ticker,))
         return cur.fetchone() is not None
 
@@ -215,6 +247,19 @@ def event_detail(event_ticker: str):
             event=None,
         )
 
+    cached = _load_event_detail_cache(event_ticker)
+    if cached is not None:
+        return render_template(
+            "event_detail.html",
+            error=None,
+            event=cached,
+            auto_snapshot_sec=_env_int(
+                "WEB_PORTAL_EVENT_AUTO_SNAPSHOT_SEC",
+                120,
+                minimum=10,
+            ),
+        )
+
     error = None
     event = None
     try:
@@ -222,6 +267,8 @@ def event_detail(event_ticker: str):
             event = fetch_event_detail(conn, event_ticker)
             if event is None:
                 error = "Event not found."
+            else:
+                _store_event_detail_cache(event_ticker, event)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.exception("event detail query failed")
         error = str(exc)

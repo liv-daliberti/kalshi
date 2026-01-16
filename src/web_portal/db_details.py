@@ -45,6 +45,7 @@ from .market_metadata import (
 )
 from .db_event_series import _build_event_forecast_series, _build_event_sparklines
 from .db_row import DICT_ROW
+from .db_timing import timed_cursor
 from .portal_utils import portal_func as _portal_func
 from .portal_types import PsycopgConnection
 
@@ -58,7 +59,7 @@ def _fetch_event_market_rows(
         "t.ts, t.implied_yes_mid, t.price_dollars, t.yes_bid_dollars, "
         "t.yes_ask_dollars, t.volume, t.raw"
     )
-    with conn.cursor(row_factory=DICT_ROW) as cur:
+    with timed_cursor(conn, row_factory=DICT_ROW) as cur:
         cur.execute(
             f"""
             SELECT
@@ -91,7 +92,7 @@ def _fetch_event_detail_row(
     event_ticker: str,
 ) -> dict[str, Any] | None:
     """Fetch the base event row for the detail view."""
-    with conn.cursor(row_factory=DICT_ROW) as cur:
+    with timed_cursor(conn, row_factory=DICT_ROW) as cur:
         cur.execute(
             """
             SELECT
@@ -434,7 +435,7 @@ def _fetch_market_detail_row(
         "t.ts, t.implied_yes_mid, t.price_dollars, t.yes_bid_dollars, "
         "t.yes_ask_dollars, t.volume, t.open_interest"
     )
-    with conn.cursor(row_factory=DICT_ROW) as cur:
+    with timed_cursor(conn, row_factory=DICT_ROW) as cur:
         cur.execute(
             f"""
             SELECT
