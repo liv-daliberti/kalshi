@@ -128,11 +128,30 @@ jobs:
 
             az account set --subscription "179a1c0b-5228-4f8e-904d-c6bb1072f1eb"
 
+            RG="liv"
+            APP="Kalshi-Data-Ingestor"
+
+            EXISTING_SECRET="$(az webapp config appsettings list \
+              --resource-group "$RG" \
+              --name "$APP" \
+              --query "[?name=='WEB_PORTAL_SECRET_KEY'].value | [0]" \
+              -o tsv)"
+
+            if [ -z "$EXISTING_SECRET" ]; then
+              SECRET="$(python - <<'PY'
+import secrets
+print(secrets.token_urlsafe(48))
+PY
+)"
+            else
+              SECRET="$EXISTING_SECRET"
+            fi
+
             az webapp config appsettings set \
-              --resource-group "liv" \
-              --name "Kalshi-Data-Ingestor" \
+              --resource-group "$RG" \
+              --name "$APP" \
               --settings \
-                WEB_PORTAL_SECRET_KEY='${{ secrets.WEB_PORTAL_SECRET_KEY }}' \
+                WEB_PORTAL_SECRET_KEY="$SECRET" \
                 WEB_PORTAL_TRUST_PROXY=1 \
                 WEB_PORTAL_COOKIE_SAMESITE=None \
                 WEB_PORTAL_STATIC_CACHE_MAX_AGE_SEC=3600 \
@@ -141,9 +160,11 @@ jobs:
             # Set the Linux startup command (App Service -> appCommandLine)
             # Use APP_PATH so it works regardless of cwd, matching Oryx-style invocation.
             az webapp config set \
-              --resource-group "liv" \
-              --name "Kalshi-Data-Ingestor" \
+              --resource-group "$RG" \
+              --name "$APP" \
               --generic-configurations '{"appCommandLine":"bash -lc \"${APP_PATH}/scripts/start_kalshi_appservice.sh\""}'
+
+            az webapp restart --resource-group "$RG" --name "$APP"
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
