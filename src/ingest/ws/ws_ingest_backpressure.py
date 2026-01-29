@@ -9,10 +9,10 @@ import queue
 import time
 from dataclasses import dataclass
 
-from src.core.env_utils import env_float, env_int
-from src.ingest.ws.ws_ingest_models import WsLoopConfig
-from src.ingest.ws.ws_ingest_subscriptions import set_active_ticker_limit_override
-from src.ingest.ws.ws_ingest_writer import _queue_put_nowait
+from ...core.env_utils import env_float, env_int
+from .ws_ingest_models import WsLoopConfig
+from .ws_ingest_subscriptions import set_active_ticker_limit_override
+from .ws_ingest_writer import _queue_put_nowait
 
 logger = logging.getLogger(__name__)
 

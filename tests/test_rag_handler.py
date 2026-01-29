@@ -1,9 +1,11 @@
+import importlib
+import json
 import os
 import sys
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from _test_utils import add_src_to_path, ensure_psycopg_stub
@@ -11,7 +13,7 @@ from _test_utils import add_src_to_path, ensure_psycopg_stub
 ensure_psycopg_stub()
 add_src_to_path()
 
-import src.rag.rag_handler as rag_handler
+rag_handler = importlib.import_module("src.rag.rag_handler")
 
 
 class FakeCursor:
@@ -208,6 +210,17 @@ class TestRagHandlerMath(unittest.TestCase):
             Decimal("0.123457"),
         )
 
+    def test_kalshi_chance_score_price_dollars(self) -> None:
+        market = {
+            "implied_yes_mid": None,
+            "candle_close": None,
+            "price_dollars": "0.33",
+        }
+        self.assertEqual(
+            rag_handler._kalshi_chance_score(market),
+            Decimal("0.330000"),
+        )
+
 
 class TestRagHandlerDocs(unittest.TestCase):
     def test_build_docs(self) -> None:
@@ -293,6 +306,96 @@ class TestRagHandlerDocs(unittest.TestCase):
         self.assertEqual(rag_handler._baseline_prob(market), Decimal("0.600000"))
         market = {"implied_yes_mid": None, "candle_close": "0.4"}
         self.assertEqual(rag_handler._baseline_prob(market), Decimal("0.400000"))
+
+
+class TestRagHandlerCallWindow(unittest.TestCase):
+    def test_parse_window_start(self) -> None:
+        self.assertIsNone(rag_handler._parse_window_start(None))
+        naive = datetime(2024, 1, 2, 3, 4, 5)
+        parsed = rag_handler._parse_window_start(naive)
+        self.assertEqual(parsed.replace(tzinfo=None), naive)
+        self.assertEqual(parsed.tzinfo, timezone.utc)
+        aware = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        self.assertEqual(rag_handler._parse_window_start(aware), aware)
+        parsed_str = rag_handler._parse_window_start("2024-01-02T03:04:05Z")
+        self.assertIsNotNone(parsed_str)
+        self.assertEqual(parsed_str.utcoffset(), timedelta(0))
+        self.assertEqual(parsed_str.year, 2024)
+        self.assertIsNone(rag_handler._parse_window_start("bad-date"))
+
+    def test_parse_call_window_invalid_payload(self) -> None:
+        self.assertEqual(rag_handler._parse_call_window("bad-json"), (None, None, None))
+
+    def test_parse_call_window_invalid_values(self) -> None:
+        raw = json.dumps(
+            {
+                "window_start": "2024-01-02T03:04:05",
+                "count": "bad",
+                "limit": "bad",
+            }
+        )
+        window_start, count, limit = rag_handler._parse_call_window(raw)
+        self.assertIsNotNone(window_start)
+        self.assertEqual(window_start.tzinfo, timezone.utc)
+        self.assertIsNone(count)
+        self.assertIsNone(limit)
+
+    def test_reserve_rag_calls_zero_desired(self) -> None:
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        self.assertEqual(rag_handler._reserve_rag_calls(0, now), 0)
+
+    def test_reserve_rag_calls_no_db_url(self) -> None:
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(rag_handler.logger, "warning") as warn:
+            allowed = rag_handler._reserve_rag_calls(3, now)
+        self.assertEqual(allowed, 3)
+        warn.assert_called_once()
+
+    def test_reserve_rag_calls_count_none(self) -> None:
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        payload = json.dumps(
+            {
+                "window_start": now.isoformat(),
+                "count": "bad",
+                "limit": 4,
+            }
+        )
+        cursor = FakeCursor(row=(payload,))
+        conn = FakeConn(cursor)
+        with patch.dict(os.environ, {"DATABASE_URL": "db"}, clear=True), \
+             patch.object(rag_handler, "assert_state_write_allowed"), \
+             patch("src.rag.rag_handler.psycopg.connect", return_value=conn, create=True):
+            allowed = rag_handler._reserve_rag_calls(2, now)
+        self.assertEqual(allowed, 2)
+        update_payload = json.loads(cursor.executes[-1][1][0])
+        self.assertEqual(update_payload["count"], 2)
+
+    def test_reserve_rag_calls_window_reset_warns(self) -> None:
+        now = datetime(2024, 1, 2, tzinfo=timezone.utc)
+        old = now - timedelta(seconds=rag_handler._RAG_CALL_WINDOW_SECONDS + 1)
+        payload = json.dumps(
+            {
+                "window_start": old.isoformat(),
+                "count": 1,
+                "limit": 2,
+            }
+        )
+        cursor = FakeCursor(row=(payload,))
+        conn = FakeConn(cursor)
+        with patch.dict(
+            os.environ,
+            {"DATABASE_URL": "db", "RAG_DAILY_LIMIT": "2"},
+            clear=True,
+        ), patch.object(rag_handler, "assert_state_write_allowed"), \
+            patch.object(rag_handler.logger, "warning") as warn, \
+            patch("src.rag.rag_handler.psycopg.connect", return_value=conn, create=True):
+            allowed = rag_handler._reserve_rag_calls(5, now)
+        self.assertEqual(allowed, 2)
+        update_payload = json.loads(cursor.executes[-1][1][0])
+        self.assertEqual(update_payload["count"], 2)
+        self.assertEqual(update_payload["window_start"], now.isoformat())
+        warn.assert_called_once()
 
 
 class TestRagHandlerPredict(unittest.TestCase):
@@ -432,3 +535,94 @@ class TestRagHandlerPredict(unittest.TestCase):
                 "Prompt",
             )
         self.assertEqual(preds, [])
+
+    def test_predict_event_missing_event_ticker_with_markets(self) -> None:
+        cfg = make_cfg()
+        with patch.object(rag_handler, "load_rag_config", return_value=cfg):
+            preds = rag_handler.predict_event(
+                {},
+                [{"ticker": "M1", "implied_yes_mid": "0.5"}],
+                {},
+                "Prompt",
+            )
+        self.assertEqual(preds, [])
+
+    def test_predict_markets_concurrent_handles_errors(self) -> None:
+        cfg = make_cfg()
+        prediction_ctx = rag_handler.PredictionContext(
+            event={},
+            stored_docs=[],
+            cfg=cfg,
+            prompt="Prompt",
+            llm_handler=None,
+            event_ticker="EV",
+        )
+        markets = [{"ticker": "GOOD"}, {"ticker": "BAD"}]
+        query_vectors = [[1.0], [1.0]]
+
+        def side_effect(market, *_args):
+            if market["ticker"] == "BAD":
+                raise RuntimeError("boom")
+            return {"market_ticker": market["ticker"]}
+
+        with patch.object(rag_handler, "_predict_market", side_effect=side_effect), \
+             patch.object(rag_handler.logger, "exception") as logged:
+            preds = rag_handler._predict_markets(
+                markets,
+                query_vectors,
+                prediction_ctx,
+                concurrency=2,
+            )
+        self.assertEqual(preds, [{"market_ticker": "GOOD"}])
+        logged.assert_called_once()
+
+    def test_predict_event_llm_limit_zero(self) -> None:
+        cfg = make_cfg(llm_handler="fake:handler")
+        markets = [{"ticker": "M1", "implied_yes_mid": "0.6"}]
+        with patch.object(rag_handler, "load_rag_config", return_value=cfg), \
+             patch.object(rag_handler, "_load_llm_handler", return_value=lambda *_args: {}), \
+             patch.object(rag_handler, "_reserve_rag_calls", return_value=0), \
+             patch.object(rag_handler, "_build_prediction_context") as build_ctx:
+            preds = rag_handler.predict_event(
+                {"event_ticker": "EV"},
+                markets,
+                {},
+                "Prompt",
+            )
+        self.assertEqual(preds, [])
+        build_ctx.assert_not_called()
+
+    def test_predict_event_llm_limit_slices_markets(self) -> None:
+        cfg = make_cfg(llm_handler="fake:handler")
+        markets = [
+            {"ticker": "M1", "implied_yes_mid": "0.6"},
+            {"ticker": "M2", "implied_yes_mid": "0.4"},
+        ]
+        captured = {}
+
+        def fake_build_ctx(request, _cfg, _llm_handler):
+            captured["markets"] = request.markets
+            prediction_ctx = rag_handler.PredictionContext(
+                event=request.event,
+                stored_docs=[],
+                cfg=cfg,
+                prompt=request.prompt,
+                llm_handler=None,
+                event_ticker=request.event.get("event_ticker"),
+            )
+            return prediction_ctx, [[1.0]]
+
+        with patch.object(rag_handler, "load_rag_config", return_value=cfg), \
+             patch.object(rag_handler, "_load_llm_handler", return_value=lambda *_args: {}), \
+             patch.object(rag_handler, "_reserve_rag_calls", return_value=1), \
+             patch.object(rag_handler, "_build_prediction_context", side_effect=fake_build_ctx), \
+             patch.object(rag_handler, "_predict_markets", return_value=[{"market_ticker": "M1"}]):
+            preds = rag_handler.predict_event(
+                {"event_ticker": "EV"},
+                markets,
+                {},
+                "Prompt",
+            )
+        self.assertEqual(preds, [{"market_ticker": "M1"}])
+        self.assertEqual(len(captured["markets"]), 1)
+        self.assertEqual(captured["markets"][0]["ticker"], "M1")

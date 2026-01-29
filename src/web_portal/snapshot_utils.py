@@ -10,8 +10,8 @@ import psycopg  # pylint: disable=import-error
 from flask import request  # pylint: disable=import-error
 from psycopg.rows import dict_row  # pylint: disable=import-error
 
-from src.db.db import normalize_prob_dollars
-from src.core.number_utils import (
+from ..db.db import normalize_prob_dollars
+from ..core.number_utils import (
     dollars_from_cents as _dollars_from_cents,
     infer_price_dollars_from_cents_spread as _infer_price_dollars_from_cents,
 )
@@ -22,6 +22,7 @@ from .db_utils import implied_yes_mid_cents
 from .formatters import _coerce_int, _to_cents, fmt_money, fmt_num, fmt_ts
 from .kalshi import _get_market_data
 from .kalshi_sdk import rest_apply_cooldown, rest_backoff_remaining
+from .portal_utils import portal_func as _portal_func
 
 
 def _load_latest_tick(conn: psycopg.Connection, ticker: str) -> dict[str, Any] | None:
@@ -72,7 +73,9 @@ def _prefer_tick_snapshot(
     freshness_sec: int,
     allow_stale: bool = False,
 ) -> dict[str, Any] | None:
-    tick = _load_latest_tick(conn, ticker)
+    load_latest_tick = _portal_func("_load_latest_tick", _load_latest_tick)
+    snapshot_from_tick = _portal_func("_snapshot_from_tick", _snapshot_from_tick)
+    tick = load_latest_tick(conn, ticker)
     if not tick:
         return None
     tick_ts = tick.get("ts")
@@ -81,7 +84,7 @@ def _prefer_tick_snapshot(
         age = (datetime.now(timezone.utc) - ts_value).total_seconds()
         if age > freshness_sec:
             return None
-    return _snapshot_from_tick(tick)
+    return snapshot_from_tick(tick)
 
 
 def _market_is_closed(conn: psycopg.Connection, ticker: str) -> bool:
@@ -117,12 +120,14 @@ def _snapshot_allows_closed() -> bool:
 
 def _snapshot_backoff_remaining() -> float:
     """Return remaining backoff seconds after a rate limit."""
-    return rest_backoff_remaining()
+    rest_backoff = _portal_func("rest_backoff_remaining", rest_backoff_remaining)
+    return rest_backoff()
 
 
 def _set_snapshot_backoff(cooldown_sec: int) -> None:
     """Set a rate-limit backoff window for snapshot polling."""
-    rest_apply_cooldown(cooldown_sec)
+    rest_cooldown = _portal_func("rest_apply_cooldown", rest_apply_cooldown)
+    rest_cooldown(cooldown_sec)
 
 
 def _snapshot_error_payload(err: str, status: int | None) -> dict[str, Any]:
@@ -135,7 +140,8 @@ def _snapshot_error_payload(err: str, status: int | None) -> dict[str, Any]:
 def _snapshot_market_data(
     ticker: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    market_data, err, status = _get_market_data(ticker)
+    get_market_data = _portal_func("_get_market_data", _get_market_data)
+    market_data, err, status = get_market_data(ticker)
     if err:
         return None, _snapshot_error_payload(err, status)
     return market_data, None

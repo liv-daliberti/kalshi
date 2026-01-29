@@ -8,10 +8,10 @@ import os
 import psycopg  # pylint: disable=import-error
 from dotenv import load_dotenv  # pylint: disable=import-error
 
-from src.db.db import ensure_schema_compatible, init_schema
-from src.core.logging_utils import configure_http_logging, log_format, log_handlers
-from src.core.loop_utils import schema_path
-from src.core.settings import ENV_FILE
+from ..db.db import ensure_schema_compatible, init_schema
+from ..core.logging_utils import configure_http_logging, log_format, log_handlers
+from ..core.loop_utils import schema_path
+from ..core.settings import ENV_FILE
 
 logger = logging.getLogger(__name__)
 

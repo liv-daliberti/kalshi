@@ -239,6 +239,43 @@
         gap: 8px;
       }
 
+      .tabs {
+        margin-top: 18px;
+        display: inline-flex;
+        gap: 10px;
+        padding: 6px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.7);
+        border: 1px solid var(--border);
+        box-shadow: 0 10px 20px var(--shadow);
+      }
+
+      .tab-pill {
+        text-decoration: none;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--ink-muted);
+        padding: 7px 14px;
+        border-radius: 999px;
+        border: 1px solid transparent;
+      }
+
+      .tab-pill.active {
+        color: white;
+        background: var(--accent);
+        border-color: rgba(224, 107, 47, 0.35);
+        box-shadow: 0 10px 18px var(--glow);
+      }
+
+      .tab-panel {
+        display: none;
+      }
+
+      .tab-panel.active {
+        display: block;
+      }
+
       .category-pill {
         display: inline-flex;
         align-items: center;
@@ -341,6 +378,62 @@
         color: #8a3f1b;
       }
 
+      .pill.arb-yes {
+        background: rgba(46, 125, 111, 0.16);
+        color: #175b52;
+      }
+
+      .pill.arb-no {
+        background: rgba(224, 107, 47, 0.16);
+        color: #8a3f1b;
+      }
+
+      .quality-badge {
+        display: inline-block;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-weight: 600;
+      }
+
+      .quality-badge.confirmed {
+        background: rgba(46, 125, 111, 0.15);
+        color: #175b52;
+      }
+
+      .quality-badge.indicative {
+        background: rgba(224, 107, 47, 0.15);
+        color: #8a3f1b;
+      }
+
+      .coverage-label {
+        font-size: 11px;
+        color: var(--ink-soft);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .market-tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .market-tag {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        border: 1px solid var(--border);
+        background: white;
+        color: var(--ink);
+        text-decoration: none;
+      }
+
       .mono {
         font-variant-numeric: tabular-nums;
       }
@@ -423,28 +516,41 @@
         <div>
           <div class="eyebrow">Market Delta Scanner</div>
           <h1>Opportunities</h1>
+          {% if active_tab == "arbitrage" %}
+          <p class="subtitle">
+            Market arbitrage across mutually exclusive outcomes using active, live pricing.
+          </p>
+          {% else %}
           <p class="subtitle">
             Differences between Kalshi prices and GPT predictions for open markets,
             filtered by confidence and freshness.
           </p>
+          {% endif %}
           <div class="meta-row">
-            <div>Refreshed {{ refreshed_at }}</div>
-            <div>Showing {{ opportunities | length }} rows</div>
+            <div id="opps-refreshed">Refreshed {{ refreshed_at }}</div>
+            <div id="opps-count">Showing {{ row_count }} rows</div>
+          </div>
+          <div class="tabs">
+            <a class="tab-pill {% if active_tab == 'model' %}active{% endif %}" href="{{ tab_links.model }}">
+              GPT vs Kalshi
+            </a>
+            <a class="tab-pill {% if active_tab == 'arbitrage' %}active{% endif %}" href="{{ tab_links.arbitrage }}">
+              Market Arbitrage
+            </a>
           </div>
         </div>
       </header>
 
-      {% if error %}
-      <div class="alert">
+      <div class="alert" id="opps-error" {% if not error %}style="display: none;"{% endif %}>
         <div class="alert-title">Opportunity query error</div>
         <div>{{ error }}</div>
       </div>
-      {% endif %}
 
       <section class="panel">
         <div class="filter-card">
           <form class="filter-form" method="get">
             <input type="hidden" name="limit" value="{{ limit }}" />
+            <input type="hidden" name="view" value="{{ active_tab }}" />
             {% for category in selected_categories %}
               <input type="hidden" name="category" value="{{ category }}" />
             {% endfor %}
@@ -470,6 +576,7 @@
                 {% endfor %}
               </select>
             </div>
+            {% if active_tab == "model" %}
             <div class="filter-field">
               <label for="min_gap">Min gap</label>
               <input id="min_gap" name="min_gap" type="number" step="0.01" min="0" max="1" value="{{ min_gap }}" />
@@ -483,6 +590,11 @@
               <label for="max_age">Max prediction age (min)</label>
               <input id="max_age" name="max_age" type="number" step="1" min="0" value="{{ max_age }}" />
             </div>
+            {% else %}
+            <input type="hidden" name="min_gap" value="{{ min_gap }}" />
+            <input type="hidden" name="min_conf" value="{{ min_conf }}" />
+            <input type="hidden" name="max_age" value="{{ max_age }}" />
+            {% endif %}
             <div class="filter-field">
               <label for="max_tick_age">Max tick age (min)</label>
               <input id="max_tick_age" name="max_tick_age" type="number" step="1" min="0" value="{{ max_tick_age }}" />
@@ -493,7 +605,7 @@
             </div>
             <div class="filter-actions">
               <button type="submit">Apply</button>
-              <a class="filter-reset" href="{{ url_for('opportunities.opportunities') }}">Reset</a>
+              <a class="filter-reset" href="{{ url_for('opportunities.opportunities', view=active_tab) }}">Reset</a>
             </div>
           </form>
         </div>
@@ -510,6 +622,9 @@
             {% endfor %}
           </div>
         </div>
+      </section>
+
+      <section class="panel tab-panel {% if active_tab == 'model' %}active{% endif %}" data-tab="model">
         <div class="table-card">
           <div class="table-wrap">
             <table>
@@ -527,7 +642,7 @@
                   <th>Direction</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody id="opps-body" data-opportunities-table="body">
                 {% set visible_opportunities = (opportunities or []) | rejectattr("volume", "equalto", "N/A") | list %}
                 {% if visible_opportunities %}
                   {% for row in visible_opportunities %}
@@ -552,6 +667,69 @@
                 {% else %}
                   <tr>
                     <td colspan="10" class="empty">No opportunities match these filters.</td>
+                  </tr>
+                {% endif %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel tab-panel {% if active_tab == 'arbitrage' %}active{% endif %}" data-tab="arbitrage">
+        <div class="table-card">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Event</th>
+                  <th>Arbitrage</th>
+                  <th>Edge</th>
+                  <th>Sum Price</th>
+                  <th>Quality</th>
+                  <th>Coverage</th>
+                  <th>Markets</th>
+                  <th>Stale tick</th>
+                </tr>
+              </thead>
+              <tbody id="arb-body">
+                {% set visible_arbitrage = arbitrage_opportunities or [] %}
+                {% if visible_arbitrage %}
+                  {% for row in visible_arbitrage %}
+                  <tr>
+                    <td>
+                      <div class="title-stack">
+                        <a class="market-link" href="{{ row.event_url }}">{{ row.event_title }}</a>
+                        <span class="event-link">
+                          {{ row.event_ticker }}{% if row.event_category %} · {{ row.event_category }}{% endif %}
+                        </span>
+                      </div>
+                    </td>
+                    <td><span class="pill {{ row.arb_action_key }}">{{ row.arb_action }}</span></td>
+                    <td class="mono">{{ row.edge_percent }}</td>
+                    <td class="mono">{{ row.sum_ask_bid_percent }}</td>
+                    <td>
+                      <span class="quality-badge {{ row.quality }}">{{ row.quality }}</span>
+                    </td>
+                    <td>
+                      <div class="coverage-label">{{ row.coverage_label }}</div>
+                    </td>
+                    <td>
+                      <div class="market-tags">
+                        {% for market in row.market_tags %}
+                          {% if market.url %}
+                            <a class="market-tag" href="{{ market.url }}">{{ market.label }}</a>
+                          {% else %}
+                            <span class="market-tag">{{ market.label }}</span>
+                          {% endif %}
+                        {% endfor %}
+                      </div>
+                    </td>
+                    <td class="mono">{{ row.tick_age }}</td>
+                  </tr>
+                  {% endfor %}
+                {% else %}
+                  <tr>
+                    <td colspan="8" class="empty">No market arbitrage opportunities match these filters.</td>
                   </tr>
                 {% endif %}
               </tbody>

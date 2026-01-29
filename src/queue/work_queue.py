@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 import psycopg  # pylint: disable=import-error
 
-from src.core.guardrails import assert_queue_op_allowed
+from ..core.guardrails import assert_queue_op_allowed
 
 try:
     import pika as PIKA  # type: ignore[import-not-found]
@@ -63,6 +63,17 @@ class WorkItem:
     payload: dict[str, Any]
     attempts: int
     max_attempts: int
+
+
+def job_type_where_clause(
+    job_types: tuple[str, ...] | list[str] | None,
+    *,
+    prefix: str = "WHERE",
+) -> tuple[str, tuple[Any, ...]]:
+    """Build a job_type filter clause for work_queue queries."""
+    if not job_types:
+        return "", ()
+    return f"{prefix} job_type = ANY(%s)", (list(job_types),)
 
 
 def _parse_bool(raw: Optional[str]) -> bool:
@@ -301,7 +312,10 @@ def enqueue_job(
             ensure_ascii=True,
         )
         try:
-            cur.execute("SELECT pg_notify('work_queue_update', %s)", (notify_payload,))
+            cur.execute(
+                "SELECT pg_notify(%s, %s)",
+                ("work_queue_update", notify_payload),
+            )
         except Exception:  # pylint: disable=broad-exception-caught
             logger.exception("Queue notify failed for job %s", job_id)
     if commit:

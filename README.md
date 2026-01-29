@@ -379,7 +379,8 @@ Optional environment variables:
 
 - `WEB_PORTAL_HOST` (default `0.0.0.0`)
 - `WEB_PORTAL_PORT` (default `8000`)
-- `WEB_PORTAL_LIMIT` (default `200`, max `2000`)
+- `WEB_PORTAL_LIMIT` (default `75`, max `2000`)
+- `WEB_PORTAL_LAZY_LOAD` (default `1`; fetch portal tables after initial page load)
 - `WEB_PORTAL_PASSWORD` (required to log in)
 - `WEB_PORTAL_SECRET_KEY` (required; session signing key)
 - `WEB_DB_POOL_ENABLE` (default `1`; set to `0` to disable pooled DB connections)

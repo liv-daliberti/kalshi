@@ -9,14 +9,20 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
-from src.core.number_utils import (
+from ..core.number_utils import (
     coerce_int as _coerce_int,
+    _parse_decimal_value,
     normalize_probability,
     to_cents as _to_cents,
 )
-from src.core.time_utils import parse_epoch_seconds, parse_ts
+from ..core.time_utils import parse_epoch_seconds, parse_ts
 
 _parse_epoch_seconds = parse_epoch_seconds
+
+
+def _decimal(value: Any) -> Decimal | None:
+    """Parse a decimal-like value for internal helpers."""
+    return _parse_decimal_value(value)
 
 
 def _money_quant(digits: int) -> Decimal:

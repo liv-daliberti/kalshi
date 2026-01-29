@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from src.db.db import implied_yes_mid_cents, normalize_prob_dollars, parse_ts_iso
-from src.core.number_utils import (
+from ...db.db import implied_yes_mid_cents, normalize_prob_dollars, parse_ts_iso
+from ...core.number_utils import (
     coerce_int as _coerce_int,
     dollars_from_cents as _dollars_from_cents,
     infer_price_dollars_from_cents_spread as _infer_price_dollars_from_cents,
@@ -57,13 +57,38 @@ def _extract_payload(message: dict) -> dict:
 
 def _extract_market_id(payload: dict) -> str | None:
     """Extract a market id from WS payloads."""
-    market_id = payload.get("market_id")
+    market_id = (
+        payload.get("market_id")
+        or payload.get("marketId")
+        or payload.get("marketID")
+    )
     if market_id:
         return str(market_id)
     market = payload.get("market") or {}
-    market_id = market.get("market_id") or market.get("id")
+    if not isinstance(market, dict):
+        market = {}
+    market_id = (
+        market.get("market_id")
+        or market.get("marketId")
+        or market.get("marketID")
+        or market.get("id")
+    )
     if market_id:
         return str(market_id)
+    has_ticker = any(
+        (
+            payload.get("market_ticker"),
+            payload.get("marketTicker"),
+            payload.get("ticker"),
+            market.get("ticker"),
+            market.get("market_ticker"),
+            market.get("marketTicker"),
+        )
+    )
+    if has_ticker:
+        market_id = payload.get("id")
+        if market_id:
+            return str(market_id)
     return None
 
 
@@ -72,10 +97,14 @@ def _resolve_market_ticker(
     market_id_map: dict[str, str] | None,
 ) -> str | None:
     """Resolve a market ticker from WS payloads."""
+    market = payload.get("market") or {}
     ticker = (
         payload.get("market_ticker")
+        or payload.get("marketTicker")
         or payload.get("ticker")
-        or (payload.get("market") or {}).get("ticker")
+        or market.get("ticker")
+        or market.get("market_ticker")
+        or market.get("marketTicker")
     )
     if ticker:
         return str(ticker)

@@ -1,14 +1,17 @@
 import os
+import sys
 import tempfile
+import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+import importlib
 
 from _test_utils import add_src_to_path
 
 add_src_to_path()
 
-import src.rag.rag as rag
+rag = importlib.import_module("src.rag.rag")
 
 
 class RagTestCase(unittest.TestCase):
@@ -88,6 +91,29 @@ class TestRagConfigAndClient(RagTestCase):
                 with self.assertRaises(RuntimeError):
                     rag._load_azure_config()
 
+    def test_load_embedding_config_overrides(self) -> None:
+        base = rag.AzureCfg(
+            endpoint="https://example",
+            api_key="key",
+            deployment="dep",
+            api_version="2024-12-01-preview",
+            use_v1=False,
+        )
+        with patch.object(rag, "_load_azure_config", return_value=base), \
+             patch.dict(
+                 os.environ,
+                 {
+                     "RAG_EMBEDDING_ENDPOINT": "https://embed.example/openai/deployments/x",
+                     "RAG_EMBEDDING_API_VERSION": "2025-01-01-preview",
+                 },
+             ):
+            cfg = rag._load_embedding_config()
+        self.assertEqual(cfg.endpoint, "https://embed.example")
+        self.assertEqual(cfg.api_version, "2025-01-01-preview")
+        self.assertEqual(cfg.api_key, "key")
+        self.assertEqual(cfg.deployment, "dep")
+        self.assertFalse(cfg.use_v1)
+
     def test_build_preferred_client_requires_azure(self) -> None:
         cfg = rag.AzureCfg(
             endpoint="https://example",
@@ -145,6 +171,35 @@ class TestRagConfigAndClient(RagTestCase):
         self.assertFalse(uses_v1)
         self.assertEqual(client.azure_endpoint, "https://example")
 
+    def test_import_openai_success_path(self) -> None:
+        fake_openai = types.ModuleType("openai")
+
+        class FakeAzure:
+            pass
+
+        class FakeOpenAI:
+            pass
+
+        class FakeOpenAIError(Exception):
+            pass
+
+        fake_openai.AzureOpenAI = FakeAzure
+        fake_openai.OpenAI = FakeOpenAI
+        fake_openai.OpenAIError = FakeOpenAIError
+        original_module = sys.modules.get("openai")
+        try:
+            with patch.dict(sys.modules, {"openai": fake_openai}):
+                reloaded = importlib.reload(rag)
+                self.assertIs(reloaded.AzureOpenAI, FakeAzure)
+                self.assertIs(reloaded.OpenAI, FakeOpenAI)
+                self.assertIs(reloaded.OpenAIError, FakeOpenAIError)
+        finally:
+            if original_module is None:
+                sys.modules.pop("openai", None)
+            else:
+                sys.modules["openai"] = original_module
+            importlib.reload(rag)
+
     def test_get_client_cached(self) -> None:
         rag._CLIENT_STATE["client"] = "client"
         rag._CLIENT_STATE["uses_v1"] = True
@@ -176,6 +231,18 @@ class TestRagParsing(RagTestCase):
     def test_extract_text_fallback(self) -> None:
         self.assertEqual(rag._extract_text(object(), uses_v1=False), "")
 
+    def test_normalize_endpoint_openai_path(self) -> None:
+        value = "https://example.com/openai/deployments/test?api-version=1"
+        self.assertEqual(rag._normalize_endpoint(value), "https://example.com")
+
+    def test_normalize_endpoint_without_scheme_openai_path(self) -> None:
+        value = "example.com/openai/deployments/test?api-version=1"
+        self.assertEqual(rag._normalize_endpoint(value), "example.com")
+
+    def test_normalize_endpoint_plain(self) -> None:
+        value = "example.com/custom/path/"
+        self.assertEqual(rag._normalize_endpoint(value), "example.com/custom/path")
+
     def test_json_from_text_paths(self) -> None:
         self.assertIsNone(rag._json_from_text(""))
         self.assertIsNone(rag._json_from_text("{bad}"))
@@ -189,6 +256,41 @@ class TestRagParsing(RagTestCase):
 
 
 class TestRagEmbeddings(RagTestCase):
+    def test_get_embedding_client_builds_and_caches(self) -> None:
+        class FakeAzure:
+            def __init__(self, api_key, azure_endpoint, api_version):
+                self.api_key = api_key
+                self.azure_endpoint = azure_endpoint
+                self.api_version = api_version
+
+        cfg = rag.AzureCfg(
+            endpoint="https://embed.example/",
+            api_key="key",
+            deployment="dep",
+            api_version="2024-12-01-preview",
+            use_v1=False,
+        )
+        with patch.object(rag, "_load_embedding_config", return_value=cfg), \
+             patch.object(rag, "AzureOpenAI", FakeAzure):
+            client = rag._get_embedding_client()
+            cached = rag._get_embedding_client()
+        self.assertIs(client, cached)
+        self.assertEqual(client.azure_endpoint, "https://embed.example")
+        self.assertEqual(rag._EMBED_CLIENT_STATE["cfg"], cfg)
+
+    def test_get_embedding_client_requires_azure(self) -> None:
+        cfg = rag.AzureCfg(
+            endpoint="https://embed.example/",
+            api_key="key",
+            deployment="dep",
+            api_version="2024-12-01-preview",
+            use_v1=False,
+        )
+        with patch.object(rag, "_load_embedding_config", return_value=cfg), \
+             patch.object(rag, "AzureOpenAI", None):
+            with self.assertRaises(RuntimeError):
+                rag._get_embedding_client()
+
     def test_embed_texts_requires_deployment(self) -> None:
         with patch("src.rag.rag._get_embedding_client", return_value=object()), \
              patch.dict(os.environ, {}, clear=True):

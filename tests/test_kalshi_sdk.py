@@ -1,17 +1,19 @@
 import json
 import os
 import sys
+import tempfile
 import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+import importlib
 
 from _test_utils import add_src_to_path
 
 add_src_to_path()
 
-import src.kalshi.kalshi_sdk as kalshi_sdk
-import src.kalshi.kalshi_rest_rate_limit as rest_rate_limit
+kalshi_sdk = importlib.import_module("src.kalshi.kalshi_sdk")
+rest_rate_limit = importlib.import_module("src.kalshi.kalshi_rest_rate_limit")
 
 
 class StopLoop(Exception):
@@ -73,6 +75,9 @@ class KalshiSdkTestCase(unittest.TestCase):
         rest_rate_limit._REST_LAST_REFILL = 0.0
         rest_rate_limit._REST_TOKENS = 0.0
         rest_rate_limit._CANDLE_NEXT_ALLOWED = 0.0
+        rest_rate_limit._REST_KEY_ROTATION_IDX = 0
+        rest_rate_limit._REST_KEY_ROTATION_ENABLED = False
+        rest_rate_limit.set_current_rest_key(None)
         if hasattr(rest_rate_limit._DB_RATE_LIMIT_LOCAL, "conn"):
             rest_rate_limit._DB_RATE_LIMIT_LOCAL.conn = None
 
@@ -146,6 +151,58 @@ class TestRestLimits(KalshiSdkTestCase):
         with patch.dict(os.environ, {}, clear=True), \
              patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_db_url", return_value="db"):
             self.assertEqual(rest_rate_limit._rest_rate_limit_backend(), "db")
+
+
+class TestRestKeySelection(KalshiSdkTestCase):
+    def test_rest_key_pool_dedupes(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"KALSHI_API_KEY_ID": " key1 ", "KALSHI_API_KEY_ID_2": "key1"},
+        ):
+            self.assertEqual(rest_rate_limit._rest_key_pool(), ["key1"])
+
+    def test_set_current_rest_key(self) -> None:
+        rest_rate_limit.set_current_rest_key("key1")
+        self.assertEqual(rest_rate_limit.current_rest_key(), "key1")
+        rest_rate_limit.set_current_rest_key(None)
+        self.assertIsNone(rest_rate_limit.current_rest_key())
+
+    def test_select_rest_key_no_rotation_uses_current(self) -> None:
+        rest_rate_limit._REST_KEY_ROTATION_ENABLED = False
+        rest_rate_limit.set_current_rest_key("key2")
+        with patch.dict(
+            os.environ,
+            {"KALSHI_API_KEY_ID": "key1", "KALSHI_API_KEY_ID_2": "key2"},
+        ):
+            selected = rest_rate_limit.select_rest_key()
+        self.assertEqual(selected, "key2")
+        self.assertEqual(rest_rate_limit.current_rest_key(), "key2")
+
+    def test_select_rest_key_rotation(self) -> None:
+        rest_rate_limit._REST_KEY_ROTATION_ENABLED = True
+        rest_rate_limit._REST_KEY_ROTATION_IDX = 0
+        rest_rate_limit.set_current_rest_key(None)
+        with patch.dict(
+            os.environ,
+            {"KALSHI_API_KEY_ID": "key1", "KALSHI_API_KEY_ID_2": "key2"},
+        ):
+            first = rest_rate_limit.select_rest_key()
+            second = rest_rate_limit.select_rest_key()
+        self.assertEqual(first, "key1")
+        self.assertEqual(second, "key2")
+
+    def test_db_rate_limit_key_includes_id(self) -> None:
+        self.assertEqual(
+            rest_rate_limit._db_rate_limit_key("key1"),
+            "kalshi_rest_rate_limit:key1",
+        )
+
+    def test_rest_apply_cooldown_db_with_key(self) -> None:
+        rest_rate_limit.set_current_rest_key("key1")
+        with patch("src.kalshi.kalshi_rest_rate_limit._rest_rate_limit_backend", return_value="db"), \
+             patch("src.kalshi.kalshi_rest_rate_limit._db_rest_apply_cooldown") as db_apply:
+            kalshi_sdk.rest_apply_cooldown(2.0)
+        db_apply.assert_called_once_with(2.0, "key1")
 
 
 class TestDbRateLimitConn(KalshiSdkTestCase):
@@ -1346,6 +1403,34 @@ class TestSdkHelpers(KalshiSdkTestCase):
         self.assertEqual(kwargs["series_ticker"], "S")
         self.assertEqual(kwargs["market_ticker"], "M")
 
+    def test_build_candlestick_kwargs_fallback_interval(self) -> None:
+        def method(**_kwargs):
+            return None
+
+        kwargs = kalshi_sdk._build_candlestick_kwargs(
+            method,
+            "S",
+            "M",
+            {"period_interval_minutes": 7},
+        )
+        self.assertEqual(kwargs["period_interval"], 7)
+        self.assertEqual(kwargs["series_ticker"], "S")
+        self.assertEqual(kwargs["market_ticker"], "M")
+
+    def test_build_candlestick_kwargs_signature_error(self) -> None:
+        def method(**_kwargs):
+            return None
+
+        with patch("src.kalshi.kalshi_sdk_candles._filter_kwargs", side_effect=lambda _m, kwargs: kwargs), \
+             patch("inspect.signature", side_effect=TypeError("boom")):
+            kwargs = kalshi_sdk._build_candlestick_kwargs(
+                method,
+                "S",
+                "M",
+                {"period_interval_minutes": 9},
+            )
+        self.assertEqual(kwargs["period_interval"], 9)
+
     def test_normalize_candlesticks_response(self) -> None:
         self.assertEqual(
             kalshi_sdk._normalize_candlesticks_response([{"a": 1}]),
@@ -1411,3 +1496,493 @@ class TestSdkHelpers(KalshiSdkTestCase):
             kalshi_sdk.get_market_candlesticks(client, "S", "M")
         wait.assert_called_once()
         self.assertEqual(client.calls, 1)
+
+
+class TestSdkWrappers(KalshiSdkTestCase):
+    def test_candlestick_wrappers(self) -> None:
+        with patch("src.kalshi.kalshi_sdk._candlesticks_wait_impl") as wait_impl:
+            kalshi_sdk._candlesticks_wait()
+        wait_impl.assert_called_once()
+
+        with patch("src.kalshi.kalshi_sdk._candlesticks_apply_cooldown_impl") as apply_impl:
+            kalshi_sdk._candlesticks_apply_cooldown(2.5)
+        apply_impl.assert_called_once_with(2.5)
+
+    def test_coerce_payload(self) -> None:
+        self.assertIsNone(kalshi_sdk.coerce_payload(None))
+        data = {"a": 1}
+        self.assertIs(kalshi_sdk.coerce_payload(data), data)
+
+        class ModelWithMode:
+            def model_dump(self, mode=None):
+                return {"b": 2}
+
+        self.assertEqual(kalshi_sdk.coerce_payload(ModelWithMode()), {"b": 2})
+
+        class ModelNoMode:
+            def model_dump(self):
+                return {"c": 3}
+
+        self.assertEqual(kalshi_sdk.coerce_payload(ModelNoMode()), {"c": 3})
+
+        class WithDict:
+            def dict(self):
+                return {"d": 4}
+
+        self.assertEqual(kalshi_sdk.coerce_payload(WithDict()), {"d": 4})
+
+        class WithDictAttr:
+            dict = {"e": 5}
+
+        self.assertEqual(kalshi_sdk.coerce_payload(WithDictAttr()), {"e": 5})
+
+        class WithAttrs:
+            def __init__(self):
+                self.f = 6
+
+        self.assertEqual(kalshi_sdk.coerce_payload(WithAttrs()), {"f": 6})
+
+    def test_is_validation_error(self) -> None:
+        class ValidationError(Exception):
+            pass
+
+        ValidationError.__module__ = "pydantic"
+        self.assertTrue(kalshi_sdk._is_validation_error(ValidationError()))
+
+        ValidationError.__module__ = "pydantic_core"
+        self.assertTrue(kalshi_sdk._is_validation_error(ValidationError()))
+
+        class OtherError(Exception):
+            pass
+
+        self.assertFalse(kalshi_sdk._is_validation_error(OtherError()))
+
+
+class TestSdkCredentials(KalshiSdkTestCase):
+    def test_write_temp_key_dict_cache(self) -> None:
+        original = kalshi_sdk._TEMP_KEY_PATH
+        try:
+            kalshi_sdk._TEMP_KEY_PATH = []
+            path1 = kalshi_sdk._write_temp_key("pem-one")
+            self.assertIsInstance(kalshi_sdk._TEMP_KEY_PATH, dict)
+            self.assertEqual(kalshi_sdk._TEMP_KEY_PATH["pem-one"], path1)
+            path2 = kalshi_sdk._write_temp_key("pem-one")
+            self.assertEqual(path1, path2)
+        finally:
+            kalshi_sdk._TEMP_KEY_PATH = original
+
+    def test_read_private_key(self) -> None:
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+            temp_file.write("secret")
+            path = temp_file.name
+        try:
+            self.assertEqual(kalshi_sdk._read_private_key(path), "secret")
+        finally:
+            os.unlink(path)
+
+    def test_load_secondary_credentials_empty(self) -> None:
+        orig_pytest = sys.modules.pop("pytest", None)
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(kalshi_sdk._load_secondary_credentials(), [])
+        finally:
+            if orig_pytest is not None:
+                sys.modules["pytest"] = orig_pytest
+
+    def test_load_secondary_credentials_missing_pair(self) -> None:
+        orig_pytest = sys.modules.pop("pytest", None)
+        try:
+            with patch.dict(
+                os.environ,
+                {"KALSHI_API_KEY_ID_2": "key", "KALSHI_PRIVATE_KEY_PEM_PATH_2": ""},
+                clear=True,
+            ), patch("src.kalshi.kalshi_sdk.logger.warning") as warn:
+                creds = kalshi_sdk._load_secondary_credentials()
+            self.assertEqual(creds, [])
+            warn.assert_called_once()
+        finally:
+            if orig_pytest is not None:
+                sys.modules["pytest"] = orig_pytest
+
+    def test_load_secondary_credentials_read_error(self) -> None:
+        orig_pytest = sys.modules.pop("pytest", None)
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID_2": "key2",
+                    "KALSHI_PRIVATE_KEY_PEM_PATH_2": "/tmp/missing",
+                },
+                clear=True,
+            ), patch("src.kalshi.kalshi_sdk._read_private_key", side_effect=OSError("fail")), \
+                patch("src.kalshi.kalshi_sdk.logger.warning") as warn:
+                creds = kalshi_sdk._load_secondary_credentials()
+            self.assertEqual(creds, [])
+            warn.assert_called_once()
+        finally:
+            if orig_pytest is not None:
+                sys.modules["pytest"] = orig_pytest
+
+    def test_load_secondary_credentials_success(self) -> None:
+        orig_pytest = sys.modules.pop("pytest", None)
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID_2": "key2",
+                    "KALSHI_PRIVATE_KEY_PEM_PATH_2": "/tmp/pem",
+                },
+                clear=True,
+            ), patch("src.kalshi.kalshi_sdk._read_private_key", return_value="pem"):
+                creds = kalshi_sdk._load_secondary_credentials()
+            self.assertEqual(creds, [("key2", "pem")])
+        finally:
+            if orig_pytest is not None:
+                sys.modules["pytest"] = orig_pytest
+
+
+class TestSdkPatchingExtra(KalshiSdkTestCase):
+    def test_patch_sdk_models_non_mapping(self) -> None:
+        market_module = types.ModuleType("kalshi_python_sync.models.market")
+        event_module = types.ModuleType("kalshi_python_sync.models.event")
+
+        class Market:
+            @classmethod
+            def from_dict(cls, obj):
+                return {"raw": obj}
+
+        class Event:
+            @classmethod
+            def from_dict(cls, obj):
+                return {"raw": obj}
+
+        market_module.Market = Market
+        event_module.Event = Event
+        with patch.dict(
+            sys.modules,
+            {
+                "kalshi_python_sync": types.ModuleType("kalshi_python_sync"),
+                "kalshi_python_sync.models": types.ModuleType("kalshi_python_sync.models"),
+                "kalshi_python_sync.models.market": market_module,
+                "kalshi_python_sync.models.event": event_module,
+            },
+        ):
+            kalshi_sdk._patch_sdk_models()
+            result = Market.from_dict(["a", "b"])
+        self.assertEqual(result["raw"], ["a", "b"])
+
+
+class TestEnsureMethodHostEarlyReturns(KalshiSdkTestCase):
+    def test_ensure_method_host_no_self(self) -> None:
+        def free_func():
+            return None
+
+        with patch.dict(os.environ, {"KALSHI_HOST": "host"}), \
+             patch("src.kalshi.kalshi_sdk.logger.info") as info:
+            kalshi_sdk._ensure_method_host(free_func)
+        info.assert_not_called()
+
+    def test_ensure_method_host_no_api_client(self) -> None:
+        class Client:
+            def events(self):
+                return None
+
+        client = Client()
+        with patch.dict(os.environ, {"KALSHI_HOST": "host"}), \
+             patch("src.kalshi.kalshi_sdk.logger.info") as info:
+            kalshi_sdk._ensure_method_host(client.events)
+        info.assert_not_called()
+
+
+class TestClientPool(KalshiSdkTestCase):
+    def test_client_pool_requires_clients(self) -> None:
+        with self.assertRaises(kalshi_sdk.KalshiSdkError):
+            kalshi_sdk._KalshiClientPool([], [])
+
+    def test_client_pool_init_and_count(self) -> None:
+        pool = kalshi_sdk._KalshiClientPool([SimpleNamespace()], ["key1"])
+        self.assertEqual(pool.client_count(), 1)
+
+    def test_client_pool_default_cooldown_invalid_env(self) -> None:
+        pool = kalshi_sdk._KalshiClientPool([SimpleNamespace()], ["key1"])
+        with patch.dict(os.environ, {"KALSHI_KEY_COOLDOWN_SECONDS": "bad"}):
+            self.assertEqual(pool._default_cooldown(), 60.0)
+
+    def test_client_pool_mark_cooldown_zero(self) -> None:
+        pool = kalshi_sdk._KalshiClientPool([SimpleNamespace()], ["key1"])
+        with patch("src.kalshi.kalshi_sdk._extract_retry_after", return_value=0.0), \
+             patch("src.kalshi.kalshi_sdk.logger.warning") as warn:
+            pool._mark_cooldown(0, Exception("rate"))
+        self.assertEqual(pool._cooldowns[0], 0.0)
+        warn.assert_not_called()
+
+    def test_client_pool_mark_cooldown_updates(self) -> None:
+        pool = kalshi_sdk._KalshiClientPool([SimpleNamespace(), SimpleNamespace()], ["key1"])
+        with patch("src.kalshi.kalshi_sdk._extract_retry_after", return_value=None), \
+             patch.dict(os.environ, {"KALSHI_KEY_COOLDOWN_SECONDS": "bad"}), \
+             patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=100.0), \
+             patch("src.kalshi.kalshi_sdk.logger.warning") as warn:
+            pool._mark_cooldown(1, Exception("rate"))
+        self.assertEqual(pool._cooldowns[1], 160.0)
+        self.assertEqual(warn.call_args[0][1], "key2")
+
+    def test_client_pool_pick_index_available(self) -> None:
+        pool = kalshi_sdk._KalshiClientPool([SimpleNamespace(), SimpleNamespace()], ["k1", "k2"])
+        pool._cooldowns = [0.0, 100.0]
+        pool._next_index = 0
+        with patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=10.0):
+            idx = pool._pick_index()
+        self.assertEqual(idx, 0)
+
+    def test_client_pool_pick_index_all_blocked(self) -> None:
+        pool = kalshi_sdk._KalshiClientPool([SimpleNamespace(), SimpleNamespace()], ["k1", "k2"])
+        pool._cooldowns = [100.0, 100.0]
+        pool._next_index = 0
+        with patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=10.0):
+            idx = pool._pick_index()
+        self.assertEqual(idx, 0)
+
+    def test_client_pool_preferred_index(self) -> None:
+        pool = kalshi_sdk._KalshiClientPool([SimpleNamespace(), SimpleNamespace()], ["k1", "k2"])
+        pool._cooldowns = [0.0, 0.0]
+        with patch("src.kalshi.kalshi_sdk.current_rest_key", return_value=""), \
+             patch("src.kalshi.kalshi_sdk.select_rest_key", return_value="k2"), \
+             patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=0.0):
+            self.assertEqual(pool._preferred_index(), 1)
+
+    def test_client_pool_preferred_index_blocked(self) -> None:
+        pool = kalshi_sdk._KalshiClientPool([SimpleNamespace(), SimpleNamespace()], ["k1", "k2"])
+        pool._cooldowns = [0.0, 100.0]
+        with patch("src.kalshi.kalshi_sdk.current_rest_key", return_value="k2"), \
+             patch("src.kalshi.kalshi_sdk.time.monotonic", return_value=0.0):
+            self.assertIsNone(pool._preferred_index())
+
+    def test_client_pool_preferred_index_missing(self) -> None:
+        pool = kalshi_sdk._KalshiClientPool([SimpleNamespace()], ["k1"])
+        with patch("src.kalshi.kalshi_sdk.current_rest_key", return_value="missing"):
+            self.assertIsNone(pool._preferred_index())
+
+    def test_client_pool_preferred_index_no_key(self) -> None:
+        pool = kalshi_sdk._KalshiClientPool([SimpleNamespace()], ["k1"])
+        with patch("src.kalshi.kalshi_sdk.current_rest_key", return_value=None), \
+             patch("src.kalshi.kalshi_sdk.select_rest_key", return_value=None):
+            self.assertIsNone(pool._preferred_index())
+
+    def test_client_pool_preferred_index_no_key_blank(self) -> None:
+        pool = kalshi_sdk._KalshiClientPool([SimpleNamespace()], ["k1"])
+        with patch("src.kalshi.kalshi_sdk.current_rest_key", return_value=""), \
+             patch("src.kalshi.kalshi_sdk.select_rest_key", return_value=""):
+            self.assertIsNone(pool._preferred_index())
+
+    def test_client_pool_call_method_prefers_index(self) -> None:
+        class Client:
+            def ping(self, value):
+                return f"pong-{value}"
+
+        pool = kalshi_sdk._KalshiClientPool([Client()], ["k1"])
+        with patch.object(pool, "_preferred_index", return_value=0), \
+             patch("src.kalshi.kalshi_sdk.set_current_rest_key") as set_key:
+            result = pool._call_method("ping", "x")
+        self.assertEqual(result, "pong-x")
+        set_key.assert_called_once_with("k1")
+
+    def test_client_pool_call_method_rate_limited(self) -> None:
+        class TooMany(Exception):
+            status = 429
+
+        class Client429:
+            def ping(self):
+                raise TooMany()
+
+        class ClientOk:
+            def ping(self):
+                return "ok"
+
+        pool = kalshi_sdk._KalshiClientPool([Client429(), ClientOk()], ["k1", "k2"])
+        pool._mark_cooldown = Mock()
+        with patch.object(pool, "_preferred_index", return_value=None), \
+             patch.object(pool, "_pick_index", side_effect=[0, 1]), \
+             patch("src.kalshi.kalshi_sdk.set_current_rest_key") as set_key:
+            result = pool._call_method("ping")
+        self.assertEqual(result, "ok")
+        pool._mark_cooldown.assert_called_once()
+        self.assertEqual(set_key.call_count, 2)
+
+    def test_client_pool_call_method_skips_attempted(self) -> None:
+        class TooMany(Exception):
+            status = 429
+
+        class Client429:
+            def ping(self):
+                raise TooMany()
+
+        pool = kalshi_sdk._KalshiClientPool([Client429(), Client429()], ["k1", "k2"])
+        pool._mark_cooldown = Mock()
+        with patch.object(pool, "_preferred_index", return_value=0), \
+             patch.object(pool, "_pick_index", return_value=0), \
+             patch("src.kalshi.kalshi_sdk.set_current_rest_key"):
+            with self.assertRaises(TooMany):
+                pool._call_method("ping")
+        pool._mark_cooldown.assert_called_once()
+
+    def test_client_pool_call_method_skips_duplicate_attempted(self) -> None:
+        class TooMany(Exception):
+            status = 429
+
+        class Client429:
+            def ping(self):
+                raise TooMany()
+
+        class ClientOk:
+            def ping(self):
+                return "ok"
+
+        pool = kalshi_sdk._KalshiClientPool(
+            [Client429(), ClientOk(), ClientOk()],
+            ["k1", "k2", "k3"],
+        )
+        pool._mark_cooldown = Mock()
+        with patch.object(pool, "_preferred_index", return_value=None), \
+             patch.object(pool, "_pick_index", side_effect=[0, 0, 1]), \
+             patch("src.kalshi.kalshi_sdk.set_current_rest_key"):
+            result = pool._call_method("ping")
+        self.assertEqual(result, "ok")
+        pool._mark_cooldown.assert_called_once()
+
+    def test_client_pool_call_method_non_rate_limit_raises(self) -> None:
+        class ServerError(Exception):
+            status = 500
+
+        class ClientFail:
+            def ping(self):
+                raise ServerError()
+
+        pool = kalshi_sdk._KalshiClientPool([ClientFail()], ["k1"])
+        with patch.object(pool, "_preferred_index", return_value=None), \
+             patch.object(pool, "_pick_index", return_value=0):
+            with self.assertRaises(ServerError):
+                pool._call_method("ping")
+
+    def test_client_pool_call_method_unknown_error_raises(self) -> None:
+        class ClientFail:
+            def ping(self):
+                raise RuntimeError("boom")
+
+        pool = kalshi_sdk._KalshiClientPool([ClientFail()], ["k1"])
+        with patch.object(pool, "_preferred_index", return_value=None), \
+             patch.object(pool, "_pick_index", return_value=0):
+            with self.assertRaises(RuntimeError):
+                pool._call_method("ping")
+
+    def test_client_pool_call_method_raises_last_exc(self) -> None:
+        class TooMany(Exception):
+            status = 429
+
+        class ClientFail:
+            def ping(self):
+                raise TooMany()
+
+        pool = kalshi_sdk._KalshiClientPool([ClientFail(), ClientFail()], ["k1", "k2"])
+        pool._mark_cooldown = Mock()
+        with patch.object(pool, "_preferred_index", return_value=None), \
+             patch.object(pool, "_pick_index", side_effect=[0, 1]):
+            with self.assertRaises(TooMany):
+                pool._call_method("ping")
+
+    def test_client_pool_call_method_no_clients(self) -> None:
+        pool = kalshi_sdk._KalshiClientPool([SimpleNamespace()], ["k1"])
+        pool._clients = []
+        with patch.object(pool, "_preferred_index", return_value=None):
+            with self.assertRaises(kalshi_sdk.KalshiSdkError):
+                pool._call_method("ping")
+
+    def test_client_pool_getattr(self) -> None:
+        class Client:
+            def __init__(self):
+                self.value = 42
+
+            def ping(self, value):
+                return value
+
+        pool = kalshi_sdk._KalshiClientPool([Client()], ["k1"])
+        self.assertEqual(pool.value, 42)
+        with self.assertRaises(AttributeError):
+            _ = pool._secret
+
+        with patch.object(pool, "_call_method", return_value="ok") as call_method, \
+             patch("src.kalshi.kalshi_sdk.inspect.signature", side_effect=TypeError("boom")):
+            wrapped = pool.ping
+            self.assertEqual(wrapped("x"), "ok")
+        call_method.assert_called_once_with("ping", "x")
+
+
+class TestRetryHelpers(KalshiSdkTestCase):
+    def test_is_retryable_status(self) -> None:
+        self.assertTrue(kalshi_sdk._is_retryable_status(408))
+        self.assertTrue(kalshi_sdk._is_retryable_status(500))
+        self.assertFalse(kalshi_sdk._is_retryable_status(400))
+        self.assertFalse(kalshi_sdk._is_retryable_status(None))
+
+    def test_is_transient_exception(self) -> None:
+        class TemporarilyUnavailable(Exception):
+            pass
+
+        class ModuleError(Exception):
+            pass
+
+        ModuleError.__module__ = "urllib3.exceptions"
+        self.assertTrue(kalshi_sdk._is_transient_exception(TemporarilyUnavailable()))
+        self.assertTrue(kalshi_sdk._is_transient_exception(ModuleError()))
+
+    def test_call_with_retries_validation_error(self) -> None:
+        class ValidationError(Exception):
+            pass
+
+        ValidationError.__module__ = "pydantic"
+
+        def boom():
+            raise ValidationError("bad")
+
+        with patch("src.kalshi.kalshi_sdk.rest_wait"), \
+             patch("src.kalshi.kalshi_sdk.logger.warning") as warn:
+            ok, result = kalshi_sdk._call_with_retries(
+                boom,
+                kalshi_sdk.RetryConfig(1, 1.0, 2.0),
+                "ctx",
+            )
+        self.assertFalse(ok)
+        self.assertIsNone(result)
+        warn.assert_called_once()
+
+    def test_call_with_retries_transient_give_up(self) -> None:
+        class ServerError(Exception):
+            status = 500
+
+        def boom():
+            raise ServerError()
+
+        with patch("src.kalshi.kalshi_sdk.rest_wait"), \
+             patch("src.kalshi.kalshi_sdk.logger.warning") as warn:
+            ok, result = kalshi_sdk._call_with_retries(
+                boom,
+                kalshi_sdk.RetryConfig(0, 1.0, 2.0),
+                "ctx",
+            )
+        self.assertFalse(ok)
+        self.assertIsNone(result)
+        warn.assert_called_once()
+
+
+class TestMakeClientMultiKey(KalshiSdkTestCase):
+    def test_make_client_pool(self) -> None:
+        client1 = SimpleNamespace()
+        client2 = SimpleNamespace()
+        with patch("src.kalshi.kalshi_sdk._import_sdk", return_value=object()), \
+             patch("src.kalshi.kalshi_sdk._patch_sdk_models"), \
+             patch("src.kalshi.kalshi_sdk._load_secondary_credentials", return_value=[("key2", "pem2")]), \
+             patch("src.kalshi.kalshi_sdk._make_single_client", side_effect=[client1, client2]), \
+             patch("src.kalshi.kalshi_sdk.set_rest_key_rotation") as set_rotate:
+            result = kalshi_sdk.make_client("host", "key1", "pem1")
+        self.assertIsInstance(result, kalshi_sdk._KalshiClientPool)
+        self.assertEqual(result.client_count(), 2)
+        set_rotate.assert_called_once_with(True)

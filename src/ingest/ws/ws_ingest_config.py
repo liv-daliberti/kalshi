@@ -7,10 +7,10 @@ import os
 from typing import Any
 from urllib.parse import urlparse
 
-from src.core.env_utils import _env_float_fallback as _env_float
-from src.core.env_utils import _env_int_fallback as _env_int
-from src.ingest.ws.ws_ingest_db_utils import _psycopg_error_type
-from src.ingest.ws.ws_ingest_models import (
+from ...core.env_utils import _env_float_fallback as _env_float
+from ...core.env_utils import _env_int_fallback as _env_int
+from .ws_ingest_db_utils import _psycopg_error_type
+from .ws_ingest_models import (
     FailureConfig,
     ShardConfig,
     WriterConfig,

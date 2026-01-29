@@ -18,11 +18,11 @@ import psycopg  # pylint: disable=import-error
 from psycopg.rows import dict_row  # pylint: disable=import-error
 from dateutil.parser import isoparse
 
-from src.core.env_utils import parse_bool, parse_int
-from src.core.guardrails import assert_state_write_allowed
-from src.core.number_utils import normalize_probability
-from src.rag.rag_documents import fetch_rag_documents
-from src.predictions.prediction_utils import baseline_market_prob
+from ..core.env_utils import parse_bool, parse_int
+from ..core.guardrails import assert_state_write_allowed
+from ..core.number_utils import normalize_probability
+from .rag_documents import fetch_rag_documents
+from ..predictions.prediction_utils import baseline_market_prob
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,14 @@ _MAX_DOC_CHARS = 2000
 _RAG_CALL_WINDOW_KEY = "rag_24h_calls"
 _RAG_CALL_WINDOW_SECONDS = 24 * 60 * 60
 _RAG_CALL_LIMIT_DEFAULT = 50000
+
+
+def _parse_int(raw: str | None, fallback: int, minimum: Optional[int] = None) -> int:
+    return parse_int(raw, fallback, minimum)
+
+
+def _parse_bool(raw: str | None, default: bool = False) -> bool:
+    return parse_bool(raw, default)
 
 EmbeddingHandler = Callable[[list[str]], list[list[float]]]
 LLMHandler = Callable[[dict[str, Any], dict[str, Any], list[dict[str, Any]], str], dict[str, Any]]

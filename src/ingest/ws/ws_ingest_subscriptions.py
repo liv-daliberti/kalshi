@@ -7,15 +7,15 @@ import itertools
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from src.db.db import upsert_active_markets_from_markets
-from src.db.tickers import load_active_tickers_shard, load_market_tickers_shard
-from src.core.number_utils import coerce_int as _coerce_int
-from src.ingest.ws.ws_ingest_config import _bool_env
-from src.ingest.ws.ws_ingest_db_utils import _psycopg_error_type
-from src.ingest.ws.ws_ingest_models import (
+from ...db.db import upsert_active_markets_from_markets
+from ...db.tickers import load_active_tickers_shard, load_market_tickers_shard
+from ...core.number_utils import coerce_int as _coerce_int
+from .ws_ingest_config import _bool_env
+from .ws_ingest_db_utils import _psycopg_error_type
+from .ws_ingest_models import (
     PendingUpdate,
     SubscriptionConfig,
     SubscriptionContext,
@@ -23,7 +23,7 @@ from src.ingest.ws.ws_ingest_models import (
     WsLoopConfig,
     WsSessionContext,
 )
-from src.ingest.ws.ws_ingest_protocol import _build_subscribe_message, _chunked
+from .ws_ingest_protocol import _build_subscribe_message, _chunked
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,16 @@ _SUBSCRIPTION_ID_FIELDS = ("sid", "subscription_id", "subscriptionId")
 
 
 @dataclass(frozen=True)
+class UpdateMessageOptions:
+    """Optional settings for update_subscription payloads."""
+
+    subscription_id: int | None = None
+    subscription_id_field: str | None = None
+    update_style: str | None = None
+    include_channels: bool | None = None
+
+
+@dataclass(frozen=True)
 class UpdateMessageRequest:
     """Input values for update_subscription payloads."""
 
@@ -108,18 +118,29 @@ class UpdateMessageRequest:
     channels: Iterable[str]
     add_tickers: list[str]
     remove_tickers: list[str]
-    subscription_id: int | None = None
-    subscription_id_field: str | None = None
+    options: UpdateMessageOptions = field(default_factory=UpdateMessageOptions)
+
+
+@dataclass(frozen=True)
+class UpdateErrorContext:
+    """Inputs needed to handle update_subscription errors."""
+
+    websocket: Any
+    state: SubscriptionState
+    config: SubscriptionConfig
+    pending: PendingUpdate
+    request_id: int
+    error_code: int | None
 
 
 def _normalize_subscription_id_field(value: str | None) -> str | None:
     if value is None:
         return None
-    field = value.strip()
-    if not field:
+    field_name = value.strip()
+    if not field_name:
         return None
-    if field in _SUBSCRIPTION_ID_FIELDS:
-        return field
+    if field_name in _SUBSCRIPTION_ID_FIELDS:
+        return field_name
     return None
 
 
@@ -127,26 +148,47 @@ def _resolve_subscription_id_field_env() -> str | None:
     return _normalize_subscription_id_field(os.getenv("KALSHI_WS_SUBSCRIPTION_ID_FIELD"))
 
 
+def _resolve_update_style(value: str | None = None) -> str:
+    if value is None:
+        value = os.getenv("KALSHI_WS_UPDATE_STYLE", "markets")
+    if value is None:
+        return "markets"
+    style = value.strip().lower()
+    if style in {"market_tickers", "tickers", "legacy"}:
+        return "legacy"
+    return "markets"
+
+
+def _alternate_update_style(value: str | None) -> str:
+    return "markets" if _resolve_update_style(value) == "legacy" else "legacy"
+
+
+def _resolve_update_include_channels(value: bool | None = None) -> bool:
+    if value is not None:
+        return value
+    return _bool_env("KALSHI_WS_UPDATE_INCLUDE_CHANNELS", False)
+
+
 def _extract_subscription_id_field(message: dict) -> str | None:
     """Extract which subscription id field is present in a WS payload."""
     msg = message.get("msg")
     params = message.get("params")
     msg_params = msg.get("params") if isinstance(msg, dict) else None
-    for field in _SUBSCRIPTION_ID_FIELDS:
-        if _coerce_int(message.get(field)) is not None:
-            return field
+    for field_name in _SUBSCRIPTION_ID_FIELDS:
+        if _coerce_int(message.get(field_name)) is not None:
+            return field_name
     if isinstance(msg, dict):
-        for field in _SUBSCRIPTION_ID_FIELDS:
-            if _coerce_int(msg.get(field)) is not None:
-                return field
+        for field_name in _SUBSCRIPTION_ID_FIELDS:
+            if _coerce_int(msg.get(field_name)) is not None:
+                return field_name
     if isinstance(params, dict):
-        for field in _SUBSCRIPTION_ID_FIELDS:
-            if _coerce_int(params.get(field)) is not None:
-                return field
+        for field_name in _SUBSCRIPTION_ID_FIELDS:
+            if _coerce_int(params.get(field_name)) is not None:
+                return field_name
     if isinstance(msg_params, dict):
-        for field in _SUBSCRIPTION_ID_FIELDS:
-            if _coerce_int(msg_params.get(field)) is not None:
-                return field
+        for field_name in _SUBSCRIPTION_ID_FIELDS:
+            if _coerce_int(msg_params.get(field_name)) is not None:
+                return field_name
     return None
 
 
@@ -159,27 +201,29 @@ async def _record_subscription_id_field(
     if field_name is None:
         return
     async with state.lock:
-        if state.sid_field != field_name:
-            if state.sid_field is not None:
+        if state.update_state.sid_field != field_name:
+            if state.update_state.sid_field is not None:
                 logger.debug(
                     "WS subscription id field changed: %s -> %s",
-                    state.sid_field,
+                    state.update_state.sid_field,
                     field_name,
                 )
-            state.sid_field = field_name
+            else:
+                logger.debug("WS subscription id field set: %s", field_name)
+            state.update_state.sid_field = field_name
 
 
 async def _resolve_update_sid_field(
     state: SubscriptionState | None,
     subscription_id_field: str | None = None,
 ) -> str:
-    field = _normalize_subscription_id_field(subscription_id_field)
-    if field is not None:
-        return field
+    sid_field = _normalize_subscription_id_field(subscription_id_field)
+    if sid_field is not None:
+        return sid_field
     if state is not None:
         async with state.lock:
-            if state.sid_field is not None:
-                return state.sid_field
+            if state.update_state.sid_field is not None:
+                return state.update_state.sid_field
     env_field = _resolve_subscription_id_field_env()
     if env_field is not None:
         return env_field
@@ -187,18 +231,42 @@ async def _resolve_update_sid_field(
 
 
 def _fallback_sid_field(current: str | None) -> str | None:
-    for field in ("subscription_id", "subscriptionId", "sid"):
-        if field != current:
-            return field
+    for sid_field in ("subscription_id", "subscriptionId", "sid"):
+        if sid_field != current:
+            return sid_field
     return None
 
 
-def _build_update_message(request: UpdateMessageRequest) -> dict:
+def _build_update_message(
+    request: UpdateMessageRequest | int,
+    channels: Iterable[str] | None = None,
+    add_tickers: list[str] | None = None,
+    remove_tickers: list[str] | None = None,
+    *,
+    subscription_id: int | None = None,
+    subscription_id_field: str | None = None,
+    update_style: str | None = None,
+    include_channels: bool | None = None,
+) -> dict:
     """Build a subscription update request for the WS API."""
-    update_style = os.getenv("KALSHI_WS_UPDATE_STYLE", "markets").strip().lower()
-    include_channels = _bool_env("KALSHI_WS_UPDATE_INCLUDE_CHANNELS", False)
+    if not isinstance(request, UpdateMessageRequest):
+        request = UpdateMessageRequest(
+            request_id=int(request),
+            channels=tuple(channels or ()),
+            add_tickers=list(add_tickers or []),
+            remove_tickers=list(remove_tickers or []),
+            options=UpdateMessageOptions(
+                subscription_id=subscription_id,
+                subscription_id_field=subscription_id_field,
+                update_style=update_style,
+                include_channels=include_channels,
+            ),
+        )
+    options = request.options
+    update_style = _resolve_update_style(options.update_style)
+    include_channels = _resolve_update_include_channels(options.include_channels)
     params: dict[str, Any] = {}
-    if update_style in {"market_tickers", "tickers", "legacy"}:
+    if update_style == "legacy":
         market_tickers: dict[str, list[str]] = {}
         if request.add_tickers:
             market_tickers["add"] = request.add_tickers
@@ -217,11 +285,11 @@ def _build_update_message(request: UpdateMessageRequest) -> dict:
         "cmd": "update_subscription",
         "params": params,
     }
-    if request.subscription_id is not None:
-        sid_field = _normalize_subscription_id_field(request.subscription_id_field)
+    if options.subscription_id is not None:
+        sid_field = _normalize_subscription_id_field(options.subscription_id_field)
         if sid_field is None:
             sid_field = _resolve_subscription_id_field_env() or "sid"
-        params[sid_field] = request.subscription_id
+        params[sid_field] = options.subscription_id
     return payload
 
 
@@ -248,8 +316,8 @@ def _extract_subscription_ids(message: dict) -> tuple[int, int] | None:
     if not isinstance(msg_params, dict):
         msg_params = {}
     for payload in (message, msg, params, msg_params):
-        for field in _SUBSCRIPTION_ID_FIELDS:
-            sid = _coerce_int(payload.get(field))
+        for field_name in _SUBSCRIPTION_ID_FIELDS:
+            sid = _coerce_int(payload.get(field_name))
             if sid is not None:
                 return request_id, sid
     return None
@@ -262,6 +330,26 @@ async def _pop_pending_update(
     """Remove and return a pending update_subscription entry."""
     async with state.lock:
         return state.pending_updates.pop(request_id, None)
+
+
+async def _resolve_single_pending_update_id(
+    state: SubscriptionState,
+) -> int | None:
+    """Return the only pending update request id when exactly one exists."""
+    async with state.lock:
+        if len(state.pending_updates) == 1:
+            return next(iter(state.pending_updates.keys()))
+    return None
+
+
+async def _drain_pending_updates(
+    state: SubscriptionState,
+) -> list[PendingUpdate]:
+    """Drain all pending update entries."""
+    async with state.lock:
+        pending = list(state.pending_updates.values())
+        state.pending_updates.clear()
+    return pending
 
 
 async def _register_subscription_sid(
@@ -279,6 +367,238 @@ async def _register_subscription_sid(
         return len(tickers)
 
 
+def _pending_update_batches(pending: PendingUpdate) -> tuple[list[str], list[str]]:
+    add_tickers = list(pending.tickers) if pending.action == "add" else []
+    remove_tickers = list(pending.tickers) if pending.action == "remove" else []
+    return add_tickers, remove_tickers
+
+
+def _build_update_request_from_pending(
+    *,
+    request_id: int,
+    channels: Iterable[str],
+    pending: PendingUpdate,
+    sid_field: str | None,
+    update_style: str | None,
+    include_channels: bool | None,
+) -> UpdateMessageRequest:
+    add_tickers, remove_tickers = _pending_update_batches(pending)
+    return UpdateMessageRequest(
+        request_id=request_id,
+        channels=channels,
+        add_tickers=add_tickers,
+        remove_tickers=remove_tickers,
+        options=UpdateMessageOptions(
+            subscription_id=pending.sid,
+            subscription_id_field=sid_field,
+            update_style=update_style,
+            include_channels=include_channels,
+        ),
+    )
+
+
+async def _disable_update_subscription(
+    state: SubscriptionState,
+    message: str,
+    *args: Any,
+) -> None:
+    async with state.lock:
+        if not state.update_state.update_disabled:
+            logger.warning(message, *args)
+        state.update_state.update_disabled = True
+
+
+async def _restore_removed_updates(
+    state: SubscriptionState,
+    pending_updates: Iterable[PendingUpdate],
+) -> None:
+    async with state.lock:
+        for pending in pending_updates:
+            if pending.action != "remove":
+                continue
+            state.subscribed.update(pending.tickers)
+            if pending.sid is not None:
+                state.sid_tickers.setdefault(pending.sid, set()).update(pending.tickers)
+
+
+def _collect_pending_tickers(pending_updates: Iterable[PendingUpdate]) -> set[str]:
+    tickers: set[str] = set()
+    for pending in pending_updates:
+        tickers.update(pending.tickers)
+    return tickers
+
+
+async def _resolve_update_request_id(
+    websocket,
+    state: SubscriptionState,
+    config: SubscriptionConfig,
+    request_id: int | None,
+    error_code: int | None,
+) -> int | None:
+    if request_id is not None:
+        return request_id
+    resolved = await _resolve_single_pending_update_id(state)
+    if resolved is not None:
+        return resolved
+    pending_updates = await _drain_pending_updates(state)
+    if not pending_updates:
+        return None
+    await _disable_update_subscription(
+        state,
+        "WS update_subscription disabled after error code=%s (missing id)",
+        error_code,
+    )
+    await _restore_removed_updates(state, pending_updates)
+    tickers = _collect_pending_tickers(pending_updates)
+    if not tickers:
+        return None
+    logger.warning(
+        "WS update_subscription error code=%s missing id; re-subscribing %s tickers",
+        error_code,
+        len(tickers),
+    )
+    await _send_subscribe_batches(
+        websocket,
+        config.channels,
+        config.ws_batch_size,
+        sorted(tickers),
+        state,
+    )
+    return None
+
+
+async def _send_update_retry(
+    websocket,
+    state: SubscriptionState,
+    config: SubscriptionConfig,
+    pending: PendingUpdate,
+    *,
+    sid_field: str | None,
+    update_style: str | None,
+    include_channels: bool | None,
+) -> None:
+    req_id = next(state.request_id)
+    msg = _build_update_message(
+        _build_update_request_from_pending(
+            request_id=req_id,
+            channels=config.channels,
+            pending=pending,
+            sid_field=sid_field,
+            update_style=update_style,
+            include_channels=include_channels,
+        )
+    )
+    logger.debug("WS update_subscription retry payload: %s", msg)
+    await websocket.send(json.dumps(msg))
+    async with state.lock:
+        state.pending_updates[req_id] = PendingUpdate(
+            action=pending.action,
+            sid=pending.sid,
+            tickers=pending.tickers,
+            sid_field=sid_field,
+            update_style=update_style,
+            include_channels=include_channels,
+            attempts=pending.attempts + 1,
+        )
+
+
+async def _retry_update_with_sid_field(context: UpdateErrorContext) -> bool:
+    pending = context.pending
+    error_code = context.error_code
+    if (
+        error_code != 12
+        or pending.sid is None
+        or pending.attempts >= 2
+        or _resolve_subscription_id_field_env() is not None
+    ):
+        return False
+    sid_field = _fallback_sid_field(pending.sid_field)
+    if sid_field is None:
+        return False
+    logger.warning(
+        "WS update_subscription error code=%s id=%s; retrying with sid_field=%s",
+        error_code,
+        context.request_id,
+        sid_field,
+    )
+    await _send_update_retry(
+        context.websocket,
+        context.state,
+        context.config,
+        pending,
+        sid_field=sid_field,
+        update_style=pending.update_style,
+        include_channels=pending.include_channels,
+    )
+    return True
+
+
+async def _retry_update_with_alt_style(context: UpdateErrorContext) -> bool:
+    pending = context.pending
+    error_code = context.error_code
+    if error_code not in {1, 15} or pending.sid is None or pending.attempts >= 1:
+        return False
+    alt_style = _alternate_update_style(pending.update_style)
+    include_channels = pending.include_channels
+    if include_channels is None:
+        include_channels = _resolve_update_include_channels()
+    if not include_channels:
+        include_channels = True
+    sid_field = pending.sid_field or _resolve_subscription_id_field_env()
+    logger.warning(
+        "WS update_subscription error code=%s id=%s; retrying with update_style=%s "
+        "include_channels=%s sid_field=%s action=%s tickers=%s",
+        error_code,
+        context.request_id,
+        alt_style,
+        include_channels,
+        sid_field,
+        pending.action,
+        len(pending.tickers),
+    )
+    await _send_update_retry(
+        context.websocket,
+        context.state,
+        context.config,
+        pending,
+        sid_field=sid_field,
+        update_style=alt_style,
+        include_channels=include_channels,
+    )
+    return True
+
+
+async def _handle_update_fallback(context: UpdateErrorContext) -> None:
+    pending = context.pending
+    error_code = context.error_code
+    if error_code in {1, 15} and pending.attempts >= 1:
+        await _disable_update_subscription(
+            context.state,
+            "WS update_subscription disabled after error code=%s id=%s attempts=%s",
+            error_code,
+            context.request_id,
+            pending.attempts,
+        )
+    if pending.action == "remove":
+        await _restore_removed_updates(context.state, [pending])
+    if not pending.tickers:
+        return
+    logger.warning(
+        "WS update_subscription error code=%s id=%s action=%s; re-subscribing %s tickers",
+        error_code,
+        context.request_id,
+        pending.action,
+        len(pending.tickers),
+    )
+    await _send_subscribe_batches(
+        context.websocket,
+        context.config.channels,
+        context.config.ws_batch_size,
+        list(pending.tickers),
+        context.state,
+    )
+
+
 async def _handle_update_error(
     websocket,
     state: SubscriptionState,
@@ -287,69 +607,33 @@ async def _handle_update_error(
     error_code: int | None,
 ) -> None:
     """Fallback to re-subscribe when update_subscription errors occur."""
-    if request_id is None or error_code not in {12, 15}:
+    if error_code not in {1, 12, 15}:
+        return
+    request_id = await _resolve_update_request_id(
+        websocket,
+        state,
+        config,
+        request_id,
+        error_code,
+    )
+    if request_id is None:
         return
     pending = await _pop_pending_update(state, request_id)
     if pending is None:
         return
-    if (
-        error_code == 12
-        and pending.sid is not None
-        and pending.attempts < 2
-        and _resolve_subscription_id_field_env() is None
-    ):
-        sid_field = _fallback_sid_field(pending.sid_field)
-        if sid_field is not None:
-            req_id = next(state.request_id)
-            msg = _build_update_message(
-                UpdateMessageRequest(
-                    request_id=req_id,
-                    channels=config.channels,
-                    add_tickers=list(pending.tickers) if pending.action == "add" else [],
-                    remove_tickers=list(pending.tickers)
-                    if pending.action == "remove"
-                    else [],
-                    subscription_id=pending.sid,
-                    subscription_id_field=sid_field,
-                )
-            )
-            logger.warning(
-                "WS update_subscription error code=%s id=%s; retrying with sid_field=%s",
-                error_code,
-                request_id,
-                sid_field,
-            )
-            await websocket.send(json.dumps(msg))
-            async with state.lock:
-                state.pending_updates[req_id] = PendingUpdate(
-                    action=pending.action,
-                    sid=pending.sid,
-                    tickers=pending.tickers,
-                    sid_field=sid_field,
-                    attempts=pending.attempts + 1,
-                )
-            return
-    if pending.action == "remove":
-        async with state.lock:
-            state.subscribed.update(pending.tickers)
-            if pending.sid is not None:
-                state.sid_tickers.setdefault(pending.sid, set()).update(pending.tickers)
-    if not pending.tickers:
+    context = UpdateErrorContext(
+        websocket=websocket,
+        state=state,
+        config=config,
+        pending=pending,
+        request_id=request_id,
+        error_code=error_code,
+    )
+    if await _retry_update_with_sid_field(context):
         return
-    logger.warning(
-        "WS update_subscription error code=%s id=%s action=%s; re-subscribing %s tickers",
-        error_code,
-        request_id,
-        pending.action,
-        len(pending.tickers),
-    )
-    await _send_subscribe_batches(
-        websocket,
-        config.channels,
-        config.ws_batch_size,
-        list(pending.tickers),
-        state,
-    )
+    if await _retry_update_with_alt_style(context):
+        return
+    await _handle_update_fallback(context)
 
 
 async def _record_subscription_ticker(
@@ -396,7 +680,6 @@ async def _subscribe_initial(
     active = _load_active_tickers(conn, limit, config)
     if active is None:
         logger.warning("load_active_tickers failed during subscribe")
-        active = []
     if not active:
         fallback = _load_market_tickers(conn, limit, config)
         if fallback is None:
@@ -496,7 +779,7 @@ async def _apply_subscription_additions(
     to_add: list[str],
     sid_tickers: dict[int, set[str]],
 ) -> None:
-    if not sid_tickers:
+    if not sid_tickers or context.state.update_state.update_disabled:
         await _send_subscribe_batches(
             websocket,
             context.config.channels,
@@ -506,6 +789,8 @@ async def _apply_subscription_additions(
         )
         return
     sid_field = await _resolve_update_sid_field(context.state)
+    update_style = _resolve_update_style()
+    include_channels = _resolve_update_include_channels()
     sid_cycle = itertools.cycle(sorted(sid_tickers.keys()))
     for batch in _chunked(to_add, context.config.ws_batch_size):
         sid = next(sid_cycle)
@@ -516,10 +801,15 @@ async def _apply_subscription_additions(
                 channels=context.config.channels,
                 add_tickers=batch,
                 remove_tickers=[],
-                subscription_id=sid,
-                subscription_id_field=sid_field,
+                options=UpdateMessageOptions(
+                    subscription_id=sid,
+                    subscription_id_field=sid_field,
+                    update_style=update_style,
+                    include_channels=include_channels,
+                ),
             )
         )
+        logger.debug("WS update_subscription add payload: %s", msg)
         logger.debug(
             "WS update_subscription add: id=%s sid=%s tickers=%s",
             req_id,
@@ -535,6 +825,8 @@ async def _apply_subscription_additions(
                 sid=sid,
                 tickers=tuple(batch),
                 sid_field=sid_field,
+                update_style=update_style,
+                include_channels=include_channels,
             )
 
 
@@ -563,6 +855,18 @@ async def _apply_subscription_removals(
     to_remove: list[str],
     sid_tickers: dict[int, set[str]],
 ) -> None:
+    if context.state.update_state.update_disabled:
+        async with context.state.lock:
+            context.state.subscribed.difference_update(to_remove)
+            for sid, tickers in list(context.state.sid_tickers.items()):
+                tickers.difference_update(to_remove)
+                if not tickers:
+                    context.state.sid_tickers.pop(sid, None)
+        logger.debug(
+            "WS update_subscription disabled; dropping %s tickers locally",
+            len(to_remove),
+        )
+        return
     remove_by_sid, skipped = _build_remove_batches(to_remove, sid_tickers)
     if skipped:
         logger.debug(
@@ -571,6 +875,8 @@ async def _apply_subscription_removals(
         )
     if remove_by_sid:
         sid_field = await _resolve_update_sid_field(context.state)
+        update_style = _resolve_update_style()
+        include_channels = _resolve_update_include_channels()
     for sid, tickers in remove_by_sid.items():
         for batch in _chunked(tickers, context.config.ws_batch_size):
             req_id = next(context.state.request_id)
@@ -580,10 +886,15 @@ async def _apply_subscription_removals(
                     channels=context.config.channels,
                     add_tickers=[],
                     remove_tickers=batch,
-                    subscription_id=sid,
-                    subscription_id_field=sid_field,
+                    options=UpdateMessageOptions(
+                        subscription_id=sid,
+                        subscription_id_field=sid_field,
+                        update_style=update_style,
+                        include_channels=include_channels,
+                    ),
                 )
             )
+            logger.debug("WS update_subscription remove payload: %s", msg)
             logger.debug(
                 "WS update_subscription remove: id=%s sid=%s tickers=%s",
                 req_id,
@@ -603,6 +914,8 @@ async def _apply_subscription_removals(
                     sid=sid,
                     tickers=tuple(batch),
                     sid_field=sid_field,
+                    update_style=update_style,
+                    include_channels=include_channels,
                 )
 
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import psycopg  # pylint: disable=import-error
 
-from src.db.db import get_state, set_state
+from .state_utils import get_state, set_state
 
 
 def _active_tickers_where(

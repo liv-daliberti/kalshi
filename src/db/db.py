@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
@@ -13,33 +11,38 @@ from typing import Any, Optional
 import psycopg  # pylint: disable=import-error
 from dateutil.parser import isoparse
 
-from src.core.env_utils import _env_bool, _env_int
-from src.core.loop_utils import log_metric as _log_metric
-from src.core.guardrails import assert_state_write_allowed
+from ..core.env_utils import _env_bool, _env_int
+from ..core.json_utils import (
+    maybe_parse_json as _maybe_parse_json_core,
+    normalize_metadata_value as _normalize_metadata_value,
+)
+from ..core.loop_utils import log_metric as _log_metric
+from . import ingest_writes as _ingest_writes
+from . import json_utils as _json_utils
+from . import portal_rollup as _portal_rollup
+from .portal_rollup import _portal_rollup_app_refresh_enabled
+from . import state_utils as _state_utils
 
 try:
-    from src.queue.work_queue import enqueue_job
+    from ..queue.work_queue import enqueue_job
 except ImportError:
     enqueue_job = None
     _ENQUEUE_JOB_IMPORT_ERROR = sys.exc_info()
 else:
     _ENQUEUE_JOB_IMPORT_ERROR = None
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class PredictionRunSpec:
-    """Input fields for prediction run inserts."""
-
-    event_ticker: Optional[str]
-    prompt: Optional[str] = None
-    agent: Optional[str] = None
-    model: Optional[str] = None
-    status: str = "running"
-    error: Optional[str] = None
-    metadata: Optional[dict[str, Any]] = None
+_json_default = _json_utils.json_default
+to_json_value = _json_utils.to_json_value
+_PORTAL_ROLLUP_REFRESH_WARNED = False
+get_state = _state_utils.get_state
+set_state = _state_utils.set_state
+PredictionRunSpec = _ingest_writes.PredictionRunSpec
+insert_lifecycle_events = _ingest_writes.insert_lifecycle_events
+insert_prediction_run = _ingest_writes.insert_prediction_run
+update_prediction_run = _ingest_writes.update_prediction_run
+insert_market_predictions = _ingest_writes.insert_market_predictions
 
 
 def init_schema(conn: psycopg.Connection, schema_path: str) -> None:
@@ -62,6 +65,40 @@ def maybe_init_schema(conn: psycopg.Connection, schema_path: str) -> None:
     if not _env_bool("DB_INIT_SCHEMA", True):
         return
     init_schema(conn, schema_path)
+
+
+def _portal_rollup_refresh_events(
+    conn: psycopg.Connection,
+    event_tickers: list[str] | set[str] | tuple[str, ...],
+) -> None:
+    global _PORTAL_ROLLUP_REFRESH_WARNED  # pylint: disable=global-statement
+    _PORTAL_ROLLUP_REFRESH_WARNED = _portal_rollup.portal_rollup_refresh_events(
+        conn,
+        event_tickers,
+        logger_override=logger,
+        warned=_PORTAL_ROLLUP_REFRESH_WARNED,
+    )
+
+
+def _event_tickers_for_market_tickers(
+    conn: psycopg.Connection,
+    tickers: list[str] | set[str] | tuple[str, ...],
+) -> list[str]:
+    unique = sorted({ticker for ticker in tickers if ticker})
+    if not unique:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT event_ticker
+            FROM markets
+            WHERE ticker = ANY(%s)
+              AND event_ticker IS NOT NULL
+            """,
+            (unique,),
+        )
+        rows = cur.fetchall()
+    return [row[0] for row in rows if row and row[0]]
 
 
 def _schema_compat_range() -> tuple[int, int]:
@@ -98,51 +135,6 @@ def ensure_schema_compatible(conn: psycopg.Connection) -> int:
             f"db={version}, expected [{min_version}, {max_version}]."
         )
     return version
-
-
-def get_state(
-    conn: psycopg.Connection,
-    key: str,
-    default: Optional[str] = None,
-) -> Optional[str]:
-    """Fetch a state value by key, returning default when missing.
-
-    :param conn: Open database connection.
-    :type conn: psycopg.Connection
-    :param key: State key to look up.
-    :type key: str
-    :param default: Value to return when key is absent.
-    :type default: str | None
-    :return: Stored value or default.
-    :rtype: str | None
-    """
-    with conn.cursor() as cur:
-        cur.execute("SELECT value FROM ingest_state WHERE key=%s", (key,))
-        row = cur.fetchone()
-        return row[0] if row else default
-
-
-def set_state(conn: psycopg.Connection, key: str, value: str) -> None:
-    """Upsert a state value by key.
-
-    :param conn: Open database connection.
-    :type conn: psycopg.Connection
-    :param key: State key to update.
-    :type key: str
-    :param value: State value to store.
-    :type value: str
-    """
-    assert_state_write_allowed(key)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO ingest_state(key, value, updated_at)
-            VALUES (%s, %s, NOW())
-            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
-            """,
-            (key, value),
-        )
-    conn.commit()
 
 
 def get_event_updated_at(
@@ -219,22 +211,49 @@ def normalize_prob_dollars(value: Any) -> Optional[Decimal]:
     return dec_value
 
 
-def _json_default(value: Any) -> Any:
-    if isinstance(value, datetime):
-        ts_value = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-        return ts_value.isoformat()
-    if isinstance(value, Decimal):
-        return str(value)
-    return str(value)
+def _maybe_parse_json(value: Any) -> Any | None:
+    """Parse JSON strings into Python values when possible."""
+    return _maybe_parse_json_core(value)
 
 
-def to_json_value(value: Any) -> Any:
-    """Serialize dict/list payloads for JSONB columns."""
-    if value is None:
+def _coerce_metadata_value(value: Any) -> Any | None:
+    """Normalize metadata values for JSON storage."""
+    return _normalize_metadata_value(value)
+
+
+def _derive_custom_strike(market: dict) -> dict[str, Any] | None:
+    """Build custom strike metadata from strike fields."""
+    payload = {
+        "strike_type": market.get("strike_type"),
+        "floor_strike": market.get("floor_strike"),
+        "cap_strike": market.get("cap_strike"),
+        "functional_strike": market.get("functional_strike"),
+    }
+    if all(value is None for value in payload.values()):
         return None
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, default=_json_default)
-    return value
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _extract_event_metadata(event: dict) -> Any | None:
+    """Extract event metadata from common payload keys."""
+    metadata = event.get("product_metadata")
+    if metadata is None:
+        metadata = event.get("event_metadata")
+    return _coerce_metadata_value(metadata)
+
+
+def _resolve_market_metadata(market: dict) -> tuple[Any | None, Any | None, Any | None]:
+    """Resolve market metadata fields from a payload."""
+    price_ranges = _coerce_metadata_value(market.get("price_ranges"))
+    if price_ranges is None:
+        price_ranges = _maybe_parse_json(market.get("price_level_structure"))
+
+    custom_strike = _coerce_metadata_value(market.get("custom_strike"))
+    if custom_strike is None:
+        custom_strike = _derive_custom_strike(market)
+
+    mve_selected_legs = _coerce_metadata_value(market.get("mve_selected_legs"))
+    return price_ranges, custom_strike, mve_selected_legs
 
 
 def implied_yes_mid_cents(
@@ -291,6 +310,7 @@ def upsert_event(conn: psycopg.Connection, event: dict) -> None:
       strike_period=EXCLUDED.strike_period,
       updated_at=NOW();
     """
+    product_metadata = _extract_event_metadata(event)
     payload = {
         "event_ticker": event.get("event_ticker"),
         "series_ticker": event.get("series_ticker"),
@@ -300,12 +320,14 @@ def upsert_event(conn: psycopg.Connection, event: dict) -> None:
         "mutually_exclusive": event.get("mutually_exclusive"),
         "collateral_return_type": event.get("collateral_return_type"),
         "available_on_brokers": event.get("available_on_brokers"),
-        "product_metadata": to_json_value(event.get("product_metadata")),
+        "product_metadata": to_json_value(product_metadata),
         "strike_date": parse_ts_iso(event.get("strike_date")),
         "strike_period": event.get("strike_period"),
     }
     with conn.cursor() as cur:
         cur.execute(sql, payload)
+    if payload.get("event_ticker"):
+        _portal_rollup_refresh_events(conn, {payload["event_ticker"]})
     conn.commit()
 
 
@@ -384,6 +406,7 @@ def upsert_market(conn: psycopg.Connection, market: dict) -> None:
       settlement_ts=EXCLUDED.settlement_ts,
       updated_at=NOW();
     """
+    price_ranges, custom_strike, mve_selected_legs = _resolve_market_metadata(market)
     payload = {
         "ticker": market.get("ticker"),
         "event_ticker": market.get("event_ticker"),
@@ -413,16 +436,16 @@ def upsert_market(conn: psycopg.Connection, market: dict) -> None:
         "risk_limit_cents": market.get("risk_limit_cents"),
 
         "price_level_structure": market.get("price_level_structure"),
-        "price_ranges": to_json_value(market.get("price_ranges")),
+        "price_ranges": to_json_value(price_ranges),
 
         "strike_type": market.get("strike_type"),
         "floor_strike": market.get("floor_strike"),
         "cap_strike": market.get("cap_strike"),
         "functional_strike": market.get("functional_strike"),
-        "custom_strike": to_json_value(market.get("custom_strike")),
+        "custom_strike": to_json_value(custom_strike),
 
         "mve_collection_ticker": market.get("mve_collection_ticker"),
-        "mve_selected_legs": to_json_value(market.get("mve_selected_legs")),
+        "mve_selected_legs": to_json_value(mve_selected_legs),
         "primary_participant_key": market.get("primary_participant_key"),
 
         "settlement_value": market.get("settlement_value"),
@@ -431,6 +454,8 @@ def upsert_market(conn: psycopg.Connection, market: dict) -> None:
     }
     with conn.cursor() as cur:
         cur.execute(sql, payload)
+    if payload.get("event_ticker"):
+        _portal_rollup_refresh_events(conn, {payload["event_ticker"]})
     conn.commit()
 
 
@@ -483,6 +508,8 @@ def upsert_active_market(
     """
     with conn.cursor() as cur:
         cur.execute(sql, (ticker, event_ticker, close_time, status))
+    if event_ticker:
+        _portal_rollup_refresh_events(conn, {event_ticker})
     conn.commit()
 
 
@@ -517,8 +544,18 @@ def delete_active_market(conn: psycopg.Connection, ticker: str) -> None:
     :param ticker: Market ticker symbol.
     :type ticker: str
     """
+    if not _portal_rollup_app_refresh_enabled():
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM active_markets WHERE ticker=%s", (ticker,))
+        conn.commit()
+        return
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM active_markets WHERE ticker=%s", (ticker,))
+        cur.execute(
+            "DELETE FROM active_markets WHERE ticker=%s RETURNING event_ticker",
+            (ticker,),
+        )
+        rows = cur.fetchall()
+    _portal_rollup_refresh_events(conn, {row[0] for row in rows if row and row[0]})
     conn.commit()
 
 
@@ -539,12 +576,61 @@ def cleanup_active_markets(conn: psycopg.Connection, grace_minutes: int = 30) ->
       AND COALESCE(am.close_time, m.close_time) IS NOT NULL
       AND COALESCE(am.close_time, m.close_time) <= NOW() - (%s * INTERVAL '1 minute')
     """
+    if not _portal_rollup_app_refresh_enabled():
+        with conn.cursor() as cur:
+            cur.execute(sql, (grace_minutes,))
+            deleted = cur.rowcount
+        conn.commit()
+        return deleted
+    sql = """
+    DELETE FROM active_markets am
+    USING markets m
+    WHERE am.ticker = m.ticker
+      AND COALESCE(am.close_time, m.close_time) IS NOT NULL
+      AND COALESCE(am.close_time, m.close_time) <= NOW() - (%s * INTERVAL '1 minute')
+    RETURNING am.event_ticker
+    """
     with conn.cursor() as cur:
         cur.execute(sql, (grace_minutes,))
-        deleted = cur.rowcount
+        rows = cur.fetchall()
+    _portal_rollup_refresh_events(conn, {row[0] for row in rows if row and row[0]})
     conn.commit()
-    return deleted
+    return len(rows)
 
+
+def load_active_tickers(conn: psycopg.Connection, limit: int) -> list[str]:
+    """Backward-compatible wrapper for src.db.tickers.load_active_tickers."""
+    from . import tickers as _tickers  # pylint: disable=import-outside-toplevel
+
+    return _tickers.load_active_tickers(conn, limit)
+
+
+def load_active_tickers_shard(
+    conn: psycopg.Connection,
+    limit: int,
+    shard_count: int,
+    shard_id: int,
+    *,
+    shard_key: str = "event",
+    round_robin: bool = False,
+    cursor_key: str | None = None,
+    round_robin_step: int | None = None,
+) -> list[str]:
+    """Backward-compatible wrapper for src.db.tickers.load_active_tickers_shard."""
+    if shard_count <= 1:
+        return load_active_tickers(conn, limit)
+    from . import tickers as _tickers  # pylint: disable=import-outside-toplevel
+
+    return _tickers.load_active_tickers_shard(
+        conn,
+        limit,
+        shard_count,
+        shard_id,
+        shard_key=shard_key,
+        round_robin=round_robin,
+        cursor_key=cursor_key,
+        round_robin_step=round_robin_step,
+    )
 
 
 def upsert_active_markets_from_markets(
@@ -568,11 +654,12 @@ def upsert_active_markets_from_markets(
       status=COALESCE(active_markets.status, EXCLUDED.status),
       last_seen_ts=NOW(),
       updated_at=NOW()
-    RETURNING ticker
+    RETURNING event_ticker
     """
     with conn.cursor() as cur:
         cur.execute(sql, (tickers,))
         rows = cur.fetchall()
+    _portal_rollup_refresh_events(conn, {row[0] for row in rows if row and row[0]})
     conn.commit()
     return len(rows)
 
@@ -592,10 +679,13 @@ def seed_active_markets_from_markets(conn: psycopg.Connection) -> int:
       status=COALESCE(active_markets.status, EXCLUDED.status),
       last_seen_ts=NOW(),
       updated_at=NOW()
+    RETURNING event_ticker
     """
     with conn.cursor() as cur:
         cur.execute(sql)
-        inserted = cur.rowcount
+        rows = cur.fetchall()
+        inserted = len(rows)
+    _portal_rollup_refresh_events(conn, {row[0] for row in rows if row and row[0]})
     conn.commit()
     return inserted
 
@@ -619,6 +709,25 @@ def _market_tick_payload(tick: dict) -> dict:
         "sid": tick.get("sid"),
         "raw": to_json_value(tick.get("raw")),
     }
+
+
+def _latest_tick_payloads(
+    ticks: list[dict],
+    payloads: list[dict],
+) -> list[dict]:
+    """Return one payload per ticker using the latest timestamp in the batch."""
+    latest_by_ticker: dict[str, tuple[datetime, dict]] = {}
+    for tick, payload in zip(ticks, payloads):
+        ticker = payload.get("ticker")
+        if not isinstance(ticker, str) or not ticker:
+            continue
+        ts_value = parse_ts_iso(payload.get("ts") or tick.get("ts"))
+        if ts_value is None:
+            continue
+        previous = latest_by_ticker.get(ticker)
+        if previous is None or ts_value >= previous[0]:
+            latest_by_ticker[ticker] = (ts_value, payload)
+    return [entry[1] for entry in latest_by_ticker.values()]
 
 
 def _ensure_markets_exist(conn: psycopg.Connection, tickers: set[str]) -> list[str]:
@@ -677,42 +786,67 @@ def _log_placeholder_inserts(tickers: list[str]) -> None:
     )
 
 
-def insert_market_tick(conn: psycopg.Connection, tick: dict) -> None:
-    """Insert a market tick row.
+_MARKET_TICKS_INSERT_SQL = """
+INSERT INTO market_ticks(
+  ts, ticker, price, yes_bid, yes_ask,
+  price_dollars, yes_bid_dollars, yes_ask_dollars, no_bid_dollars,
+  volume, open_interest, dollar_volume, dollar_open_interest,
+  implied_yes_mid, sid, raw
+)
+VALUES(
+  %(ts)s, %(ticker)s, %(price)s, %(yes_bid)s, %(yes_ask)s,
+  %(price_dollars)s, %(yes_bid_dollars)s, %(yes_ask_dollars)s, %(no_bid_dollars)s,
+  %(volume)s, %(open_interest)s, %(dollar_volume)s, %(dollar_open_interest)s,
+  %(implied_yes_mid)s, %(sid)s, %(raw)s
+)
+"""
+_MARKET_TICKS_LATEST_SQL = """
+INSERT INTO market_ticks_latest(
+  ticker, ts, price, yes_bid, yes_ask,
+  price_dollars, yes_bid_dollars, yes_ask_dollars, no_bid_dollars,
+  volume, open_interest, dollar_volume, dollar_open_interest,
+  implied_yes_mid, sid, raw, updated_at
+)
+VALUES(
+  %(ticker)s, %(ts)s, %(price)s, %(yes_bid)s, %(yes_ask)s,
+  %(price_dollars)s, %(yes_bid_dollars)s, %(yes_ask_dollars)s, %(no_bid_dollars)s,
+  %(volume)s, %(open_interest)s, %(dollar_volume)s, %(dollar_open_interest)s,
+  %(implied_yes_mid)s, %(sid)s, %(raw)s, NOW()
+)
+ON CONFLICT (ticker) DO UPDATE SET
+  ts = EXCLUDED.ts,
+  price = EXCLUDED.price,
+  yes_bid = EXCLUDED.yes_bid,
+  yes_ask = EXCLUDED.yes_ask,
+  price_dollars = EXCLUDED.price_dollars,
+  yes_bid_dollars = EXCLUDED.yes_bid_dollars,
+  yes_ask_dollars = EXCLUDED.yes_ask_dollars,
+  no_bid_dollars = EXCLUDED.no_bid_dollars,
+  volume = EXCLUDED.volume,
+  open_interest = EXCLUDED.open_interest,
+  dollar_volume = EXCLUDED.dollar_volume,
+  dollar_open_interest = EXCLUDED.dollar_open_interest,
+  implied_yes_mid = EXCLUDED.implied_yes_mid,
+  sid = EXCLUDED.sid,
+  raw = EXCLUDED.raw,
+  updated_at = NOW()
+WHERE market_ticks_latest.ts IS NULL
+   OR EXCLUDED.ts >= market_ticks_latest.ts
+"""
 
-    :param conn: Open database connection.
-    :type conn: psycopg.Connection
-    :param tick: Normalized tick payload.
-    :type tick: dict
-    """
-    insert_market_ticks(conn, [tick])
 
-
-def insert_market_ticks(conn: psycopg.Connection, ticks: list[dict]) -> None:
-    """Insert multiple market tick rows in one transaction."""
-    if not ticks:
-        return
+def _collect_tick_tickers(ticks: list[dict]) -> set[str]:
     tickers: set[str] = set()
     for tick in ticks:
         ticker = tick.get("ticker")
         if isinstance(ticker, str) and ticker:
             tickers.add(ticker)
-    inserted = _ensure_markets_exist(conn, tickers)
-    sql = """
-    INSERT INTO market_ticks(
-      ts, ticker, price, yes_bid, yes_ask,
-      price_dollars, yes_bid_dollars, yes_ask_dollars, no_bid_dollars,
-      volume, open_interest, dollar_volume, dollar_open_interest,
-      implied_yes_mid, sid, raw
-    )
-    VALUES(
-      %(ts)s, %(ticker)s, %(price)s, %(yes_bid)s, %(yes_ask)s,
-      %(price_dollars)s, %(yes_bid_dollars)s, %(yes_ask_dollars)s, %(no_bid_dollars)s,
-      %(volume)s, %(open_interest)s, %(dollar_volume)s, %(dollar_open_interest)s,
-      %(implied_yes_mid)s, %(sid)s, %(raw)s
-    )
-    """
-    payloads = [_market_tick_payload(tick) for tick in ticks]
+    return tickers
+
+
+def _last_tick_times(
+    ticks: list[dict],
+) -> tuple[Optional[datetime], Optional[datetime]]:
     last_ts: Optional[datetime] = None
     last_ws_ts: Optional[datetime] = None
     for tick in ticks:
@@ -726,8 +860,43 @@ def insert_market_ticks(conn: psycopg.Connection, ticks: list[dict]) -> None:
         if source != "live_snapshot":
             if last_ws_ts is None or ts_value > last_ws_ts:
                 last_ws_ts = ts_value
+    return last_ts, last_ws_ts
+
+
+def insert_market_tick(conn: psycopg.Connection, tick: dict) -> None:
+    """Insert a market tick row.
+
+    :param conn: Open database connection.
+    :type conn: psycopg.Connection
+    :param tick: Normalized tick payload.
+    :type tick: dict
+    """
+    insert_market_ticks(conn, [tick])
+
+
+def insert_lifecycle_event(conn: psycopg.Connection, event: dict) -> None:
+    """Insert a market lifecycle event row."""
+    insert_lifecycle_events(conn, [event])
+
+
+def insert_market_prediction(conn: psycopg.Connection, prediction: dict) -> None:
+    """Insert a single market prediction row."""
+    insert_market_predictions(conn, [prediction])
+
+
+def insert_market_ticks(conn: psycopg.Connection, ticks: list[dict]) -> None:
+    """Insert multiple market tick rows in one transaction."""
+    if not ticks:
+        return
+    tickers = _collect_tick_tickers(ticks)
+    inserted = _ensure_markets_exist(conn, tickers)
+    payloads = [_market_tick_payload(tick) for tick in ticks]
+    latest_payloads = _latest_tick_payloads(ticks, payloads)
+    last_ts, last_ws_ts = _last_tick_times(ticks)
     with conn.cursor() as cur:
-        cur.executemany(sql, payloads)
+        cur.executemany(_MARKET_TICKS_INSERT_SQL, payloads)
+        if latest_payloads:
+            cur.executemany(_MARKET_TICKS_LATEST_SQL, latest_payloads)
         if last_ts is not None:
             cur.execute(
                 """
@@ -748,127 +917,11 @@ def insert_market_ticks(conn: psycopg.Connection, ticks: list[dict]) -> None:
                 """,
                 ("last_ws_tick_ts", last_ws_ts.isoformat()),
             )
+        if _portal_rollup_app_refresh_enabled():
+            _portal_rollup_refresh_events(
+                conn,
+                set(_event_tickers_for_market_tickers(conn, tickers)),
+            )
     conn.commit()
     _log_placeholder_inserts(inserted)
     _enqueue_discover_market_jobs(conn, inserted)
-
-
-def _lifecycle_payload(event: dict) -> dict:
-    return {
-        "ts": event.get("ts"),
-        "market_ticker": event.get("market_ticker"),
-        "event_type": event.get("event_type") or "unknown",
-        "open_ts": event.get("open_ts"),
-        "close_ts": event.get("close_ts"),
-        "raw": to_json_value(event.get("raw")),
-    }
-
-
-def insert_lifecycle_event(conn: psycopg.Connection, event: dict) -> None:
-    """Insert a market lifecycle event row."""
-    insert_lifecycle_events(conn, [event])
-
-
-def insert_lifecycle_events(conn: psycopg.Connection, events: list[dict]) -> None:
-    """Insert multiple lifecycle rows in one transaction."""
-    if not events:
-        return
-    sql = """
-    INSERT INTO lifecycle_events(
-      ts, market_ticker, event_type, open_ts, close_ts, raw
-    )
-    VALUES(
-      %(ts)s, %(market_ticker)s, %(event_type)s, %(open_ts)s, %(close_ts)s, %(raw)s
-    )
-    """
-    payloads = [_lifecycle_payload(event) for event in events]
-    with conn.cursor() as cur:
-        cur.executemany(sql, payloads)
-    conn.commit()
-
-
-def insert_prediction_run(conn: psycopg.Connection, spec: PredictionRunSpec) -> int:
-    """Insert a prediction run and return its id."""
-    payload = to_json_value(spec.metadata)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO prediction_runs(
-              event_ticker, run_ts, prompt, agent, model, status, error, metadata
-            )
-            VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s)
-            RETURNING id
-            """,
-            (
-                spec.event_ticker,
-                spec.prompt,
-                spec.agent,
-                spec.model,
-                spec.status,
-                spec.error,
-                payload,
-            ),
-        )
-        run_id = cur.fetchone()[0]
-    conn.commit()
-    return int(run_id)
-
-
-def update_prediction_run(
-    conn: psycopg.Connection,
-    run_id: int,
-    status: str,
-    error: Optional[str] = None,
-    metadata: Optional[dict] = None,
-) -> None:
-    """Update a prediction run status and optional metadata."""
-    payload = to_json_value(metadata) if metadata is not None else None
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE prediction_runs
-            SET status=%s,
-                error=%s,
-                metadata=COALESCE(%s, metadata)
-            WHERE id=%s
-            """,
-            (status, error, payload, run_id),
-        )
-    conn.commit()
-
-
-def insert_market_prediction(conn: psycopg.Connection, prediction: dict) -> None:
-    """Insert a single market prediction row."""
-    insert_market_predictions(conn, [prediction])
-
-
-def insert_market_predictions(conn: psycopg.Connection, predictions: list[dict]) -> None:
-    """Insert multiple market prediction rows."""
-    if not predictions:
-        return
-    sql = """
-    INSERT INTO market_predictions(
-      run_id, event_ticker, market_ticker, predicted_yes_prob,
-      confidence, rationale, raw, created_at
-    )
-    VALUES(
-      %(run_id)s, %(event_ticker)s, %(market_ticker)s, %(predicted_yes_prob)s,
-      %(confidence)s, %(rationale)s, %(raw)s, NOW()
-    )
-    """
-    payloads = []
-    for prediction in predictions:
-        payloads.append(
-            {
-                "run_id": prediction.get("run_id"),
-                "event_ticker": prediction.get("event_ticker"),
-                "market_ticker": prediction.get("market_ticker"),
-                "predicted_yes_prob": prediction.get("predicted_yes_prob"),
-                "confidence": prediction.get("confidence"),
-                "rationale": prediction.get("rationale"),
-                "raw": to_json_value(prediction.get("raw")),
-            }
-        )
-    with conn.cursor() as cur:
-        cur.executemany(sql, payloads)
-    conn.commit()

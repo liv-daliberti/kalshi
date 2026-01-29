@@ -49,14 +49,45 @@ def _sparkline_value(row: dict[str, Any]) -> float | None:
     return None
 
 
-def _build_event_sparklines(
+_SPARKLINE_TABLE_READY: bool | None = None
+
+
+def _row_first_value(row: Any) -> Any | None:
+    """Return the first column value for common row types."""
+    result: Any | None = None
+    if row is not None:
+        if isinstance(row, dict):
+            if "to_regclass" in row:
+                result = row.get("to_regclass")
+            elif "relkind" in row:
+                result = row.get("relkind")
+            elif len(row) == 1:
+                result = next(iter(row.values()))
+        else:
+            try:
+                result = row[0]
+            except (TypeError, KeyError, IndexError):
+                result = None
+    return result
+
+
+def _sparkline_table_exists(conn: PsycopgConnection) -> bool:
+    global _SPARKLINE_TABLE_READY  # pylint: disable=global-statement
+    if _SPARKLINE_TABLE_READY is not None:
+        return _SPARKLINE_TABLE_READY
+    with timed_cursor(conn) as cur:
+        cur.execute("SELECT to_regclass('event_sparkline')")
+        row = cur.fetchone()
+    _SPARKLINE_TABLE_READY = bool(_row_first_value(row))
+    return _SPARKLINE_TABLE_READY
+
+
+def _build_event_sparklines_from_ticks(
     conn: PsycopgConnection,
     tickers: list[str],
+    max_points: int,
 ) -> dict[str, list[float]]:
-    """Load sparkline points for event outcomes."""
-    if not tickers:
-        return {}
-    max_points = _env_int("WEB_PORTAL_EVENT_SPARKLINE_POINTS", 24, minimum=4)
+    """Load sparkline points directly from market ticks."""
     with timed_cursor(conn, row_factory=DICT_ROW) as cur:
         cur.execute(
             """
@@ -92,6 +123,48 @@ def _build_event_sparklines(
             continue
         value = max(0.0, min(1.0, value))
         points_by_ticker.setdefault(ticker, []).append(round(value, 4))
+    return points_by_ticker
+
+
+def _build_event_sparklines(
+    conn: PsycopgConnection,
+    tickers: list[str],
+) -> dict[str, list[float]]:
+    """Load sparkline points for event outcomes."""
+    if not tickers:
+        return {}
+    max_points = _env_int("WEB_PORTAL_EVENT_SPARKLINE_POINTS", 24, minimum=1)
+    if not _sparkline_table_exists(conn):
+        return _build_event_sparklines_from_ticks(conn, tickers, max_points)
+    with timed_cursor(conn, row_factory=DICT_ROW) as cur:
+        cur.execute(
+            """
+            SELECT ticker, points
+            FROM event_sparkline
+            WHERE ticker = ANY(%s)
+            """,
+            (tickers,),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return _build_event_sparklines_from_ticks(conn, tickers, max_points)
+    points_by_ticker = {ticker: [] for ticker in tickers}
+    for row in rows:
+        ticker = row.get("ticker")
+        if not ticker:
+            continue
+        raw_points = row.get("points") or []
+        trimmed = raw_points[-max_points:] if max_points else raw_points
+        points: list[float] = []
+        for value in trimmed:
+            if value is None:
+                continue
+            value = float(value)
+            value = max(0.0, min(1.0, value))
+            points.append(round(value, 4))
+        points_by_ticker[ticker] = points
+    if not any(points_by_ticker.values()):
+        return _build_event_sparklines_from_ticks(conn, tickers, max_points)
     return points_by_ticker
 
 
@@ -302,27 +375,27 @@ def _build_event_forecast_series(
     max_series = _env_int("WEB_PORTAL_EVENT_FORECAST_SERIES_LIMIT", 8, minimum=1)
     max_points = _env_int("WEB_PORTAL_EVENT_FORECAST_POINTS", 200, minimum=2)
     candidates = _forecast_candidates(market_rows, datetime.now(timezone.utc))
-    if not candidates:
-        return [], None
-    selected, tickers, total_outcomes = _select_forecast_candidates(
-        candidates,
-        max_series,
-    )
-    if not tickers:
-        return [], None
-    series, note = _series_from_candles(
-        conn,
-        tickers,
-        selected,
-        max_points=max_points,
-        total_outcomes=total_outcomes,
-    )
-    if series:
-        return series, note
-    return _series_from_ticks(
-        conn,
-        tickers,
-        selected,
-        max_points=max_points,
-        total_outcomes=total_outcomes,
-    )
+    series: list[dict[str, Any]] = []
+    note: str | None = None
+    if candidates:
+        selected, tickers, total_outcomes = _select_forecast_candidates(
+            candidates,
+            max_series,
+        )
+        if tickers:
+            series, note = _series_from_candles(
+                conn,
+                tickers,
+                selected,
+                max_points=max_points,
+                total_outcomes=total_outcomes,
+            )
+            if not series:
+                series, note = _series_from_ticks(
+                    conn,
+                    tickers,
+                    selected,
+                    max_points=max_points,
+                    total_outcomes=total_outcomes,
+                )
+    return series, note

@@ -9,34 +9,36 @@ import json
 import logging
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 
-from src.core.guardrails import assert_service_role
-from src.core.loop_utils import log_metric as _log_metric
-from src.core.number_utils import coerce_int as _coerce_int
-from src.core.env_utils import env_int
-from src.db.db import set_state
-from src.db.tickers import load_active_tickers_shard
-from src.ingest.ws.ws_ingest_config import (
+from ...core.guardrails import assert_service_role
+from ...core.loop_utils import log_metric as _log_metric
+from ...core.number_utils import coerce_int as _coerce_int
+from ...core.env_utils import env_float, env_int
+from ...db.db import set_state
+from ...db.tickers import load_active_tickers_shard
+from .ws_ingest_config import (
     _DEFAULT_WS_PATH,
     _bool_env,
     _build_ws_loop_config,
     _resolve_ws_loop_options,
 )
-from src.ingest.ws.ws_ingest_utils import (
+from .ws_ingest_utils import (
     _extract_channel,
     _extract_payload,
     _is_terminal_lifecycle,
     _normalize_lifecycle,
     _normalize_tick,
+    _resolve_market_ticker,
 )
-from src.ingest.ws.ws_ingest_db_utils import (
+from .ws_ingest_db_utils import (
     PsycopgError,
 )
-from src.ingest.ws.ws_ingest_models import (
+from .ws_ingest_models import (
     SubscriptionConfig,
     SubscriptionContext,
     SubscriptionState,
@@ -47,10 +49,10 @@ from src.ingest.ws.ws_ingest_models import (
     WsLoopState,
     WsSessionContext,
 )
-from src.ingest.ws.ws_ingest_protocol import (
+from .ws_ingest_protocol import (
     _build_ws_headers as _build_ws_headers_impl,
 )
-from src.ingest.ws.ws_ingest_subscriptions import (
+from .ws_ingest_subscriptions import (
     _build_subscription_context,
     _extract_error_code,
     _extract_subscription_id_field,
@@ -62,13 +64,13 @@ from src.ingest.ws.ws_ingest_subscriptions import (
     _register_subscription_sid,
     _refresh_subscriptions,
 )
-from src.ingest.ws.ws_ingest_backpressure import (
+from .ws_ingest_backpressure import (
     QueueBackpressureState,
     enqueue_ws_item,
     load_backpressure_state,
     reset_backpressure_override,
 )
-from src.ingest.ws.ws_ingest_writer import (
+from .ws_ingest_writer import (
     _DB_WORK_LIFECYCLE,
     _DB_WORK_STOP,
     _DB_WORK_TICK,
@@ -79,6 +81,73 @@ from src.ingest.ws.ws_ingest_writer import (
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _TickDropStats:
+    total: int = 0
+    window: int = 0
+    last_log: float = 0.0
+
+
+_TICK_DROP_STATS: dict[str, _TickDropStats] = {}
+
+
+def _tick_drop_log_interval() -> float:
+    return env_float("WS_TICK_DROP_METRIC_SECONDS", 60.0, minimum=0.0)
+
+
+def _tick_drop_payload_flags(payload: dict | None) -> dict[str, int]:
+    if not isinstance(payload, dict):
+        return {}
+    market = payload.get("market")
+    if not isinstance(market, dict):
+        market = {}
+
+    def _flag(value: Any) -> int:
+        return 1 if value else 0
+
+    return {
+        "has_market_id": _flag(
+            payload.get("market_id") or payload.get("marketId") or payload.get("marketID")
+        ),
+        "has_id": _flag(payload.get("id")),
+        "has_ticker": _flag(payload.get("ticker")),
+        "has_market_ticker": _flag(
+            payload.get("market_ticker") or payload.get("marketTicker")
+        ),
+        "has_market_obj": _flag(bool(market)),
+        "market_has_id": _flag(
+            market.get("market_id")
+            or market.get("marketId")
+            or market.get("marketID")
+            or market.get("id")
+        ),
+        "market_has_ticker": _flag(
+            market.get("ticker")
+            or market.get("market_ticker")
+            or market.get("marketTicker")
+        ),
+    }
+
+
+def _record_tick_drop(reason: str, payload: dict | None) -> None:
+    stats = _TICK_DROP_STATS.setdefault(reason, _TickDropStats())
+    stats.total += 1
+    stats.window += 1
+    interval = _tick_drop_log_interval()
+    now = time.monotonic()
+    if interval <= 0 or now - stats.last_log >= interval:
+        _log_metric(
+            logger,
+            "ws.tick_drop",
+            reason=reason,
+            drops=stats.window,
+            drops_total=stats.total,
+            **_tick_drop_payload_flags(payload),
+        )
+        stats.window = 0
+        stats.last_log = now
 
 
 @lru_cache(maxsize=1)
@@ -401,15 +470,10 @@ def _compute_stale_tick_count(
                 """
                 SELECT COUNT(*)
                 FROM unnest(%s::text[]) AS a(ticker)
-                LEFT JOIN LATERAL (
-                  SELECT ts
-                  FROM market_ticks mt
-                  WHERE mt.ticker = a.ticker
-                  ORDER BY mt.ts DESC
-                  LIMIT 1
-                ) mt ON TRUE
-                WHERE mt.ts IS NULL
-                   OR mt.ts < NOW() - (%s * INTERVAL '1 second')
+                LEFT JOIN market_ticks_latest mt
+                  ON mt.ticker = a.ticker
+                WHERE mt.updated_at IS NULL
+                   OR mt.updated_at < NOW() - (%s * INTERVAL '1 second')
                 """,
                 (active, stale_window),
             )
@@ -564,6 +628,7 @@ async def _handle_subscription_ack(
     ids = _extract_subscription_ids(message)
     if ids is None:
         return False
+    logger.debug("WS subscription ack payload: %s", message)
     request_id, sid = ids
     sid_field = _extract_subscription_id_field(message)
     if sid_field is not None:
@@ -631,6 +696,7 @@ async def _handle_update_ack(
                 subscription_state,
                 pending_update.sid_field,
             )
+        logger.debug("WS update_subscription ack payload: %s", message)
         logger.debug("WS update_subscription ack: id=%s", request_id)
 
 
@@ -639,6 +705,11 @@ async def _handle_ticker_payload(
     payload: dict,
     context: WsMessageContext,
 ) -> None:
+    _update_market_id_map(payload, context.market_id_map)
+    ticker = _resolve_market_ticker(payload, context.market_id_map)
+    if not ticker:
+        _record_tick_drop("missing_ticker", payload)
+        return
     tick = _normalize_tick(payload, context.market_id_map)
     if tick is None:
         return
@@ -709,9 +780,18 @@ async def _handle_channel_payload(
 
 async def _listen_loop(
     websocket,
-    context: WsMessageContext,
+    context: WsMessageContext | queue.Queue,
+    market_id_map: dict[str, str] | None = None,
 ) -> None:
     """Receive and persist WS messages."""
+    if not isinstance(context, WsMessageContext):
+        context = WsMessageContext(
+            work_queue=context,
+            market_id_map=market_id_map or {},
+            subscription_state=None,
+            subscription_config=None,
+            backpressure=None,
+        )
     async for raw in websocket:
         message = _decode_ws_message(raw)
         if message is None:

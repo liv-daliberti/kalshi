@@ -9,20 +9,20 @@ import os
 import psycopg  # pylint: disable=import-error
 from dotenv import load_dotenv
 
-from src.jobs.backfill import backfill_pass
-from src.jobs.backfill_config import build_backfill_config_from_settings
-from src.jobs.closed_cleanup import build_closed_cleanup_config, closed_cleanup_pass
-from src.db.db import ensure_schema_compatible, maybe_init_schema
-from src.jobs.discovery import discovery_pass
-from src.core.logging_utils import configure_logging as configure_service_logging, parse_log_level
-from src.core.loop_utils import schema_path
-from src.predictions.predictions import load_prediction_config
-from src.queue.queue_worker import run_worker
-from src.rag.rag_loop import rag_prediction_loop
-from src.ingest.rest_loop import rest_backfill_loop, rest_closed_cleanup_loop, rest_discovery_loop
-from src.core.settings import ENV_FILE, load_settings
-from src.queue.work_queue import load_queue_config
-from src.ingest.ws.ws_ingest import ws_loop
+from ..jobs.backfill import backfill_pass
+from ..jobs.backfill_config import build_backfill_config_from_settings
+from ..jobs.closed_cleanup import build_closed_cleanup_config, closed_cleanup_pass
+from ..db.db import ensure_schema_compatible, maybe_init_schema
+from ..jobs.discovery import discovery_pass
+from ..core.logging_utils import configure_logging as configure_service_logging, parse_log_level
+from ..core.loop_utils import schema_path
+from ..predictions.predictions import load_prediction_config
+from ..queue.queue_worker import run_worker
+from ..rag.rag_loop import rag_prediction_loop
+from ..ingest.rest_loop import rest_backfill_loop, rest_closed_cleanup_loop, rest_discovery_loop
+from ..core.settings import ENV_FILE, load_settings
+from ..queue.work_queue import load_queue_config
+from ..ingest.ws.ws_ingest import ws_loop
 
 logger = logging.getLogger(__name__)
 

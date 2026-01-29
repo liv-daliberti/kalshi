@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 from unittest.mock import patch
+import importlib
 
 from _test_utils import add_src_to_path
 
@@ -18,7 +19,7 @@ if "src.services.main" not in sys.modules:
     main_stub.main = _main
     sys.modules["src.services.main"] = main_stub
 
-import src.services.ws_service as ws_service
+ws_service = importlib.import_module("src.services.ws_service")
 
 
 class TestWsService(unittest.TestCase):

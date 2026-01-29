@@ -6,13 +6,15 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, Callable
 
 from flask import Blueprint, jsonify, render_template, request  # pylint: disable=import-error
 from psycopg.rows import dict_row  # pylint: disable=import-error
 
-from src.core.time_utils import infer_strike_period_from_times
-from src.queue.work_queue import enqueue_job
+from ...core.time_utils import infer_strike_period_from_times
+from ...queue.work_queue import enqueue_job
 
 from ..backfill_config import BackfillConfig, _load_backfill_config
 from ..config import _env_bool, _env_float, _env_int
@@ -20,6 +22,7 @@ from ..db import _db_connection, fetch_market_detail
 from ..db_timing import timed_cursor
 from ..db_utils import insert_market_tick
 from ..formatters import _parse_ts
+from ..portal_utils import portal_func as _portal_func
 from ..snapshot_utils import (
     _market_is_closed,
     _prefer_tick_snapshot,
@@ -32,6 +35,69 @@ bp = Blueprint("market", __name__)
 logger = logging.getLogger(__name__)
 _MARKET_DETAIL_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
 _MARKET_DETAIL_CACHE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class MarketSnapshotHandlers:
+    """Callable hooks used by market snapshot flows."""
+
+    db_connection: Callable[[], Any]
+    snapshot_allows_closed: Callable[[], bool]
+    market_is_closed: Callable[[Any, str], bool]
+    prefer_tick_snapshot: Callable[..., dict[str, Any] | None]
+    fetch_snapshot: Callable[[str], tuple[dict[str, Any], dict[str, Any] | None]]
+    insert_tick: Callable[[Any, dict[str, Any]], None]
+    set_backoff: Callable[[int], None]
+
+
+def _market_snapshot_handlers() -> MarketSnapshotHandlers:
+    return MarketSnapshotHandlers(
+        db_connection=_portal_func("_db_connection", _db_connection),
+        snapshot_allows_closed=_portal_func(
+            "_snapshot_allows_closed",
+            _snapshot_allows_closed,
+        ),
+        market_is_closed=_portal_func("_market_is_closed", _market_is_closed),
+        prefer_tick_snapshot=_portal_func("_prefer_tick_snapshot", _prefer_tick_snapshot),
+        fetch_snapshot=_portal_func("fetch_live_snapshot", fetch_live_snapshot),
+        insert_tick=_portal_func("insert_market_tick", insert_market_tick),
+        set_backoff=_portal_func("_set_snapshot_backoff", _set_snapshot_backoff),
+    )
+
+
+def _snapshot_payload_from_remote(
+    conn,
+    ticker: str,
+    is_closed: bool,
+    handlers: MarketSnapshotHandlers,
+) -> tuple[dict[str, object], int, dict[str, object] | None]:
+    prefer_ticks_sec = _env_int("WEB_PORTAL_SNAPSHOT_PREFER_TICKS_SEC", 60, minimum=0)
+    cached_payload = handlers.prefer_tick_snapshot(
+        conn,
+        ticker,
+        prefer_ticks_sec,
+        allow_stale=is_closed,
+    )
+    if cached_payload is not None:
+        cached_payload["db_saved"] = False
+        return cached_payload, 200, None
+
+    data, snapshot_tick = handlers.fetch_snapshot(ticker)
+    is_rate_limited = bool(data.get("rate_limited"))
+    if "error" in data:
+        if is_rate_limited:
+            handlers.set_backoff(
+                _env_int("WEB_PORTAL_SNAPSHOT_POLL_COOLDOWN_SEC", 30, minimum=5)
+            )
+        status = 429 if is_rate_limited else 503
+        return data, status, data
+    if not snapshot_tick:
+        payload, status = _snapshot_error("Live snapshot data missing.", 503)
+        return payload, status, None
+
+    handlers.insert_tick(conn, snapshot_tick)
+    data["db_saved"] = True
+    return data, 200, None
 
 
 def _market_detail_cache_ttl() -> int:
@@ -106,7 +172,11 @@ def _infer_strike_period_from_row(
     hour_max: float,
     day_max: float,
 ) -> str | None:
-    return infer_strike_period_from_times(
+    infer_func = _portal_func(
+        "_infer_strike_period_from_times",
+        infer_strike_period_from_times,
+    )
+    return infer_func(
         _parse_ts(row.get("open_time")),
         _parse_ts(row.get("close_time")),
         hour_max,
@@ -155,67 +225,46 @@ def _snapshot_error(message: str, status: int) -> tuple[dict[str, str], int]:
 def _market_snapshot_payload(ticker: str) -> tuple[dict[str, object], int]:
     payload: dict[str, object] = {}
     status = 200
+    error_payload: dict[str, object] | None = None
+    handlers = _market_snapshot_handlers()
     if not os.getenv("DATABASE_URL"):
         return _snapshot_error("DATABASE_URL is not set. Live snapshot not saved.", 503)
     try:
-        with _db_connection() as conn:
-            allow_closed = _snapshot_allows_closed()
-            is_closed = _market_is_closed(conn, ticker)
+        with handlers.db_connection() as conn:
+            allow_closed = handlers.snapshot_allows_closed()
+            is_closed = handlers.market_is_closed(conn, ticker)
             if not allow_closed and is_closed:
                 payload, status = _snapshot_error(
                     "Market is closed; snapshot skipped.",
                     409,
                 )
             else:
-                prefer_ticks_sec = _env_int(
-                    "WEB_PORTAL_SNAPSHOT_PREFER_TICKS_SEC", 60, minimum=0
-                )
-                cached_payload = _prefer_tick_snapshot(
+                payload, status, error_payload = _snapshot_payload_from_remote(
                     conn,
                     ticker,
-                    prefer_ticks_sec,
-                    allow_stale=is_closed,
+                    is_closed,
+                    handlers,
                 )
-                if cached_payload is not None:
-                    cached_payload["db_saved"] = False
-                    payload = cached_payload
-                else:
-                    data, snapshot_tick = fetch_live_snapshot(ticker)
-                    if "error" in data:
-                        status = 429 if data.get("rate_limited") else 503
-                        if data.get("rate_limited"):
-                            _set_snapshot_backoff(
-                                _env_int(
-                                    "WEB_PORTAL_SNAPSHOT_POLL_COOLDOWN_SEC",
-                                    30,
-                                    minimum=5,
-                                )
-                            )
-                        payload = data
-                    elif not snapshot_tick:
-                        payload, status = _snapshot_error(
-                            "Live snapshot data missing.",
-                            503,
-                        )
-                    else:
-                        insert_market_tick(conn, snapshot_tick)
-                        data["db_saved"] = True
-                        payload = data
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception:  # pylint: disable=broad-exception-caught
         logger.exception("live snapshot insert failed for %s", ticker)
-        payload, status = _snapshot_error(
-            str(exc) or "Live snapshot save failed.",
-            503,
-        )
+        if error_payload and error_payload.get("error") is not None:
+            status = 429 if error_payload.get("rate_limited") else 503
+            payload = error_payload
+        else:
+            payload, status = _snapshot_error(
+                "Live snapshot save failed.",
+                503,
+            )
     return payload, status
 
 
 @bp.get("/market/<ticker>")
 def market_detail(ticker: str):
     """Render a market detail view."""
+    render = _portal_func("render_template", render_template)
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
-        return render_template(
+        return render(
             "market_detail.html",
             error="DATABASE_URL is not set.",
             market=None,
@@ -223,7 +272,7 @@ def market_detail(ticker: str):
 
     cached = _load_market_detail_cache(ticker)
     if cached is not None:
-        return render_template(
+        return render(
             "market_detail.html",
             error=None,
             market=cached,
@@ -232,8 +281,10 @@ def market_detail(ticker: str):
     error = None
     market = None
     try:
-        with _db_connection() as conn:
-            market = fetch_market_detail(conn, ticker)
+        db_connection = _portal_func("_db_connection", _db_connection)
+        fetch_detail = _portal_func("fetch_market_detail", fetch_market_detail)
+        with db_connection() as conn:
+            market = fetch_detail(conn, ticker)
             if market is None:
                 error = "Market not found."
             else:
@@ -242,7 +293,7 @@ def market_detail(ticker: str):
         logger.exception("market detail query failed")
         error = str(exc)
 
-    return render_template(
+    return render(
         "market_detail.html",
         error=error,
         market=market,
@@ -253,7 +304,10 @@ def market_detail(ticker: str):
 def market_snapshot(ticker: str):
     """Return a live snapshot for a market ticker."""
     payload, status = _market_snapshot_payload(ticker)
-    return jsonify(payload), status
+    response = jsonify(payload)
+    if status == 200:
+        return response
+    return response, status
 
 
 def _enqueue_market_backfill(
@@ -272,7 +326,8 @@ def _enqueue_market_backfill(
     if error_payload:
         return error_payload, 400
     market_payload = _market_payload(row)
-    job_id = enqueue_job(
+    enqueue = _portal_func("enqueue_job", enqueue_job)
+    job_id = enqueue(
         conn,
         "backfill_market",
         {
@@ -301,9 +356,16 @@ def market_backfill(ticker: str):
     payload = request.get_json(silent=True) or {}
     force_full = bool(payload.get("force_full"))
 
-    cfg = _load_backfill_config()
+    response = None
+    status = None
     try:
-        with _db_connection() as conn:
+        db_connection = _portal_func("_db_connection", _db_connection)
+        load_backfill_config = _portal_func(
+            "_load_backfill_config",
+            _load_backfill_config,
+        )
+        cfg = load_backfill_config()
+        with db_connection() as conn:
             response, status = _enqueue_market_backfill(
                 conn,
                 ticker,
@@ -312,6 +374,11 @@ def market_backfill(ticker: str):
             )
     except Exception as exc:  # pylint: disable=broad-exception-caught
         logger.exception("market backfill failed for %s", ticker)
+        if response is not None and status is not None:
+            return jsonify(response), status
         response, status = {"error": str(exc) or "Market backfill failed."}, 503
 
-    return jsonify(response), status
+    resp = jsonify(response)
+    if status == 200:
+        return resp
+    return resp, status

@@ -14,13 +14,13 @@ from typing import Any, Optional
 import psycopg  # pylint: disable=import-error
 from dateutil.parser import isoparse  # pylint: disable=import-error
 
-from src.db.db import ensure_schema_compatible
-from src.core.time_utils import (
+from ..db.db import ensure_schema_compatible
+from ..core.time_utils import (
     age_seconds as _age_seconds,
     parse_epoch_seconds as _parse_epoch_seconds,
     parse_ts,
 )
-from src.core.env_utils import _env_bool, _env_int
+from ..core.env_utils import _env_bool, _env_int
 
 logger = logging.getLogger(__name__)
 

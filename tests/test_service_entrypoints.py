@@ -10,8 +10,8 @@ from _test_utils import add_src_to_path
 
 add_src_to_path()
 
-import src.services.rag_service as rag_service
-import src.services.rest_service as rest_service
+rag_service = importlib.import_module("src.services.rag_service")
+rest_service = importlib.import_module("src.services.rest_service")
 
 
 class TestRagService(unittest.TestCase):

@@ -168,6 +168,26 @@ Concurrency pins:
 6) Enable guardrails: `SERVICE_GUARDRAILS=1`.
 7) Validate health signals and data writes (see below).
 
+## Schema patches
+
+- Apply the portal rollup advisory lock hotfix on an existing DB (psycopg):
+  ```
+  python - <<'PY'
+  import os
+  import psycopg
+
+  sql_path = "sql/patch_portal_rollup_lock.sql"
+  db_url = os.environ["DATABASE_URL"]
+  with open(sql_path, "r", encoding="utf-8") as f:
+    sql = f.read()
+  with psycopg.connect(db_url) as conn:
+    with conn.cursor() as cur:
+      cur.execute(sql)
+    conn.commit()
+  print("Applied portal rollup lock patch.")
+  PY
+  ```
+
 ## Testing and validation
 
 Smoke checks:

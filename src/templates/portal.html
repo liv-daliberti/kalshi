@@ -225,6 +225,12 @@
         margin: 8px 0;
       }
 
+      .stat-value.loading,
+      .stat-meta.loading {
+        color: var(--ink-soft);
+        font-style: italic;
+      }
+
       .stat-meta {
         font-size: 13px;
         color: var(--ink-muted);
@@ -752,37 +758,83 @@
             powered directly by Liv and Kalshi’s API.
           </p>
           <div class="meta-row">
-            <div>Refreshed {{ refreshed_at }}</div>
+            <div id="portal-refreshed">
+              {% if lazy_load %}
+                Loading data...
+              {% else %}
+                Refreshed {{ refreshed_at }}
+              {% endif %}
+            </div>
             <div>Limit {{ limit }} rows per table</div>
           </div>
           {% if scope_note %}
           <div class="scope-note">{{ scope_note }}</div>
           {% endif %}
         </div>
-        <div class="hero-cards">
-          <div class="stat-card">
+        <div class="hero-cards" id="portal-stats">
+          <div class="stat-card" data-portal-stat="active">
             <div class="stat-label">Active events</div>
-            <div class="stat-value">{{ active_total }}</div>
-            {% set active_shown = (active_page * limit) + (active_rows | length) %}
-            <div class="stat-meta">Showing {{ active_shown }} of {{ active_total }}</div>
+            <div class="stat-value{% if lazy_load %} loading{% endif %}" id="portal-active-total">
+              {% if lazy_load %}
+                --
+              {% else %}
+                {{ active_total }}
+              {% endif %}
+            </div>
+            {% if lazy_load %}
+            <div class="stat-meta loading" id="portal-active-meta">Loading...</div>
+            {% else %}
+              {% set active_shown = (active_page * limit) + (active_rows | length) %}
+              <div class="stat-meta" id="portal-active-meta">
+                Showing {{ active_shown }} of {{ active_total }}
+              </div>
+            {% endif %}
           </div>
-          <div class="stat-card">
+          <div class="stat-card" data-portal-stat="closed">
             <div class="stat-label">Closed events</div>
-            <div class="stat-value">{{ closed_total }}</div>
-            {% set closed_shown = (closed_page * limit) + (closed_rows | length) %}
-            <div class="stat-meta">Showing {{ closed_shown }} of {{ closed_total }}</div>
+            <div class="stat-value{% if lazy_load %} loading{% endif %}" id="portal-closed-total">
+              {% if lazy_load %}
+                --
+              {% else %}
+                {{ closed_total }}
+              {% endif %}
+            </div>
+            {% if lazy_load %}
+            <div class="stat-meta loading" id="portal-closed-meta">Loading...</div>
+            <div class="stat-meta loading" id="portal-closed-filled">Loading...</div>
+            {% else %}
+              {% set closed_shown = (closed_page * limit) + (closed_rows | length) %}
+              <div class="stat-meta" id="portal-closed-meta">
+                Showing {{ closed_shown }} of {{ closed_total }}
+              </div>
+              <div class="stat-meta" id="portal-closed-filled">
+                Filled {{ closed_filled_total }} of {{ closed_total }}
+              </div>
+            {% endif %}
           </div>
-          <div class="stat-card">
+          <div class="stat-card" data-portal-stat="scheduled">
             <div class="stat-label">Scheduled events</div>
-            <div class="stat-value">{{ scheduled_total }}</div>
-            {% set scheduled_shown = (scheduled_page * limit) + (scheduled_rows | length) %}
-            <div class="stat-meta">Showing {{ scheduled_shown }} of {{ scheduled_total }}</div>
+            <div class="stat-value{% if lazy_load %} loading{% endif %}" id="portal-scheduled-total">
+              {% if lazy_load %}
+                --
+              {% else %}
+                {{ scheduled_total }}
+              {% endif %}
+            </div>
+            {% if lazy_load %}
+            <div class="stat-meta loading" id="portal-scheduled-meta">Loading...</div>
+            {% else %}
+              {% set scheduled_shown = (scheduled_page * limit) + (scheduled_rows | length) %}
+              <div class="stat-meta" id="portal-scheduled-meta">
+                Showing {{ scheduled_shown }} of {{ scheduled_total }}
+              </div>
+            {% endif %}
           </div>
         </div>
       </header>
 
-      {% if health %}
-      <section class="health-strip">
+      <section class="health-strip" id="portal-health" {% if not health %}style="display: none;"{% endif %}>
+        {% if health %}
         <div class="health-card">
           <div class="health-label">Discovery</div>
           <div class="health-value status-{{ health.discovery.status }}">{{ health.discovery.display }}</div>
@@ -815,15 +867,13 @@
             {{ health.queue.running }} running · {{ health.queue.workers }} workers · {{ health.queue.failed }} failed
           </div>
         </div>
+        {% endif %}
       </section>
-      {% endif %}
 
-      {% if error %}
-      <div class="alert">
+      <div class="alert" id="portal-error" {% if not error %}style="display: none;"{% endif %}>
         <div class="alert-title">Portal error</div>
         <div>{{ error }}</div>
       </div>
-      {% endif %}
 
       <section class="panel">
         <div class="filter-card">
@@ -925,7 +975,7 @@
         </div>
         <div class="category-row">
           <div class="category-label">Categories</div>
-          <div class="category-pills">
+          <div class="category-pills" id="portal-category-pills">
             {% for item in category_filters %}
               <a class="category-pill {% if item.active %}active{% endif %}" href="{{ item.url }}">
                 {{ item.label }}
@@ -955,7 +1005,7 @@
                   </th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody id="portal-active-body" data-portal-table="active">
                 {% set visible_active_rows = (active_rows or []) | rejectattr("volume", "equalto", "N/A") | list %}
                 {% if visible_active_rows %}
                   {% for row in visible_active_rows %}
@@ -975,19 +1025,24 @@
                   </tr>
                   {% endfor %}
                 {% else %}
-                  <tr>
-                    <td colspan="3" class="empty">No active events found for this view.</td>
-                  </tr>
+                  {% if lazy_load %}
+                    <tr>
+                      <td colspan="3" class="empty">Loading active events...</td>
+                    </tr>
+                  {% else %}
+                    <tr>
+                      <td colspan="3" class="empty">No active events found for this view.</td>
+                    </tr>
+                  {% endif %}
                 {% endif %}
               </tbody>
             </table>
           </div>
         </div>
-        {% if active_has_more %}
-          <div class="load-more-row">
-            <a class="load-more-btn" href="{{ load_more_links.active }}">Load more</a>
-          </div>
-        {% endif %}
+        <div class="load-more-row" id="portal-load-more-active" data-portal-load-more="active"
+             {% if not active_has_more %}style="display: none;"{% endif %}>
+          <a class="load-more-btn" href="{{ load_more_links.active or '#' }}">Load more</a>
+        </div>
       </section>
 
       <section class="panel">
@@ -1024,7 +1079,7 @@
                   </th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody id="portal-scheduled-body" data-portal-table="scheduled">
                 {% if scheduled_rows %}
                   {% for row in scheduled_rows %}
                   <tr class="row-link" data-href="{{ url_for('event.event_detail', event_ticker=row.event_ticker) }}"
@@ -1044,26 +1099,40 @@
                   </tr>
                   {% endfor %}
                 {% else %}
-                  <tr>
-                    <td colspan="4" class="empty">No scheduled events found for this view.</td>
-                  </tr>
+                  {% if lazy_load %}
+                    <tr>
+                      <td colspan="4" class="empty">Loading scheduled events...</td>
+                    </tr>
+                  {% else %}
+                    <tr>
+                      <td colspan="4" class="empty">No scheduled events found for this view.</td>
+                    </tr>
+                  {% endif %}
                 {% endif %}
               </tbody>
             </table>
           </div>
         </div>
-        {% if scheduled_has_more %}
-          <div class="load-more-row">
-            <a class="load-more-btn" href="{{ load_more_links.scheduled }}">Load more</a>
-          </div>
-        {% endif %}
+        <div class="load-more-row" id="portal-load-more-scheduled" data-portal-load-more="scheduled"
+             {% if not scheduled_has_more %}style="display: none;"{% endif %}>
+          <a class="load-more-btn" href="{{ load_more_links.scheduled or '#' }}">Load more</a>
+        </div>
       </section>
 
       <section class="panel">
         <div class="panel-header">
           <div>
             <h2 class="panel-title">Closed Events</h2>
-            <div class="panel-subtitle">Events where all markets are closed.</div>
+            <div class="panel-subtitle">
+              Events where all markets are closed.
+              <span id="portal-closed-filled-summary">
+                {% if lazy_load %}
+                  Filled -- of --
+                {% else %}
+                  Filled {{ closed_filled_total }} of {{ closed_total }}
+                {% endif %}
+              </span>
+            </div>
           </div>
         </div>
         <div class="table-card">
@@ -1093,7 +1162,7 @@
                   </th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody id="portal-closed-body" data-portal-table="closed">
                 {% set visible_closed_rows = (closed_rows or []) | rejectattr("volume", "equalto", "N/A") | list %}
                 {% if visible_closed_rows %}
                   {% for row in visible_closed_rows %}
@@ -1114,23 +1183,29 @@
                   </tr>
                   {% endfor %}
                 {% else %}
-                  <tr>
-                    <td colspan="4" class="empty">No closed events found for this view.</td>
-                  </tr>
+                  {% if lazy_load %}
+                    <tr>
+                      <td colspan="4" class="empty">Loading closed events...</td>
+                    </tr>
+                  {% else %}
+                    <tr>
+                      <td colspan="4" class="empty">No closed events found for this view.</td>
+                    </tr>
+                  {% endif %}
                 {% endif %}
               </tbody>
             </table>
           </div>
         </div>
-        {% if closed_has_more %}
-          <div class="load-more-row">
-            <a class="load-more-btn" href="{{ load_more_links.closed }}">Load more</a>
-          </div>
-        {% endif %}
+        <div class="load-more-row" id="portal-load-more-closed" data-portal-load-more="closed"
+             {% if not closed_has_more %}style="display: none;"{% endif %}>
+          <a class="load-more-btn" href="{{ load_more_links.closed or '#' }}">Load more</a>
+        </div>
       </section>
 
       <footer class="footer">
-        Use ?limit= and ?active_page= / ?scheduled_page= / ?closed_page= to paginate tables.
+        Use ?limit= and ?active_page= / ?scheduled_page= / ?closed_page= with ?active_after= /
+        ?scheduled_after= / ?closed_after= for keyset pagination.
       </footer>
     </div>
     <script>
@@ -1147,5 +1222,28 @@
       });
     </script>
     {% include "queue_stream.html" %}
+    <script>
+      (function () {
+        const lazyLoad = {{ "true" if lazy_load else "false" }};
+        if (!lazyLoad) {
+          return;
+        }
+        function schedule() {
+          if (typeof window.portalRefreshData !== "function") {
+            return;
+          }
+          if (window.requestAnimationFrame) {
+            window.requestAnimationFrame(() => window.portalRefreshData());
+          } else {
+            setTimeout(() => window.portalRefreshData(), 0);
+          }
+        }
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", schedule, { once: true });
+        } else {
+          schedule();
+        }
+      })();
+    </script>
   </body>
 </html>

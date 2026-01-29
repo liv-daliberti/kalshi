@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 
-from src.services import main as ingestor_main
-from src.core.guardrails import assert_env_isolated
-from src.services.healthcheck import start_health_server
+from . import main as ingestor_main
+from ..core.guardrails import assert_env_isolated
+from .healthcheck import start_health_server
 
 
 def _ensure_env() -> None:

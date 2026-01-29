@@ -4,13 +4,14 @@ import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import mock_open, patch
+import importlib
 
 from _test_utils import add_src_to_path, ensure_psycopg_stub
 
 ensure_psycopg_stub()
 add_src_to_path()
 
-import src.queue.queue_worker as queue_worker
+queue_worker = importlib.import_module("src.queue.queue_worker")
 
 
 class StopLoop(Exception):
@@ -31,6 +32,21 @@ class DummyCursor:
         return False
 
 
+class MetricsCursor(DummyCursor):
+    def __init__(self, row, raise_on_execute=False):
+        super().__init__()
+        self.row = row
+        self.raise_on_execute = raise_on_execute
+
+    def execute(self, sql, params=None):
+        if self.raise_on_execute:
+            raise RuntimeError("execute failed")
+        super().execute(sql, params)
+
+    def fetchone(self):
+        return self.row
+
+
 class FakeConn:
     def __init__(self):
         self.rollback_called = False
@@ -47,6 +63,18 @@ class FakeConn:
 
     def rollback(self):
         self.rollback_called = True
+
+
+class MetricsConn(FakeConn):
+    def __init__(self, row, raise_on_execute=False):
+        super().__init__()
+        self.row = row
+        self.raise_on_execute = raise_on_execute
+
+    def cursor(self):
+        cursor = MetricsCursor(self.row, raise_on_execute=self.raise_on_execute)
+        self.cursors.append(cursor)
+        return cursor
 
 
 class FakeChannel:
@@ -93,6 +121,46 @@ class TestQueueWorkerHelpers(unittest.TestCase):
 
 
 class TestQueueWorkerProcess(unittest.TestCase):
+    def test_process_item_discover_market(self) -> None:
+        conn = object()
+        client = object()
+        item = queue_worker.WorkItem(
+            job_id=4,
+            job_type="discover_market",
+            payload={"ticker": 123},
+            attempts=0,
+            max_attempts=1,
+        )
+        cfg = queue_worker.BackfillConfig(
+            strike_periods=("hour",),
+            event_statuses=("closed",),
+            minutes_hour=1,
+            minutes_day=60,
+            lookback_hours=2,
+        )
+        with patch("src.queue.queue_worker.discover_market", return_value=7) as discover_market:
+            result = queue_worker._process_item(conn, client, cfg, item)
+        self.assertEqual(result, 7)
+        discover_market.assert_called_once_with(conn, client, "123")
+
+    def test_process_item_discover_market_invalid_payload(self) -> None:
+        item = queue_worker.WorkItem(
+            job_id=5,
+            job_type="discover_market",
+            payload={},
+            attempts=0,
+            max_attempts=1,
+        )
+        cfg = queue_worker.BackfillConfig(
+            strike_periods=("hour",),
+            event_statuses=("closed",),
+            minutes_hour=1,
+            minutes_day=60,
+            lookback_hours=2,
+        )
+        with self.assertRaises(ValueError):
+            queue_worker._process_item(object(), object(), cfg, item)
+
     def test_process_item_backfill(self) -> None:
         item = queue_worker.WorkItem(
             job_id=1,
@@ -148,6 +216,33 @@ class TestQueueWorkerProcess(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             queue_worker._process_item(object(), object(), cfg, item)
+
+
+class TestQueueWorkerMetrics(unittest.TestCase):
+    def test_log_queue_metrics_success(self) -> None:
+        conn = MetricsConn((2, 1, 0, 5.234))
+        queue_cfg = SimpleNamespace(job_types=("backfill_market",))
+        with patch("src.queue.queue_worker.logger.info") as log_info:
+            queue_worker._log_queue_metrics(conn, queue_cfg)
+        self.assertEqual(len(conn.cursors), 1)
+        self.assertEqual(len(conn.cursors[0].executes), 1)
+        args, _kwargs = log_info.call_args
+        self.assertTrue(args[0].startswith("metric=worker.queue"))
+        self.assertEqual(args[1:], (2, 1, 0, 5.2))
+
+    def test_log_queue_metrics_empty_row(self) -> None:
+        conn = MetricsConn(None)
+        queue_cfg = SimpleNamespace(job_types=("backfill_market",))
+        with patch("src.queue.queue_worker.logger.info") as log_info:
+            queue_worker._log_queue_metrics(conn, queue_cfg)
+        log_info.assert_not_called()
+
+    def test_log_queue_metrics_exception_logs(self) -> None:
+        conn = MetricsConn((1, 2, 3, 4), raise_on_execute=True)
+        queue_cfg = SimpleNamespace(job_types=None)
+        with patch("src.queue.queue_worker.logger.exception") as log_exc:
+            queue_worker._log_queue_metrics(conn, queue_cfg)
+        log_exc.assert_called_once()
 
 
 class TestQueueWorkerLoop(unittest.TestCase):
@@ -218,6 +313,20 @@ class TestQueueWorkerLoop(unittest.TestCase):
                 queue_worker._run_worker_loop(conn, object(), object(), cfg)
         self.assertEqual(channel.acked, [1])
         log_warn.assert_called_once()
+
+    def test_fetch_rabbitmq_item_unclaimed_logs_warning(self) -> None:
+        conn = FakeConn()
+        cfg = self._queue_cfg()
+        method_frame = SimpleNamespace(delivery_tag=3)
+        channel = FakeChannel(responses=[(method_frame, None, b"42")])
+        connection = FakeConnection()
+        with patch("src.queue.queue_worker.claim_job_by_id", return_value=None) as claim_job, \
+             patch("src.queue.queue_worker.logger.warning") as log_warn:
+            result = queue_worker._fetch_rabbitmq_item(conn, cfg, connection, channel)
+        self.assertEqual(result, (connection, channel, None, False))
+        claim_job.assert_called_once_with(conn, 42, cfg.worker_id, cfg.job_types)
+        log_warn.assert_called_once()
+        self.assertEqual(channel.acked, [3])
 
     def test_run_worker_loop_read_failure_reconnects(self) -> None:
         conn = FakeConn()
@@ -357,6 +466,17 @@ class TestQueueWorkerLoop(unittest.TestCase):
         requeue.assert_called_once()
         cleanup.assert_called_once()
         self.assertGreaterEqual(log_info.call_count, 2)
+
+    def test_run_worker_loop_logs_metrics(self) -> None:
+        conn = FakeConn()
+        cfg = self._queue_cfg(publish=False)
+        with patch("src.queue.queue_worker._env_int", return_value=1), \
+             patch("src.queue.queue_worker._log_queue_metrics") as log_metrics, \
+             patch("src.queue.queue_worker.time.monotonic", side_effect=[0, 2]), \
+             patch("src.queue.queue_worker.claim_next_job", side_effect=StopLoop):
+            with self.assertRaises(StopLoop):
+                queue_worker._run_worker_loop(conn, object(), object(), cfg)
+        log_metrics.assert_called_once_with(conn, cfg)
 
     def test_run_worker_loop_sleep_continue(self) -> None:
         conn = FakeConn()

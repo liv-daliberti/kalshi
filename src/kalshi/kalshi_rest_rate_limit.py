@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 import logging
 import os
@@ -12,8 +11,8 @@ from datetime import timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 
-from src.core.db_utils import safe_close
-from src.kalshi.kalshi_rate_limit import register_rest_rate_limit
+from ..core.db_utils import safe_close
+from .kalshi_rate_limit import register_rest_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +27,10 @@ _REST_RATE_LIMIT_BACKEND_OVERRIDE: Optional[str] = None
 _REST_RATE_LIMIT_DB_URL_OVERRIDE: Optional[str] = None
 _REST_RATE_LIMIT_WARNED: set[str] = set()
 _DB_RATE_LIMIT_LOCAL = threading.local()
+_REST_KEY_LOCAL = threading.local()
+_REST_KEY_ROTATION_LOCK = threading.Lock()
+_REST_KEY_ROTATION_IDX = 0
+_REST_KEY_ROTATION_ENABLED = False
 _DB_RATE_LIMIT_ERROR_LOCK = threading.Lock()
 _DB_RATE_LIMIT_ERROR_TS = 0.0
 _DB_RATE_LIMIT_KEY = "kalshi_rest_rate_limit"
@@ -61,6 +64,60 @@ def configure_rest_rate_limit(
         if db_url is not None:
             db_url = db_url.strip() if db_url else ""
             _REST_RATE_LIMIT_DB_URL_OVERRIDE = db_url or None
+
+
+def set_rest_key_rotation(enabled: bool) -> None:
+    """Enable or disable per-key rotation for REST rate limiting."""
+    global _REST_KEY_ROTATION_ENABLED  # pylint: disable=global-statement
+    _REST_KEY_ROTATION_ENABLED = bool(enabled)
+
+
+def _rest_key_pool() -> list[str]:
+    keys: list[str] = []
+    for env_key in ("KALSHI_API_KEY_ID", "KALSHI_API_KEY_ID_2"):
+        value = os.getenv(env_key, "").strip()
+        if value and value not in keys:
+            keys.append(value)
+    return keys
+
+
+def current_rest_key() -> Optional[str]:
+    """Return the currently selected REST key id, if any."""
+    return getattr(_REST_KEY_LOCAL, "key", None)
+
+
+def set_current_rest_key(key_id: Optional[str]) -> None:
+    """Store the REST key id for the current thread, or clear it."""
+    if key_id:
+        _REST_KEY_LOCAL.key = key_id
+    else:
+        _REST_KEY_LOCAL.key = None
+
+
+def _default_rest_key() -> Optional[str]:
+    keys = _rest_key_pool()
+    return keys[0] if keys else None
+
+
+def _current_or_default_rest_key() -> Optional[str]:
+    return current_rest_key() or _default_rest_key()
+
+
+def select_rest_key() -> Optional[str]:
+    """Select and store a REST key id, honoring rotation settings."""
+    keys = _rest_key_pool()
+    if not keys:
+        return None
+    if not _REST_KEY_ROTATION_ENABLED or len(keys) == 1:
+        key_id = _current_or_default_rest_key() or keys[0]
+        set_current_rest_key(key_id)
+        return key_id
+    with _REST_KEY_ROTATION_LOCK:
+        global _REST_KEY_ROTATION_IDX  # pylint: disable=global-statement
+        key_id = keys[_REST_KEY_ROTATION_IDX % len(keys)]
+        _REST_KEY_ROTATION_IDX += 1
+    set_current_rest_key(key_id)
+    return key_id
 
 
 def _rest_rate_limit_db_url() -> Optional[str]:
@@ -107,7 +164,7 @@ def _rest_rate_limit_backend() -> str:
 
 def _import_psycopg():
     try:
-        return importlib.import_module("psycopg")
+        return __import__("psycopg")
     except ImportError:
         return None
 
@@ -124,6 +181,10 @@ def _db_rate_limit_conn():
         return None
     conn = getattr(_DB_RATE_LIMIT_LOCAL, "conn", None)
     if conn is not None and not getattr(conn, "closed", False):
+        managed = bool(getattr(_DB_RATE_LIMIT_LOCAL, "managed", False))
+        if not managed:
+            _DB_RATE_LIMIT_LOCAL.conn = None
+            _DB_RATE_LIMIT_LOCAL.managed = False
         return conn
     psycopg = _import_psycopg()
     if psycopg is None:
@@ -141,6 +202,7 @@ def _db_rate_limit_conn():
         )
         return None
     _DB_RATE_LIMIT_LOCAL.conn = conn
+    _DB_RATE_LIMIT_LOCAL.managed = True
     return conn
 
 
@@ -203,7 +265,18 @@ def _serialize_db_rate_state(state: dict[str, float]) -> str:
     return json.dumps(state, separators=(",", ":"), sort_keys=True)
 
 
-def _db_rate_limit_fetch_state(conn, now: float, burst: int) -> dict[str, float]:
+def _db_rate_limit_key(key_id: Optional[str]) -> str:
+    if not key_id:
+        return _DB_RATE_LIMIT_KEY
+    return f"{_DB_RATE_LIMIT_KEY}:{key_id}"
+
+
+def _db_rate_limit_fetch_state(
+    conn,
+    now: float,
+    burst: int,
+    key_id: Optional[str] = None,
+) -> dict[str, float]:
     default_state = _serialize_db_rate_state(
         {
             "tokens": float(burst),
@@ -211,6 +284,7 @@ def _db_rate_limit_fetch_state(conn, now: float, burst: int) -> dict[str, float]
             "next_allowed_ts": 0.0,
         }
     )
+    state_key = _db_rate_limit_key(key_id)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -218,19 +292,24 @@ def _db_rate_limit_fetch_state(conn, now: float, burst: int) -> dict[str, float]
             VALUES (%s, %s, NOW())
             ON CONFLICT (key) DO NOTHING
             """,
-            (_DB_RATE_LIMIT_KEY, default_state),
+            (state_key, default_state),
         )
         cur.execute(
             "SELECT value FROM ingest_state WHERE key = %s FOR UPDATE",
-            (_DB_RATE_LIMIT_KEY,),
+            (state_key,),
         )
         row = cur.fetchone()
     raw = row[0] if row else None
     return _parse_db_rate_state(raw, now, burst)
 
 
-def _db_rate_limit_write_state(conn, state: dict[str, float]) -> None:
+def _db_rate_limit_write_state(
+    conn,
+    state: dict[str, float],
+    key_id: Optional[str] = None,
+) -> None:
     payload = _serialize_db_rate_state(state)
+    state_key = _db_rate_limit_key(key_id)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -238,11 +317,11 @@ def _db_rate_limit_write_state(conn, state: dict[str, float]) -> None:
             SET value = %s, updated_at = NOW()
             WHERE key = %s
             """,
-            (payload, _DB_RATE_LIMIT_KEY),
+            (payload, state_key),
         )
 
 
-def _db_rest_backoff_remaining() -> Optional[float]:
+def _db_rest_backoff_remaining(key_id: Optional[str] = None) -> Optional[float]:
     conn = _db_rate_limit_conn()
     if conn is None:
         return None
@@ -251,7 +330,7 @@ def _db_rest_backoff_remaining() -> Optional[float]:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT value FROM ingest_state WHERE key = %s",
-                (_DB_RATE_LIMIT_KEY,),
+                (_db_rate_limit_key(key_id),),
             )
             row = cur.fetchone()
         state = _parse_db_rate_state(row[0] if row else None, now, burst=1)
@@ -262,7 +341,10 @@ def _db_rest_backoff_remaining() -> Optional[float]:
         return None
 
 
-def _db_rest_apply_cooldown(cooldown_sec: float) -> bool:
+def _db_rest_apply_cooldown(
+    cooldown_sec: float,
+    key_id: Optional[str] = None,
+) -> bool:
     if cooldown_sec <= 0:
         return True
     conn = _db_rate_limit_conn()
@@ -272,7 +354,7 @@ def _db_rest_apply_cooldown(cooldown_sec: float) -> bool:
     now = time.time()
     try:
         with conn.transaction():
-            state = _db_rate_limit_fetch_state(conn, now, burst)
+            state = _db_rate_limit_fetch_state(conn, now, burst, key_id)
             state["next_allowed_ts"] = max(
                 state["next_allowed_ts"],
                 now + cooldown_sec,
@@ -280,7 +362,7 @@ def _db_rest_apply_cooldown(cooldown_sec: float) -> bool:
             if rate_per_sec <= 0:
                 state["tokens"] = float(burst)
                 state["last_refill_ts"] = now
-            _db_rate_limit_write_state(conn, state)
+            _db_rate_limit_write_state(conn, state, key_id=key_id)
         return True
     except Exception as exc:  # pylint: disable=broad-exception-caught
         _db_rate_limit_error(exc)
@@ -288,7 +370,7 @@ def _db_rest_apply_cooldown(cooldown_sec: float) -> bool:
         return False
 
 
-def _db_rest_wait() -> bool:
+def _db_rest_wait(key_id: Optional[str] = None) -> bool:
     rate_per_sec, burst = _rest_limits()
     conn = _db_rate_limit_conn()
     if conn is None:
@@ -298,7 +380,7 @@ def _db_rest_wait() -> bool:
         wait_s = 0.0
         try:
             with conn.transaction():
-                state = _db_rate_limit_fetch_state(conn, now, burst)
+                state = _db_rate_limit_fetch_state(conn, now, burst, key_id=key_id)
                 backoff_s = state["next_allowed_ts"] - now
                 if backoff_s > 0:
                     wait_s = backoff_s
@@ -315,7 +397,7 @@ def _db_rest_wait() -> bool:
                     else:
                         state["tokens"] = tokens
                         wait_s = (1.0 - tokens) / rate_per_sec
-                _db_rate_limit_write_state(conn, state)
+                _db_rate_limit_write_state(conn, state, key_id=key_id)
             if wait_s <= 0:
                 return True
             time.sleep(wait_s)
@@ -371,7 +453,7 @@ def _rest_wait_local() -> None:
 def rest_backoff_remaining() -> float:
     """Return remaining global REST backoff seconds."""
     if _rest_rate_limit_backend() == "db":
-        remaining = _db_rest_backoff_remaining()
+        remaining = _db_rest_backoff_remaining(_current_or_default_rest_key())
         if remaining is not None:
             return remaining
     return _rest_backoff_remaining_local()
@@ -381,12 +463,17 @@ def rest_apply_cooldown(cooldown_sec: float) -> None:
     """Apply a shared REST cooldown window."""
     _rest_apply_cooldown_local(cooldown_sec)
     if _rest_rate_limit_backend() == "db":
-        _db_rest_apply_cooldown(cooldown_sec)
+        key_id = current_rest_key()
+        if key_id:
+            _db_rest_apply_cooldown(cooldown_sec, key_id)
+        else:
+            _db_rest_apply_cooldown(cooldown_sec)
 
 
 def rest_wait() -> None:
     """Wait for shared REST backoff and token bucket allowance."""
-    if _rest_rate_limit_backend() == "db" and _db_rest_wait():
+    key_id = select_rest_key()
+    if _rest_rate_limit_backend() == "db" and _db_rest_wait(key_id):
         return
     _rest_wait_local()
 

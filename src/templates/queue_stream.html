@@ -1,9 +1,6 @@
-{% if queue_stream_enabled %}
 <script>
   (function () {
-    if (!("EventSource" in window)) {
-      return;
-    }
+    const streamEnabled = {{ "true" if queue_stream_enabled else "false" }};
     const streamUrl = "{{ url_for('stream.queue_stream') }}";
     const minReloadMs = Number("{{ queue_stream_min_reload_ms }}") || 5000;
     const reloadKey = "queueStreamLastReloadAt";
@@ -12,6 +9,7 @@
     let refreshTimer = null;
     let quietTimer = null;
     let lastReloadAt = 0;
+    let refreshInFlight = false;
 
     try {
       const stored = localStorage.getItem(reloadKey);
@@ -30,6 +28,614 @@
       }
     }
 
+    function escapeHtml(value) {
+      if (value === null || value === undefined) {
+        return "";
+      }
+      return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function wireRowLinks(scope) {
+      const rows = (scope || document).querySelectorAll(".row-link");
+      rows.forEach((row) => {
+        if (row.dataset.portalLinked === "1") {
+          return;
+        }
+        row.dataset.portalLinked = "1";
+        row.addEventListener("click", (event) => {
+          if (event.target.closest("a")) {
+            return;
+          }
+          const href = row.getAttribute("data-href");
+          if (href) {
+            window.location.href = href;
+          }
+        });
+      });
+    }
+
+    function isPortalPage() {
+      return Boolean(
+        document.getElementById("portal-active-body") &&
+          document.getElementById("portal-scheduled-body") &&
+          document.getElementById("portal-closed-body")
+      );
+    }
+
+    function isOpportunitiesPage() {
+      return Boolean(document.getElementById("opps-body"));
+    }
+
+    function isHealthPage() {
+      return Boolean(document.getElementById("health-status-grid"));
+    }
+
+    function buildEventUrl(ticker) {
+      if (!ticker) {
+        return "#";
+      }
+      return `/event/${encodeURIComponent(ticker)}`;
+    }
+
+    function renderEventRow(row, index) {
+      const title = escapeHtml(row.event_title || "Unknown event");
+      const ticker = row.event_ticker || "";
+      const href = buildEventUrl(ticker);
+      const volume = escapeHtml(row.volume || "");
+      return {
+        href,
+        title,
+        volume,
+        style: `animation-delay: ${index * 35}ms;`,
+      };
+    }
+
+    function renderActiveRows(rows) {
+      const visible = (rows || []).filter((row) => row.volume !== "N/A");
+      if (!visible.length) {
+        return '<tr><td colspan="3" class="empty">No active events found for this view.</td></tr>';
+      }
+      return visible
+        .map((row, index) => {
+          const base = renderEventRow(row, index);
+          const timeRemaining = escapeHtml(row.time_remaining || "");
+          return (
+            `<tr class="row-link" data-href="${base.href}" style="${base.style}">` +
+            '<td><div class="title-stack"><div class="title">' +
+            `<a class="market-link" href="${base.href}">${base.title}</a>` +
+            "</div></div></td>" +
+            `<td class="mono">${base.volume}</td>` +
+            `<td class="mono">${timeRemaining}</td>` +
+            "</tr>"
+          );
+        })
+        .join("");
+    }
+
+    function renderScheduledRows(rows) {
+      if (!rows || !rows.length) {
+        return '<tr><td colspan="4" class="empty">No scheduled events found for this view.</td></tr>';
+      }
+      return rows
+        .map((row, index) => {
+          const base = renderEventRow(row, index);
+          const openTime = escapeHtml(row.open_time || "");
+          const closeTime = escapeHtml(row.close_time || "");
+          return (
+            `<tr class="row-link" data-href="${base.href}" style="${base.style}">` +
+            '<td><div class="title-stack"><div class="title">' +
+            `<a class="market-link" href="${base.href}">${base.title}</a>` +
+            "</div></div></td>" +
+            `<td class="mono">${base.volume}</td>` +
+            `<td class="mono">${openTime}</td>` +
+            `<td class="mono">${closeTime}</td>` +
+            "</tr>"
+          );
+        })
+        .join("");
+    }
+
+    function renderClosedRows(rows) {
+      const visible = (rows || []).filter((row) => row.volume !== "N/A");
+      if (!visible.length) {
+        return '<tr><td colspan="4" class="empty">No closed events found for this view.</td></tr>';
+      }
+      return visible
+        .map((row, index) => {
+          const base = renderEventRow(row, index);
+          const openTime = escapeHtml(row.open_time || "");
+          const closeTime = escapeHtml(row.close_time || "");
+          return (
+            `<tr class="row-link" data-href="${base.href}" style="${base.style}">` +
+            '<td><div class="title-stack"><div class="title">' +
+            `<a class="market-link" href="${base.href}">${base.title}</a>` +
+            "</div></div></td>" +
+            `<td class="mono">${base.volume}</td>` +
+            `<td class="mono">${openTime}</td>` +
+            `<td class="mono">${closeTime}</td>` +
+            "</tr>"
+          );
+        })
+        .join("");
+    }
+
+    function renderCategoryFilters(filters) {
+      if (!filters || !filters.length) {
+        return "";
+      }
+      return filters
+        .map((item) => {
+          const label = escapeHtml(item.label || "");
+          const href = escapeHtml(item.url || "#");
+          const active = item.active ? "active" : "";
+          return `<a class="category-pill ${active}" href="${href}">${label}</a>`;
+        })
+        .join("");
+    }
+
+    function renderOpportunityRows(rows) {
+      const visible = (rows || []).filter((row) => row.volume !== "N/A");
+      if (!visible.length) {
+        return '<tr><td colspan="10" class="empty">No opportunities match these filters.</td></tr>';
+      }
+      return visible
+        .map((row) => {
+          const marketUrl = escapeHtml(row.market_url || "#");
+          const marketLabel = escapeHtml(row.market_label || "");
+          const eventUrl = escapeHtml(row.event_url || "#");
+          const eventTitle = escapeHtml(row.event_title || "");
+          const kalshi = escapeHtml(row.kalshi_percent || "");
+          const gpt = escapeHtml(row.gpt_percent || "");
+          const gap = escapeHtml(row.gap_percent || "");
+          const conf = escapeHtml(row.confidence_percent || "");
+          const predictionAge = escapeHtml(row.prediction_age || "");
+          const tickAge = escapeHtml(row.tick_age || "");
+          const volume = escapeHtml(row.volume || "");
+          const timeRemaining = escapeHtml(row.time_remaining || "");
+          const directionKey = escapeHtml(row.direction_key || "");
+          const direction = escapeHtml(row.direction || "");
+          return (
+            "<tr>" +
+            '<td><div class="title-stack">' +
+            `<a class="market-link" href="${marketUrl}">${marketLabel}</a>` +
+            `<a class="event-link" href="${eventUrl}">${eventTitle}</a>` +
+            "</div></td>" +
+            `<td class="mono">${kalshi}</td>` +
+            `<td class="mono">${gpt}</td>` +
+            `<td class="mono">${gap}</td>` +
+            `<td class="mono">${conf}</td>` +
+            `<td class="mono">${predictionAge}</td>` +
+            `<td class="mono">${tickAge}</td>` +
+            `<td class="mono">${volume}</td>` +
+            `<td class="mono">${timeRemaining}</td>` +
+            `<td><span class="pill ${directionKey}">${direction}</span></td>` +
+            "</tr>"
+          );
+        })
+        .join("");
+    }
+
+    function renderMarketTags(tags) {
+      if (!tags || !tags.length) {
+        return "";
+      }
+      return tags
+        .map((tag) => {
+          const label = escapeHtml(tag.label || "");
+          const url = escapeHtml(tag.url || "");
+          if (url) {
+            return `<a class="market-tag" href="${url}">${label}</a>`;
+          }
+          return `<span class="market-tag">${label}</span>`;
+        })
+        .join("");
+    }
+
+    function renderArbitrageRows(rows) {
+      const visible = rows || [];
+      if (!visible.length) {
+        return (
+          '<tr><td colspan="7" class="empty">' +
+          "No market arbitrage opportunities match these filters.</td></tr>"
+        );
+      }
+      return visible
+        .map((row) => {
+          const eventUrl = escapeHtml(row.event_url || "#");
+          const eventTitle = escapeHtml(row.event_title || "Unknown event");
+          const eventTicker = escapeHtml(row.event_ticker || "");
+          const eventCategory = escapeHtml(row.event_category || "");
+          const eventMeta = eventCategory ? `${eventTicker} · ${eventCategory}` : eventTicker;
+          const action = escapeHtml(row.arb_action || "");
+          const actionKey = escapeHtml(row.arb_action_key || "");
+          const edge = escapeHtml(row.edge_percent || "");
+          const sumYesAsk = escapeHtml(row.sum_yes_ask_percent || "");
+          const sumYesBid = escapeHtml(row.sum_yes_bid_percent || "");
+          const tickAge = escapeHtml(row.tick_age || "");
+          const marketTags = renderMarketTags(row.market_tags || []);
+          return (
+            "<tr>" +
+            '<td><div class="title-stack">' +
+            `<a class="market-link" href="${eventUrl}">${eventTitle}</a>` +
+            `<span class="event-link">${escapeHtml(eventMeta)}</span>` +
+            "</div></td>" +
+            `<td><span class="pill ${actionKey}">${action}</span></td>` +
+            `<td class="mono">${edge}</td>` +
+            `<td class="mono">${sumYesAsk}</td>` +
+            `<td class="mono">${sumYesBid}</td>` +
+            `<td><div class="market-tags">${marketTags}</div></td>` +
+            `<td class="mono">${tickAge}</td>` +
+            "</tr>"
+          );
+        })
+        .join("");
+    }
+
+    function updateStats(payload) {
+      const totals = payload.totals || {};
+      const rows = payload.rows || {};
+      const paging = payload.paging || {};
+      const limit = Number(payload.limit) || 0;
+
+      const activeTotalEl = document.getElementById("portal-active-total");
+      const closedTotalEl = document.getElementById("portal-closed-total");
+      const scheduledTotalEl = document.getElementById("portal-scheduled-total");
+      if (activeTotalEl) {
+        activeTotalEl.textContent = totals.active ?? 0;
+      }
+      if (closedTotalEl) {
+        closedTotalEl.textContent = totals.closed ?? 0;
+      }
+      if (scheduledTotalEl) {
+        scheduledTotalEl.textContent = totals.scheduled ?? 0;
+      }
+
+      const activeShown = (Number(paging.active_page) || 0) * limit + (rows.active || []).length;
+      const closedShown = (Number(paging.closed_page) || 0) * limit + (rows.closed || []).length;
+      const scheduledShown =
+        (Number(paging.scheduled_page) || 0) * limit + (rows.scheduled || []).length;
+
+      const activeMetaEl = document.getElementById("portal-active-meta");
+      if (activeMetaEl) {
+        activeMetaEl.textContent = `Showing ${activeShown} of ${totals.active ?? 0}`;
+      }
+      const closedMetaEl = document.getElementById("portal-closed-meta");
+      if (closedMetaEl) {
+        closedMetaEl.textContent = `Showing ${closedShown} of ${totals.closed ?? 0}`;
+      }
+      const closedFilled = totals.closed_filled ?? 0;
+      const closedFilledEl = document.getElementById("portal-closed-filled");
+      if (closedFilledEl) {
+        closedFilledEl.textContent = `Filled ${closedFilled} of ${totals.closed ?? 0}`;
+      }
+      const closedFilledSummary = document.getElementById("portal-closed-filled-summary");
+      if (closedFilledSummary) {
+        closedFilledSummary.textContent = `Filled ${closedFilled} of ${totals.closed ?? 0}`;
+      }
+      const scheduledMetaEl = document.getElementById("portal-scheduled-meta");
+      if (scheduledMetaEl) {
+        scheduledMetaEl.textContent = `Showing ${scheduledShown} of ${totals.scheduled ?? 0}`;
+      }
+    }
+
+    function updateLoadMore(id, link, hasMore) {
+      const row = document.getElementById(id);
+      if (!row) {
+        return;
+      }
+      if (hasMore) {
+        row.style.display = "";
+        const anchor = row.querySelector("a");
+        if (anchor && link) {
+          anchor.setAttribute("href", link);
+        }
+      } else {
+        row.style.display = "none";
+      }
+    }
+
+    function renderHealth(health) {
+      if (!health) {
+        return "";
+      }
+      const discovery = health.discovery || {};
+      const heartbeat = discovery.heartbeat || null;
+      const backfill = health.backfill || {};
+      const ws = health.ws || {};
+      const rag = health.rag || {};
+      const lastTick = health.last_tick || {};
+      const queue = health.queue || {};
+
+      const parts = [];
+      parts.push(
+        '<div class="health-card">' +
+          '<div class="health-label">Discovery</div>' +
+          `<div class="health-value status-${escapeHtml(discovery.status)}">${escapeHtml(
+            discovery.display
+          )}</div>` +
+          `<div class="health-meta">Last run ${escapeHtml(discovery.age_text)}</div>`
+      );
+      if (heartbeat && heartbeat.age_text) {
+        parts.push(`<div class="health-meta">Heartbeat ${escapeHtml(heartbeat.age_text)}</div>`);
+      }
+      parts.push("</div>");
+
+      parts.push(
+        '<div class="health-card">' +
+          '<div class="health-label">Backfill</div>' +
+          `<div class="health-value status-${escapeHtml(backfill.status)}">${escapeHtml(
+            backfill.display
+          )}</div>` +
+          `<div class="health-meta">Last run ${escapeHtml(backfill.age_text)}</div>` +
+          "</div>"
+      );
+
+      parts.push(
+        '<div class="health-card">' +
+          '<div class="health-label">Websocket</div>' +
+          `<div class="health-value status-${escapeHtml(ws.status)}">${escapeHtml(
+            ws.label
+          )}</div>` +
+          `<div class="health-meta">Last tick ${escapeHtml(lastTick.age_text)}</div>` +
+          "</div>"
+      );
+
+      parts.push(
+        '<div class="health-card">' +
+          '<div class="health-label">RAG</div>' +
+          `<div class="health-value status-${escapeHtml(rag.status)}">${escapeHtml(
+            rag.label
+          )}</div>` +
+          `<div class="health-meta">Last run ${escapeHtml(rag.age_text)} · 24h calls ${escapeHtml(
+            rag.call_count
+          )} / ${escapeHtml(rag.call_limit)}</div>` +
+          "</div>"
+      );
+
+      parts.push(
+        '<div class="health-card">' +
+          '<div class="health-label">Queue</div>' +
+          `<div class="health-value">${escapeHtml(queue.pending)} pending</div>` +
+          `<div class="health-meta">${escapeHtml(queue.running)} running · ${escapeHtml(
+            queue.workers
+          )} workers · ${escapeHtml(queue.failed)} failed</div>` +
+          "</div>"
+      );
+
+      return parts.join("");
+    }
+
+    function updateHealth(health) {
+      const el = document.getElementById("portal-health");
+      if (!el) {
+        return;
+      }
+      if (!health) {
+        el.style.display = "none";
+        return;
+      }
+      el.style.display = "";
+      el.innerHTML = renderHealth(health);
+    }
+
+    function updateError(errorText) {
+      const el = document.getElementById("portal-error");
+      if (!el) {
+        return;
+      }
+      if (!errorText) {
+        el.style.display = "none";
+        return;
+      }
+      el.style.display = "";
+      el.innerHTML =
+        '<div class="alert-title">Portal error</div>' +
+        `<div>${escapeHtml(errorText)}</div>`;
+    }
+
+    function updateOpportunitiesError(errorText) {
+      const el = document.getElementById("opps-error");
+      if (!el) {
+        return;
+      }
+      if (!errorText) {
+        el.style.display = "none";
+        return;
+      }
+      el.style.display = "";
+      el.innerHTML =
+        '<div class="alert-title">Opportunity query error</div>' +
+        `<div>${escapeHtml(errorText)}</div>`;
+    }
+
+    function patchPortal(payload) {
+      if (!payload || typeof payload !== "object") {
+        return false;
+      }
+      const refreshedEl = document.getElementById("portal-refreshed");
+      if (refreshedEl && payload.refreshed_at) {
+        refreshedEl.textContent = `Refreshed ${payload.refreshed_at}`;
+      }
+      updateStats(payload);
+      updateHealth(payload.health);
+      updateError(payload.error);
+      const categoryPills = document.getElementById("portal-category-pills");
+      if (categoryPills && payload.category_filters !== undefined) {
+        categoryPills.innerHTML = renderCategoryFilters(payload.category_filters || []);
+      }
+
+      const rows = payload.rows || {};
+      const activeBody = document.getElementById("portal-active-body");
+      const scheduledBody = document.getElementById("portal-scheduled-body");
+      const closedBody = document.getElementById("portal-closed-body");
+      if (!activeBody || !scheduledBody || !closedBody) {
+        return false;
+      }
+      activeBody.innerHTML = renderActiveRows(rows.active || []);
+      scheduledBody.innerHTML = renderScheduledRows(rows.scheduled || []);
+      closedBody.innerHTML = renderClosedRows(rows.closed || []);
+      wireRowLinks(activeBody);
+      wireRowLinks(scheduledBody);
+      wireRowLinks(closedBody);
+
+      const hasMore = payload.has_more || {};
+      const links = payload.load_more_links || {};
+      updateLoadMore("portal-load-more-active", links.active, hasMore.active);
+      updateLoadMore("portal-load-more-scheduled", links.scheduled, hasMore.scheduled);
+      updateLoadMore("portal-load-more-closed", links.closed, hasMore.closed);
+      return true;
+    }
+
+    function renderStatusCards(cards) {
+      if (!cards || !cards.length) {
+        return "";
+      }
+      return cards
+        .map((card) => {
+          const title = escapeHtml(card.title || "");
+          const level = escapeHtml(card.level || "");
+          const label = escapeHtml(card.label || "");
+          const summary = escapeHtml(card.summary || "");
+          const details = card.details || [];
+          const detailsHtml = details.length
+            ? `<ul class="status-details">${details
+                .map((detail) => `<li>${escapeHtml(detail)}</li>`)
+                .join("")}</ul>`
+            : "";
+          return (
+            '<article class="status-card">' +
+            '<div class="card-header">' +
+            `<h2>${title}</h2>` +
+            `<span class="status-pill status-${level}">${label}</span>` +
+            "</div>" +
+            `<p class="status-summary">${summary}</p>` +
+            detailsHtml +
+            "</article>"
+          );
+        })
+        .join("");
+    }
+
+    function patchHealth(payload) {
+      if (!payload || typeof payload !== "object") {
+        return false;
+      }
+      const refreshedEl = document.getElementById("health-refreshed");
+      if (refreshedEl && payload.refreshed_at) {
+        refreshedEl.textContent = `Updated ${payload.refreshed_at}`;
+      }
+      const loggedInEl = document.getElementById("health-logged-in");
+      if (loggedInEl && payload.logged_in !== undefined) {
+        loggedInEl.textContent = `Logged in ${payload.logged_in ? "Yes" : "No"}`;
+      }
+      const grid = document.getElementById("health-status-grid");
+      if (!grid) {
+        return false;
+      }
+      grid.innerHTML = renderStatusCards(payload.status_cards || []);
+      return true;
+    }
+
+    function patchOpportunities(payload) {
+      if (!payload || typeof payload !== "object") {
+        return false;
+      }
+      const view = payload.view || "model";
+      const opportunityRows = payload.opportunities || [];
+      const arbitrageRows = payload.arbitrage || [];
+      const refreshedEl = document.getElementById("opps-refreshed");
+      if (refreshedEl && payload.refreshed_at) {
+        refreshedEl.textContent = `Refreshed ${payload.refreshed_at}`;
+      }
+      const countEl = document.getElementById("opps-count");
+      const activeRows = view === "arbitrage" ? arbitrageRows : opportunityRows;
+      const count = payload.count ?? activeRows.length;
+      if (countEl) {
+        countEl.textContent = `Showing ${count} rows`;
+      }
+      updateOpportunitiesError(payload.error);
+      if (view === "arbitrage") {
+        const arbBody = document.getElementById("arb-body");
+        if (!arbBody) {
+          return false;
+        }
+        arbBody.innerHTML = renderArbitrageRows(arbitrageRows);
+      } else {
+        const oppBody = document.getElementById("opps-body");
+        if (!oppBody) {
+          return false;
+        }
+        oppBody.innerHTML = renderOpportunityRows(opportunityRows);
+      }
+      return true;
+    }
+
+    function detectPage() {
+      if (isPortalPage()) {
+        return "portal";
+      }
+      if (isOpportunitiesPage()) {
+        return "opportunities";
+      }
+      if (isHealthPage()) {
+        return "health";
+      }
+      return null;
+    }
+
+    function refreshPageData() {
+      if (refreshInFlight) {
+        return;
+      }
+      const page = detectPage();
+      if (!page) {
+        window.location.reload();
+        return;
+      }
+      refreshInFlight = true;
+      const baseUrl =
+        page === "portal"
+          ? "/portal/data"
+          : page === "opportunities"
+            ? "/opportunities/data"
+            : "/health/data";
+      const dataUrl = `${baseUrl}${window.location.search || ""}`;
+      fetch(dataUrl, {
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+        },
+      })
+        .then((resp) => {
+          if (!resp.ok) {
+            throw new Error("data fetch failed");
+          }
+          return resp.json();
+        })
+        .then((payload) => {
+          const patched =
+            page === "portal"
+              ? patchPortal(payload)
+              : page === "opportunities"
+                ? patchOpportunities(payload)
+                : patchHealth(payload);
+          if (!patched) {
+            window.location.reload();
+          }
+        })
+        .catch(() => {
+          window.location.reload();
+        })
+        .finally(() => {
+          refreshInFlight = false;
+        });
+    }
+
     function scheduleReload() {
       if (refreshTimer) {
         return;
@@ -43,7 +649,7 @@
         }
         pendingRefresh = false;
         markReload();
-        window.location.reload();
+        refreshPageData();
       }, waitMs);
     }
 
@@ -61,18 +667,55 @@
       }, quietWindowMs);
     }
 
-    const source = new EventSource(streamUrl);
-    source.addEventListener("queue", requestRefresh);
-    source.addEventListener("ping", () => {});
-    source.addEventListener("error", () => {
-      // EventSource handles reconnects automatically.
-    });
+    window.portalRefreshData = refreshPageData;
+
+    let source = null;
+
+    function closeStream() {
+      if (!source) {
+        return;
+      }
+      try {
+        source.close();
+      } catch (err) {
+        // Ignore shutdown errors.
+      }
+      source = null;
+    }
+
+    function openStream() {
+      if (!streamEnabled || !("EventSource" in window)) {
+        return;
+      }
+      if (source) {
+        return;
+      }
+      source = new EventSource(streamUrl);
+      source.addEventListener("queue", requestRefresh);
+      source.addEventListener("ping", () => {});
+      source.addEventListener("error", () => {
+        // EventSource handles reconnects automatically.
+      });
+    }
+
+    if (!streamEnabled || !("EventSource" in window)) {
+      return;
+    }
+
+    openStream();
 
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden && pendingRefresh) {
         scheduleReload();
       }
     });
+
+    window.addEventListener("pagehide", () => {
+      closeStream();
+    });
+
+    window.addEventListener("pageshow", () => {
+      openStream();
+    });
   })();
 </script>
-{% endif %}

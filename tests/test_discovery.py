@@ -2,6 +2,7 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
+import importlib
 
 from _test_utils import add_src_to_path, ensure_kalshi_sdk_stub, ensure_psycopg_stub
 
@@ -9,7 +10,7 @@ ensure_psycopg_stub()
 add_src_to_path()
 ensure_kalshi_sdk_stub()
 
-import src.jobs.discovery as discovery
+discovery = importlib.import_module("src.jobs.discovery")
 
 
 class TestDiscoveryPass(unittest.TestCase):
@@ -282,6 +283,27 @@ class TestDiscoveryHelpers(unittest.TestCase):
             {"updated_since": last_dt.isoformat()},
         )
 
+    def test_updated_since_override_unknown(self) -> None:
+        last_dt = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        with patch.dict(os.environ, {"DISCOVERY_UPDATED_SINCE_PARAM": "mystery"}), \
+             patch("src.jobs.discovery.logger.warning") as warn:
+            result = discovery._updated_since_override(last_dt)
+        self.assertEqual(result, {})
+        warn.assert_called_once()
+
+    def test_updated_since_override_known_values(self) -> None:
+        last_dt = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        with patch.dict(os.environ, {"DISCOVERY_UPDATED_SINCE_PARAM": "updated_after"}):
+            self.assertEqual(
+                discovery._updated_since_override(last_dt),
+                {"updated_after": last_dt.isoformat()},
+            )
+        with patch.dict(os.environ, {"DISCOVERY_UPDATED_SINCE_PARAM": "updated_since"}):
+            self.assertEqual(
+                discovery._updated_since_override(last_dt),
+                {"updated_since": last_dt.isoformat()},
+            )
+
     def test_parse_discovery_cursor(self) -> None:
         self.assertIsNone(discovery._parse_discovery_cursor(None))
         ts = 1_700_000_000
@@ -313,6 +335,302 @@ class TestDiscoveryHelpers(unittest.TestCase):
         with patch("src.jobs.discovery.get_market_updated_at", return_value=last_dt + timedelta(seconds=1)):
             self.assertFalse(discovery._should_skip_market(object(), market_db, last_dt))
         self.assertFalse(discovery._should_skip_market(object(), {}, last_dt))
+
+    def test_should_skip_event_and_market_without_cursor(self) -> None:
+        event = {"updated_time": 1700000000}
+        market = {"updated_time": 1700000000}
+        self.assertFalse(discovery._should_skip_event(object(), event, None))
+        self.assertFalse(discovery._should_skip_market(object(), market, None))
+
+    def test_upsert_active_market_wrapper_kwargs(self) -> None:
+        with patch("src.jobs.discovery.maybe_upsert_active_market_from_market", return_value=True) as upsert:
+            result = discovery.upsert_active_market(
+                object(),
+                ticker="M1",
+                event_ticker="EV1",
+            )
+        self.assertTrue(result)
+        upsert.assert_called_once_with(
+            unittest.mock.ANY,
+            {"ticker": "M1", "event_ticker": "EV1"},
+        )
+
+    def test_market_is_active_status_and_time(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.assertTrue(discovery._market_is_active({"status": "open"}, None, None))
+        self.assertTrue(discovery._market_is_active({"status": "paused"}, None, None))
+        self.assertFalse(discovery._market_is_active({"status": "closed"}, None, None))
+        self.assertTrue(
+            discovery._market_is_active(
+                {},
+                now - timedelta(days=1),
+                now + timedelta(days=1),
+            )
+        )
+        self.assertFalse(
+            discovery._market_is_active(
+                {},
+                now + timedelta(days=1),
+                None,
+            )
+        )
+        self.assertFalse(
+            discovery._market_is_active(
+                {},
+                None,
+                now - timedelta(days=1),
+            )
+        )
+
+
+class TestDiscoveryProcessMarket(unittest.TestCase):
+    def test_process_market_skips(self) -> None:
+        with patch("src.jobs.discovery._should_skip_market", return_value=True), \
+             patch("src.jobs.discovery.upsert_market") as upsert_market:
+            result = discovery._process_market(
+                object(),
+                {"ticker": "M1"},
+                datetime.now(timezone.utc),
+            )
+        self.assertEqual(result, (0, 0))
+        upsert_market.assert_not_called()
+
+    def test_process_market_inactive(self) -> None:
+        market = {"ticker": "M1", "status": "closed"}
+        with patch("src.jobs.discovery._should_skip_market", return_value=False), \
+             patch("src.jobs.discovery.parse_ts_iso", return_value=None), \
+             patch("src.jobs.discovery.upsert_market") as upsert_market, \
+             patch("src.jobs.discovery.upsert_active_market") as upsert_active_market:
+            result = discovery._process_market(object(), market, None)
+        self.assertEqual(result, (1, 0))
+        upsert_market.assert_called_once()
+        upsert_active_market.assert_not_called()
+
+    def test_process_market_active(self) -> None:
+        market = {
+            "ticker": "M1",
+            "event_ticker": "EV1",
+            "status": "open",
+            "open_time": "open",
+            "close_time": "close",
+        }
+        with patch("src.jobs.discovery._should_skip_market", return_value=False), \
+             patch("src.jobs.discovery.parse_ts_iso", side_effect=["open_dt", "close_dt"]), \
+             patch("src.jobs.discovery.upsert_market") as upsert_market, \
+             patch("src.jobs.discovery.upsert_active_market", return_value=True) as upsert_active_market:
+            result = discovery._process_market(object(), market, None)
+        self.assertEqual(result, (1, 1))
+        upsert_market.assert_called_once()
+        upsert_active_market.assert_called_once_with(
+            unittest.mock.ANY,
+            ticker="M1",
+            event_ticker="EV1",
+            open_time="open_dt",
+            close_time="close_dt",
+            status="open",
+        )
+
+
+class TestDiscoveryProcessEvent(unittest.TestCase):
+    def test_process_event_skips_when_filtered(self) -> None:
+        stats = discovery.EventScanStats()
+        event = {"event_ticker": "EV1", "markets": []}
+        with patch("src.jobs.discovery.accept_event", return_value=None), \
+             patch("src.jobs.discovery.upsert_event") as upsert_event:
+            result = discovery._process_event(object(), event, ("hour",), stats, None)
+        self.assertEqual(result, (0, 0, 0))
+        upsert_event.assert_not_called()
+
+    def test_process_event_upsert_error_returns_zero(self) -> None:
+        stats = discovery.EventScanStats()
+        event = {"event_ticker": "EV1", "markets": []}
+        with patch("src.jobs.discovery.accept_event", return_value="hour"), \
+             patch("src.jobs.discovery._should_skip_event", return_value=False), \
+             patch("src.jobs.discovery.upsert_event", side_effect=RuntimeError("boom")), \
+             patch("src.jobs.discovery._handle_event_upsert_error", return_value=False):
+            result = discovery._process_event(object(), event, ("hour",), stats, None)
+        self.assertEqual(result, (0, 0, 0))
+
+    def test_process_event_raises_on_event_upsert_error(self) -> None:
+        stats = discovery.EventScanStats()
+        event = {"event_ticker": "EV1", "markets": []}
+        with patch("src.jobs.discovery.accept_event", return_value="hour"), \
+             patch("src.jobs.discovery._should_skip_event", return_value=False), \
+             patch("src.jobs.discovery.upsert_event", side_effect=RuntimeError("boom")), \
+             patch("src.jobs.discovery._handle_event_upsert_error", return_value=True):
+            with self.assertRaises(RuntimeError):
+                discovery._process_event(object(), event, ("hour",), stats, None)
+
+    def test_process_event_raises_on_market_upsert_error(self) -> None:
+        stats = discovery.EventScanStats()
+        event = {"event_ticker": "EV1", "markets": [{"ticker": "M1"}]}
+        with patch("src.jobs.discovery.accept_event", return_value="hour"), \
+             patch("src.jobs.discovery._should_skip_event", return_value=False), \
+             patch("src.jobs.discovery.upsert_event"), \
+             patch("src.jobs.discovery._process_market", side_effect=RuntimeError("boom")), \
+             patch("src.jobs.discovery._handle_market_upsert_error", return_value=True):
+            with self.assertRaises(RuntimeError):
+                discovery._process_event(object(), event, ("hour",), stats, None)
+
+    def test_process_event_market_error_continues(self) -> None:
+        stats = discovery.EventScanStats()
+        event = {
+            "event_ticker": "EV1",
+            "markets": [{"ticker": "M1"}, {"ticker": "M2"}],
+        }
+        with patch("src.jobs.discovery.accept_event", return_value="hour"), \
+             patch("src.jobs.discovery._should_skip_event", return_value=False), \
+             patch("src.jobs.discovery.upsert_event") as upsert_event, \
+             patch(
+                 "src.jobs.discovery._process_market",
+                 side_effect=[RuntimeError("boom"), (1, 0)],
+             ) as process_market, \
+             patch("src.jobs.discovery._handle_market_upsert_error", return_value=False):
+            result = discovery._process_event(object(), event, ("hour",), stats, None)
+        self.assertEqual(result, (1, 1, 0))
+        upsert_event.assert_called_once()
+        self.assertEqual(process_market.call_count, 2)
+
+
+class TestDiscoveryEventStatus(unittest.TestCase):
+    def test_process_event_status_handles_event_errors(self) -> None:
+        class FakeHeartbeat:
+            def __init__(self):
+                self.calls = 0
+
+            def beat(self, *args, **kwargs):
+                self.calls += 1
+
+        heartbeat = FakeHeartbeat()
+        context = discovery.EventProcessContext(
+            conn=object(),
+            client=object(),
+            strike_periods=(),
+            stats=discovery.EventScanStats(),
+            last_discovery_dt=None,
+            updated_since_params={},
+            heartbeat=heartbeat,
+        )
+
+        def fake_iter_events(client, rate_limit_hook=None, **params):
+            if rate_limit_hook is not None:
+                rate_limit_hook(0.0)
+            return [{"event_ticker": "EV1"}]
+
+        with patch("src.jobs.discovery.iter_events", new=fake_iter_events), \
+             patch("src.jobs.discovery._process_event", side_effect=RuntimeError("boom")), \
+             patch("src.jobs.discovery._is_connection_error", return_value=False), \
+             patch("src.jobs.discovery._safe_rollback") as rollback, \
+             patch("src.jobs.discovery._log_metric") as log_metric:
+            result = discovery._process_event_status(context, "open")
+
+        self.assertEqual(result, (0, 0, 0))
+        self.assertGreaterEqual(heartbeat.calls, 2)
+        log_metric.assert_called_once()
+        rollback.assert_called_once()
+
+    def test_process_event_status_raises_on_connection_error(self) -> None:
+        class FakeHeartbeat:
+            def __init__(self):
+                self.calls = 0
+
+            def beat(self, *args, **kwargs):
+                self.calls += 1
+
+        context = discovery.EventProcessContext(
+            conn=object(),
+            client=object(),
+            strike_periods=(),
+            stats=discovery.EventScanStats(),
+            last_discovery_dt=None,
+            updated_since_params={},
+            heartbeat=FakeHeartbeat(),
+        )
+
+        def boom_iter_events(*_args, **_kwargs):
+            raise RuntimeError("boom")
+
+        with patch("src.jobs.discovery.iter_events", new=boom_iter_events), \
+             patch("src.jobs.discovery._is_connection_error", return_value=True), \
+             patch("src.jobs.discovery._safe_rollback") as rollback:
+            with self.assertRaises(RuntimeError):
+                discovery._process_event_status(context, "open")
+
+        rollback.assert_called_once()
+
+    def test_process_event_status_raises_on_event_connection_error(self) -> None:
+        class FakeHeartbeat:
+            def beat(self, *args, **kwargs):
+                return None
+
+        context = discovery.EventProcessContext(
+            conn=object(),
+            client=object(),
+            strike_periods=(),
+            stats=discovery.EventScanStats(),
+            last_discovery_dt=None,
+            updated_since_params={},
+            heartbeat=FakeHeartbeat(),
+        )
+
+        with patch("src.jobs.discovery.iter_events", return_value=[{"event_ticker": "EV1"}]), \
+             patch("src.jobs.discovery._process_event", side_effect=RuntimeError("boom")), \
+             patch("src.jobs.discovery._is_connection_error", return_value=True), \
+             patch("src.jobs.discovery._safe_rollback") as rollback:
+            with self.assertRaises(RuntimeError):
+                discovery._process_event_status(context, "open")
+
+        self.assertGreaterEqual(rollback.call_count, 1)
+
+    def test_process_event_status_accumulates_counts(self) -> None:
+        class FakeHeartbeat:
+            def beat(self, *args, **kwargs):
+                return None
+
+        context = discovery.EventProcessContext(
+            conn=object(),
+            client=object(),
+            strike_periods=(),
+            stats=discovery.EventScanStats(),
+            last_discovery_dt=None,
+            updated_since_params={},
+            heartbeat=FakeHeartbeat(),
+        )
+
+        events = [{"event_ticker": "EV1"}, {"event_ticker": "EV2"}]
+        with patch("src.jobs.discovery.iter_events", return_value=events), \
+             patch(
+                 "src.jobs.discovery._process_event",
+                 side_effect=[(1, 2, 3), (0, 1, 1)],
+             ):
+            result = discovery._process_event_status(context, "active")
+
+        self.assertEqual(result, (1, 3, 4))
+
+
+class TestDiscoveryContext(unittest.TestCase):
+    def test_build_discovery_context_logs_updated_since(self) -> None:
+        last_dt = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        with patch("src.jobs.discovery.get_state", return_value="raw"), \
+             patch("src.jobs.discovery._parse_discovery_cursor", return_value=last_dt), \
+             patch("src.jobs.discovery.env_int", return_value=60), \
+             patch("src.jobs.discovery.set_state") as set_state, \
+             patch(
+                 "src.jobs.discovery._build_updated_since_params",
+                 return_value={"updated_after_ts": 123},
+             ), \
+             patch("src.jobs.discovery.logger.info") as info:
+            context = discovery._build_discovery_context(object(), object(), ("hour",))
+
+        self.assertEqual(context.updated_since_params, {"updated_after_ts": 123})
+        set_state.assert_called_once()
+        self.assertTrue(
+            any(
+                call.args[:2]
+                == ("discovery_pass: using updated-since filter %s", {"updated_after_ts": 123})
+                for call in info.call_args_list
+            )
+        )
 
 
 class TestDiscoveryPassEdgeCases(unittest.TestCase):
@@ -427,4 +745,27 @@ class TestDiscoveryPassEdgeCases(unittest.TestCase):
             unittest.mock.ANY,
             "last_discovery_ts",
             unittest.mock.ANY,
+        )
+
+    def test_discovery_pass_logs_seeded_active_markets(self) -> None:
+        with patch("src.jobs.discovery.load_active_tickers", return_value=[]), \
+             patch("src.jobs.discovery.seed_active_markets_from_markets", return_value=2), \
+             patch("src.jobs.discovery._run_discovery", return_value=[0, 0, 0]), \
+             patch("src.jobs.discovery.cleanup_active_markets", return_value=0), \
+             patch("src.jobs.discovery.set_state"), \
+             patch("src.jobs.discovery.get_state", return_value=None), \
+             patch("src.jobs.discovery.logger.info") as info:
+            discovery.discovery_pass(
+                conn=object(),
+                client=object(),
+                strike_periods=("hour",),
+                event_statuses=("open",),
+            )
+
+        self.assertTrue(
+            any(
+                call.args[:2]
+                == ("discovery_pass: seeded active_markets from markets rows=%d", 2)
+                for call in info.call_args_list
+            )
         )

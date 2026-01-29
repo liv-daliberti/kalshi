@@ -6,13 +6,14 @@ import inspect
 import logging
 import os
 import time
+import functools
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 import psycopg  # pylint: disable=import-error
 
-from src.db.db import (
+from ..db.db import (
     cleanup_active_markets,
     get_event_updated_at,
     get_market_updated_at,
@@ -24,24 +25,27 @@ from src.db.db import (
     upsert_event,
     upsert_market,
 )
-from src.db.tickers import load_active_tickers
-from src.core.env_utils import env_int
-from src.core.guardrails import assert_service_role
-from src.core.loop_utils import log_metric as _log_metric
-from src.jobs.event_filter import EventScanStats, accept_event
-from src.jobs.job_utils import log_item_error as _log_item_error
-from src.kalshi.kalshi_sdk import iter_events
+from ..db.tickers import load_active_tickers
+from ..core.env_utils import env_int
+from ..core.guardrails import assert_service_role
+from ..core.loop_utils import log_metric as _log_metric
+from .event_filter import EventScanStats, accept_event
+from .job_utils import (
+    handle_event_upsert_error as _handle_event_upsert_error,
+    handle_market_upsert_error as _handle_market_upsert_error,
+    is_connection_error as _is_connection_error,
+    safe_rollback as _safe_rollback_fn,
+)
+from ..kalshi.kalshi_sdk import iter_events
 
 logger = logging.getLogger(__name__)
-
 _DISCOVERY_HEARTBEAT_KEY = "last_discovery_heartbeat_ts"
 
-
-def _safe_rollback(conn: psycopg.Connection) -> None:
-    try:
-        conn.rollback()
-    except Exception:  # pylint: disable=broad-exception-caught
-        logger.warning("discovery_pass: rollback failed")
+_safe_rollback = functools.partial(
+    _safe_rollback_fn,
+    logger=logger,
+    label="discovery_pass",
+)
 
 
 @dataclass
@@ -211,6 +215,44 @@ def _should_skip_market(
     return db_updated is not None and db_updated <= last_discovery_dt
 
 
+_ACTIVE_MARKET_STATUSES = {"open", "paused", "active"}
+
+
+def _market_is_active(
+    market: dict,
+    open_time: datetime | None,
+    close_time: datetime | None,
+) -> bool:
+    status = (market.get("status") or "").strip().lower()
+    if status in _ACTIVE_MARKET_STATUSES:
+        return True
+    if status:
+        return False
+    now = datetime.now(timezone.utc)
+    return (open_time is None or open_time <= now) and (
+        close_time is None or close_time > now
+    )
+
+
+def _upsert_event_or_skip(conn: psycopg.Connection, event: dict) -> bool:
+    event_ticker = event.get("event_ticker") if isinstance(event, dict) else None
+    try:
+        upsert_event(conn, event)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        if _handle_event_upsert_error(
+            logger=logger,
+            metric_name="discovery.item_error",
+            event_ticker=event_ticker,
+            rollback=_safe_rollback,
+            conn=conn,
+            exc=exc,
+            source="discovery_pass",
+        ):
+            raise
+        return False
+    return True
+
+
 def _process_market(
     conn: psycopg.Connection,
     market: dict,
@@ -220,8 +262,31 @@ def _process_market(
     if _should_skip_market(conn, market, last_discovery_dt):
         return 0, 0
     upsert_market(conn, market)
-    active = maybe_upsert_active_market_from_market(conn, market)
+    open_time = parse_ts_iso(market.get("open_time"))
+    close_time = parse_ts_iso(market.get("close_time"))
+    is_active = _market_is_active(market, open_time, close_time)
+    if not is_active:
+        return 1, 0
+    active = upsert_active_market(
+        conn,
+        ticker=market.get("ticker"),
+        event_ticker=market.get("event_ticker"),
+        open_time=open_time,
+        close_time=close_time,
+        status=market.get("status"),
+    )
     return 1, 1 if active else 0
+
+
+def upsert_active_market(
+    conn: psycopg.Connection,
+    market: dict | None = None,
+    **kwargs,
+) -> bool:
+    """Backward-compatible active market upsert wrapper."""
+    if market is None:
+        market = dict(kwargs)
+    return maybe_upsert_active_market_from_market(conn, market)
 
 
 def _process_event(
@@ -236,22 +301,7 @@ def _process_event(
         return 0, 0, 0
     if _should_skip_event(conn, event, last_discovery_dt):
         return 0, 0, 0
-    try:
-        upsert_event(conn, event)
-    except Exception:  # pylint: disable=broad-exception-caught
-        logger.exception(
-            "discovery_pass: event upsert failed event_ticker=%s",
-            event.get("event_ticker"),
-        )
-        _log_item_error(
-            logger,
-            "discovery.item_error",
-            kind="event_upsert",
-            event_ticker=event.get("event_ticker"),
-            market_ticker=None,
-            rollback=_safe_rollback,
-            conn=conn,
-        )
+    if not _upsert_event_or_skip(conn, event):
         return 0, 0, 0
     markets = event.get("markets") or []
     market_updates = active_updates = 0
@@ -262,21 +312,18 @@ def _process_event(
                 market,
                 last_discovery_dt,
             )
-        except Exception:  # pylint: disable=broad-exception-caught
-            logger.exception(
-                "discovery_pass: market upsert failed event=%s market=%s",
-                event.get("event_ticker"),
-                market.get("ticker"),
-            )
-            _log_item_error(
-                logger,
-                "discovery.item_error",
-                kind="market_upsert",
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            if _handle_market_upsert_error(
+                logger=logger,
+                metric_name="discovery.item_error",
                 event_ticker=event.get("event_ticker"),
                 market_ticker=market.get("ticker"),
                 rollback=_safe_rollback,
                 conn=conn,
-            )
+                exc=exc,
+                source="discovery_pass",
+            ):
+                raise
             continue
         else:
             market_updates += market_delta
@@ -314,7 +361,9 @@ def _process_event_status(
                     context.stats,
                     context.last_discovery_dt,
                 )
-            except Exception:  # pylint: disable=broad-exception-caught
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                if _is_connection_error(context.conn, exc):
+                    raise
                 logger.exception(
                     "discovery_pass: event processing failed event_ticker=%s",
                     event.get("event_ticker"),
@@ -329,7 +378,10 @@ def _process_event_status(
                 continue
             for idx, delta in enumerate(deltas):
                 counts[idx] += delta
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        if _is_connection_error(context.conn, exc):
+            _safe_rollback(context.conn)
+            raise
         logger.exception(
             "discovery_pass: events query failed (status=%s mapped=%s)",
             event_status,

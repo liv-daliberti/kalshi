@@ -7,13 +7,14 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import ModuleType
 from unittest.mock import Mock, patch
+import importlib
 
 from _test_utils import add_src_to_path, ensure_psycopg_stub
 
 ensure_psycopg_stub()
 add_src_to_path()
 
-import src.predictions.predictions as predictions
+predictions = importlib.import_module("src.predictions.predictions")
 
 
 class FakeCursor:
@@ -270,6 +271,30 @@ class TestPredictionHelpers(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].event_ticker, "EV1")
 
+    def test_fetch_candidate_events_skips_future_or_missing_open_time(self) -> None:
+        now = datetime.now(timezone.utc)
+        rows = [
+            {
+                "event_ticker": "EV1",
+                "event_title": "Title",
+                "strike_period": "hour",
+                "open_time": None,
+                "close_time": now,
+                "last_prediction_ts": None,
+            },
+            {
+                "event_ticker": "EV2",
+                "event_title": "Future",
+                "strike_period": "day",
+                "open_time": now + timedelta(days=1),
+                "close_time": now + timedelta(days=2),
+                "last_prediction_ts": None,
+            },
+        ]
+        conn = FakeConn(rows=rows)
+        events = predictions._fetch_candidate_events(conn, limit=2)
+        self.assertEqual(events, [])
+
     def test_fetch_event_metadata(self) -> None:
         row = {"event_ticker": "EV1", "title": "Title"}
         conn = FakeConn(row=row)
@@ -293,6 +318,9 @@ class TestPredictionHelpers(unittest.TestCase):
         conn = FakeConn(rows=[{"id": 1}, {"id": 2}])
         docs = predictions._fetch_rag_documents(conn, "EV1", ["M1"], 2)
         self.assertEqual([doc["id"] for doc in docs], [1, 2])
+
+    def test_has_volume_value_na(self) -> None:
+        self.assertFalse(predictions._has_volume_value({"volume": " N/A "}))
 
     def test_load_handler(self) -> None:
         module = ModuleType("mod")
@@ -348,6 +376,98 @@ class TestPredictionHelpers(unittest.TestCase):
         self.assertEqual(len(preds), 2)
         self.assertEqual(preds[0]["market_ticker"], "M1")
         self.assertEqual(preds[0]["predicted_yes_prob"], Decimal("0.200000"))
+
+    def test_prediction_heartbeat_success(self) -> None:
+        class FakeWaitEvent:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def wait(self, _interval: float) -> bool:
+                self.calls += 1
+                return self.calls > 1
+
+        class ConnContext:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        stop_event = FakeWaitEvent()
+        with patch("src.predictions.predictions.psycopg.connect", return_value=ConnContext()), \
+             patch("src.predictions.predictions.set_state") as set_state:
+            predictions._prediction_heartbeat("db://", 0.1, stop_event)
+        set_state.assert_called_once()
+        self.assertGreaterEqual(stop_event.calls, 2)
+
+    def test_prediction_heartbeat_logs_exception(self) -> None:
+        class FakeWaitEvent:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def wait(self, _interval: float) -> bool:
+                self.calls += 1
+                return self.calls > 1
+
+        stop_event = FakeWaitEvent()
+        with patch("src.predictions.predictions.psycopg.connect", side_effect=RuntimeError("boom")), \
+             patch.object(predictions.logger, "exception") as log_exc:
+            predictions._prediction_heartbeat("db://", 0.1, stop_event)
+        log_exc.assert_called_once()
+
+    def test_start_stop_prediction_heartbeat(self) -> None:
+        class FakeThread:
+            def __init__(self, *args, **kwargs) -> None:
+                self.args = args
+                self.kwargs = kwargs
+                self.started = False
+                self.joined = False
+                self.join_timeout = None
+
+            def start(self) -> None:
+                self.started = True
+
+            def join(self, timeout=None) -> None:
+                self.joined = True
+                self.join_timeout = timeout
+
+        class FakeStopEvent:
+            def __init__(self) -> None:
+                self.set_called = False
+
+            def set(self) -> None:
+                self.set_called = True
+
+        with patch("src.predictions.predictions.threading.Thread", FakeThread):
+            stop_event, thread = predictions._start_prediction_heartbeat("db://", 1.0)
+        self.assertIsNotNone(stop_event)
+        self.assertTrue(thread.started)
+        self.assertIs(thread.kwargs["target"], predictions._prediction_heartbeat)
+
+        fake_stop = FakeStopEvent()
+        fake_thread = FakeThread()
+        predictions._stop_prediction_heartbeat(fake_stop, fake_thread, 2.5)
+        self.assertTrue(fake_stop.set_called)
+        self.assertTrue(fake_thread.joined)
+        self.assertEqual(fake_thread.join_timeout, 2.5)
+
+    def test_prepare_prediction_inputs_missing_tickers(self) -> None:
+        now = datetime.now(timezone.utc)
+        event = predictions.PredictionEvent(
+            event_ticker="EV1",
+            event_title="Title",
+            strike_period="hour",
+            open_time=None,
+            close_time=None,
+            last_prediction_ts=None,
+        )
+        task = predictions.PredictionTask(event=event, interval_minutes=10, now=now)
+        cfg = _cfg()
+        with patch("src.predictions.predictions._fetch_event_metadata", return_value={"event_ticker": "EV1"}), \
+             patch("src.predictions.predictions._fetch_event_markets", return_value=[{"volume": 1}]), \
+             patch("src.predictions.predictions._fetch_rag_documents") as fetch_docs:
+            self.assertIsNone(predictions._prepare_prediction_inputs(Mock(), cfg, task))
+        fetch_docs.assert_not_called()
 
 
 class TestPredictionPass(unittest.TestCase):

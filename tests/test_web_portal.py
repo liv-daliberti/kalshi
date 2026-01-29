@@ -1,3 +1,5 @@
+import base64
+import itertools
 import json
 import os
 import runpy
@@ -8,13 +10,22 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, mock_open, patch
+import importlib
 
 from _test_utils import add_src_to_path, ensure_psycopg_stub
 
 ensure_psycopg_stub()
 add_src_to_path()
 
-import src.web_portal as web_portal
+web_portal = importlib.import_module("src.web_portal")
+portal_db = importlib.import_module("src.web_portal.db")
+portal_health = importlib.import_module("src.web_portal.health_utils")
+portal_event_series = importlib.import_module("src.web_portal.db_event_series")
+opportunities_routes = importlib.import_module("src.web_portal.routes.opportunities")
+event_routes = importlib.import_module("src.web_portal.routes.event")
+stream_routes = importlib.import_module("src.web_portal.routes.stream")
+portal_db_pool = importlib.import_module("src.web_portal.db_pool")
+market_metadata = importlib.import_module("src.web_portal.market_metadata")
 
 
 class TestPortalParsing(unittest.TestCase):
@@ -76,7 +87,7 @@ class TestPortalParsing(unittest.TestCase):
         self.assertIn("LOWER(e.category)", where_sql)
         self.assertEqual(len(params), 7)
         order_by = web_portal._build_order_by("title", "desc", "close_time", "asc")
-        self.assertIn("e.title", order_by)
+        self.assertIn("event_title", order_by)
         params_dict = web_portal._build_filter_params(10, filters)
         self.assertEqual(params_dict["limit"], 10)
         self.assertEqual(params_dict["category"], ["A", "B"])
@@ -252,23 +263,24 @@ class TestPortalFormatting(unittest.TestCase):
     def test_misc_formatters(self) -> None:
         self.assertEqual(web_portal.fmt_num(1200), "1,200")
         self.assertEqual(web_portal.fmt_num("nope"), "nope")
+        self.assertEqual(web_portal.fmt_num(True), "1")
         self.assertEqual(web_portal.fmt_bool(None), "N/A")
         self.assertEqual(web_portal.fmt_bool(0), "No")
         expected = json.dumps({"b": 1, "a": 2}, indent=2, sort_keys=True, ensure_ascii=True)
         self.assertEqual(web_portal.fmt_json({"b": 1, "a": 2}), expected)
         self.assertEqual(web_portal.fmt_json(None), "N/A")
         self.assertEqual(web_portal.fmt_json({1}), "{1}")
-        self.assertEqual(web_portal.fmt_outcome("50", None, None, None, None), "50")
-        self.assertEqual(web_portal.fmt_outcome(None, "0.5", None, None, None), "0.5")
-        self.assertEqual(web_portal.fmt_outcome("bad", None, None, None, None), "Pending")
+        self.assertEqual(web_portal.fmt_outcome("50", None), "50")
+        self.assertEqual(web_portal.fmt_outcome(None, "0.5"), "0.5")
+        self.assertEqual(web_portal.fmt_outcome("bad", None), "Pending")
 
 
 class TestPortalLabels(unittest.TestCase):
     def test_outcome_and_labels(self) -> None:
-        self.assertEqual(web_portal.fmt_outcome(100, None, None, None, None), "YES")
-        self.assertEqual(web_portal.fmt_outcome(0, None, None, None, None), "NO")
-        self.assertEqual(web_portal.fmt_outcome(None, "1", None, None, None), "YES")
-        self.assertEqual(web_portal.fmt_outcome(None, None, None, None, None), "Pending")
+        self.assertEqual(web_portal.fmt_outcome(100, None), "YES")
+        self.assertEqual(web_portal.fmt_outcome(0, None), "NO")
+        self.assertEqual(web_portal.fmt_outcome(None, "1"), "YES")
+        self.assertEqual(web_portal.fmt_outcome(None, None), "Pending")
         row = {"market_title": "Title", "market_subtitle": "Sub", "ticker": "M1"}
         self.assertEqual(web_portal._market_label(row), "Sub")
         self.assertTrue(web_portal._settlement_is_yes(100, None))
@@ -277,8 +289,8 @@ class TestPortalLabels(unittest.TestCase):
         self.assertEqual(web_portal._market_label(row), "M1")
 
     def test_outcome_dollars_invalid(self) -> None:
-        self.assertEqual(web_portal.fmt_outcome(None, "bad", None, None, None), "Pending")
-        self.assertEqual(web_portal.fmt_outcome(None, "0.0000", None, None, None), "NO")
+        self.assertEqual(web_portal.fmt_outcome(None, "bad"), "Pending")
+        self.assertEqual(web_portal.fmt_outcome(None, "0.0000"), "NO")
         self.assertFalse(web_portal._settlement_is_yes("bad", None))
         self.assertFalse(web_portal._settlement_is_yes(None, "bad"))
 
@@ -321,6 +333,13 @@ class TestPortalLabels(unittest.TestCase):
         row = {"price_dollars": "0.45"}
         yes_price, _, _ = web_portal._derive_yes_price(row, True)
         self.assertEqual(yes_price, Decimal("0.45"))
+
+    def test_closed_market_yes_price_settlement_paths(self) -> None:
+        self.assertEqual(
+            web_portal._closed_market_yes_price({"settlement_value_dollars": "0.4"}),
+            Decimal("0.4"),
+        )
+        self.assertIsNone(web_portal._closed_market_yes_price({}))
 
     def test_event_outcome_label(self) -> None:
         label = web_portal._format_event_outcome_label(["A"], None, False)
@@ -371,6 +390,31 @@ class TestPortalLabels(unittest.TestCase):
         label = web_portal._compute_event_outcome_label(rows, False)
         self.assertIn("Leading: Leader", label)
 
+    def test_compute_event_outcome_label_leader_updates(self) -> None:
+        now = datetime.now(timezone.utc)
+        rows = [
+            {
+                "market_title": "Low",
+                "settlement_value": None,
+                "settlement_value_dollars": None,
+                "market_open_time": now - timedelta(hours=1),
+                "market_close_time": now + timedelta(hours=1),
+                "yes_bid_dollars": "0.2",
+                "yes_ask_dollars": "0.3",
+            },
+            {
+                "market_title": "High",
+                "settlement_value": None,
+                "settlement_value_dollars": None,
+                "market_open_time": now - timedelta(hours=1),
+                "market_close_time": now + timedelta(hours=1),
+                "yes_bid_dollars": "0.7",
+                "yes_ask_dollars": "0.8",
+            },
+        ]
+        label = web_portal._compute_event_outcome_label(rows, False)
+        self.assertIn("Leading: High", label)
+
     def test_yes_price_closed_market_fallbacks(self) -> None:
         row = {
             "yes_bid_dollars": "0",
@@ -401,6 +445,7 @@ class TestPortalUrlsAndTime(unittest.TestCase):
         self.assertEqual(web_portal.derive_series_ticker(None), "")
         self.assertIsNone(web_portal.get_market_url(None))
         self.assertIsNone(web_portal.get_event_url(None, None, None))
+        self.assertEqual(web_portal.get_market_url("M1"), "https://kalshi.com/markets/m1")
         url = web_portal.get_market_url("M1", event_ticker="EV-123", event_title=None)
         self.assertIn("/ev/ev-123/m1", url)
         with patch.dict(
@@ -532,6 +577,11 @@ class DummyCursor:
 
     def fetchone(self):
         return self.row
+
+    def fetchall(self):
+        if isinstance(self.row, list):
+            return self.row
+        return []
 
     def __enter__(self):
         return self
@@ -675,11 +725,24 @@ class SequenceConn:
 
 class TestPortalDbPool(unittest.TestCase):
     def setUp(self) -> None:
-        self._db_pool = web_portal._DB_POOL
-        web_portal._DB_POOL = None
+        self._db_pool = portal_db_pool._DB_POOL
+        self._portal_module = portal_db_pool._portal_module()
+        self._portal_db_pool_set = False
+        self._portal_db_pool = None
+        if self._portal_module is not None:
+            if hasattr(self._portal_module, "_DB_POOL"):
+                self._portal_db_pool_set = True
+                self._portal_db_pool = getattr(self._portal_module, "_DB_POOL")
+            setattr(self._portal_module, "_DB_POOL", None)
+        portal_db_pool._DB_POOL = None
 
     def tearDown(self) -> None:
-        web_portal._DB_POOL = self._db_pool
+        portal_db_pool._DB_POOL = self._db_pool
+        if self._portal_module is not None:
+            if self._portal_db_pool_set:
+                setattr(self._portal_module, "_DB_POOL", self._portal_db_pool)
+            elif hasattr(self._portal_module, "_DB_POOL"):
+                delattr(self._portal_module, "_DB_POOL")
 
     def test_db_pool_sizes_and_timeout(self) -> None:
         with patch.dict(
@@ -690,12 +753,12 @@ class TestPortalDbPool(unittest.TestCase):
                 "WEB_DB_POOL_TIMEOUT": "0",
             },
         ):
-            self.assertEqual(web_portal._db_pool_sizes(), (5, 5))
-            self.assertEqual(web_portal._db_pool_timeout(), 0.1)
+            self.assertEqual(portal_db_pool._db_pool_sizes(), (5, 5))
+            self.assertEqual(portal_db_pool._db_pool_timeout(), 0.1)
 
     def test_get_db_pool_disabled(self) -> None:
         with patch.dict(os.environ, {"WEB_DB_POOL_ENABLE": "0"}):
-            self.assertIsNone(web_portal._get_db_pool("postgres://example"))
+            self.assertIsNone(portal_db_pool._get_db_pool("postgres://example"))
 
     def test_get_db_pool_builds_once(self) -> None:
         class FakePool:
@@ -714,29 +777,29 @@ class TestPortalDbPool(unittest.TestCase):
                 "WEB_DB_POOL_TIMEOUT": "1.5",
             },
         ):
-            with patch.object(web_portal, "ConnectionPool", FakePool):
-                pool = web_portal._get_db_pool("postgres://example")
+            with patch.object(portal_db_pool, "ConnectionPool", FakePool):
+                pool = portal_db_pool._get_db_pool("postgres://example")
                 self.assertIsInstance(pool, FakePool)
                 self.assertEqual(pool.min_size, 2)
                 self.assertEqual(pool.max_size, 4)
                 self.assertEqual(pool.timeout, 1.5)
-                self.assertIs(web_portal._get_db_pool("postgres://example"), pool)
+                self.assertIs(portal_db_pool._get_db_pool("postgres://example"), pool)
 
     def test_get_db_pool_returns_existing_inside_lock(self) -> None:
         sentinel = object()
 
         class FakeLock:
             def __enter__(self):
-                web_portal._DB_POOL = sentinel
+                portal_db_pool._DB_POOL = sentinel
                 return self
 
             def __exit__(self, exc_type, exc, tb):
                 return False
 
         with patch.dict(os.environ, {"WEB_DB_POOL_ENABLE": "1"}):
-            with patch.object(web_portal, "_DB_POOL_LOCK", FakeLock()), \
-                 patch.object(web_portal, "ConnectionPool") as pool_cls:
-                pool = web_portal._get_db_pool("postgres://example")
+            with patch.object(portal_db_pool, "_DB_POOL_LOCK", FakeLock()), \
+                 patch.object(portal_db_pool, "ConnectionPool") as pool_cls:
+                pool = portal_db_pool._get_db_pool("postgres://example")
         self.assertIs(pool, sentinel)
         pool_cls.assert_not_called()
 
@@ -768,7 +831,7 @@ class TestPortalDbPool(unittest.TestCase):
         conn = DummyConn(autocommit=False)
         with patch.dict(os.environ, {"DATABASE_URL": "postgres://example"}):
             with patch.object(web_portal, "_get_db_pool", return_value=None):
-                with patch("src.web_portal.psycopg.connect", return_value=conn) as mocked:
+                with patch("src.web_portal.db_pool.psycopg.connect", return_value=conn) as mocked:
                     with web_portal._db_connection() as got:
                         self.assertIs(got, conn)
                     mocked.assert_called_with("postgres://example")
@@ -779,7 +842,7 @@ class TestPortalDbPool(unittest.TestCase):
         conn = DummyConn(autocommit=False)
         with patch.dict(os.environ, {"DATABASE_URL": "postgres://example"}):
             with patch.object(web_portal, "_get_db_pool", return_value=None):
-                with patch("src.web_portal.psycopg.connect", return_value=conn):
+                with patch("src.web_portal.db_pool.psycopg.connect", return_value=conn):
                     with self.assertRaises(RuntimeError):
                         with web_portal._db_connection():
                             raise RuntimeError("boom")
@@ -793,9 +856,9 @@ class TestPortalDbPool(unittest.TestCase):
                 raise RuntimeError("boom")
 
         with patch.dict(os.environ, {"WEB_DB_POOL_ENABLE": "1"}):
-            with patch.object(web_portal, "ConnectionPool", BadPool):
+            with patch.object(portal_db_pool, "ConnectionPool", BadPool):
                 with patch.object(web_portal.logger, "warning") as warn:
-                    pool = web_portal._get_db_pool("postgres://example")
+                    pool = portal_db_pool._get_db_pool("postgres://example")
         self.assertIsNone(pool)
         warn.assert_called_once()
 
@@ -809,7 +872,7 @@ class TestPortalDbPool(unittest.TestCase):
         conn = DummyConn(autocommit=False)
         with patch.dict(os.environ, {"DATABASE_URL": "postgres://example"}):
             with patch.object(web_portal, "_get_db_pool") as get_pool:
-                with patch("src.web_portal.psycopg.connect", return_value=conn) as mocked:
+                with patch("src.web_portal.db_pool.psycopg.connect", return_value=conn) as mocked:
                     with web_portal._db_connection(connect_timeout=7, force_direct=True) as got:
                         self.assertIs(got, conn)
                     get_pool.assert_not_called()
@@ -853,6 +916,50 @@ class TestPortalDbPool(unittest.TestCase):
                 with patch.object(web_portal.logger, "warning") as warn:
                     web_portal._maybe_prewarm_db_pool()
         warn.assert_called_once()
+
+
+class TestPortalSnapshotSchema(unittest.TestCase):
+    def test_snapshot_ready_requires_rollup(self) -> None:
+        @contextmanager
+        def fake_db(*_args, **_kwargs):
+            yield object()
+
+        with patch.dict(
+            os.environ,
+            {
+                "DATABASE_URL": "postgres://example",
+                "WEB_PORTAL_DB_SNAPSHOT_ENABLE": "1",
+                "WEB_PORTAL_DB_SNAPSHOT_REQUIRE": "1",
+            },
+            clear=True,
+        ):
+            with patch("src.web_portal.db_snapshot._db_connection", side_effect=fake_db), \
+                 patch("src.web_portal.db_snapshot._portal_snapshot_table_exists", return_value=False), \
+                 patch("src.web_portal.db_snapshot._portal_snapshot_function_exists", return_value=False):
+                with self.assertRaises(RuntimeError):
+                    portal_db.ensure_portal_snapshot_ready()
+
+    def test_snapshot_ready_auto_init(self) -> None:
+        @contextmanager
+        def fake_db(*_args, **_kwargs):
+            yield object()
+
+        with patch.dict(
+            os.environ,
+            {
+                "DATABASE_URL": "postgres://example",
+                "WEB_PORTAL_DB_SNAPSHOT_ENABLE": "1",
+                "WEB_PORTAL_DB_SNAPSHOT_AUTO_INIT": "1",
+            },
+            clear=True,
+        ):
+            with patch("src.web_portal.db_snapshot._db_connection", side_effect=fake_db), \
+                 patch("src.web_portal.db_snapshot._portal_snapshot_table_exists", side_effect=[False, True]), \
+                 patch("src.web_portal.db_snapshot._portal_snapshot_function_exists", return_value=True), \
+                 patch("src.web_portal.db_snapshot.init_schema") as init_schema:
+                ready = portal_db.ensure_portal_snapshot_ready()
+        self.assertTrue(ready)
+        init_schema.assert_called_once()
 
 
 class TestPortalQueueStream(unittest.TestCase):
@@ -1005,6 +1112,23 @@ class TestPortalSparklineHelpers(unittest.TestCase):
         self.assertEqual(points["T1"], [0.25, 0.3])
         self.assertEqual(points["T2"], [1.0])
         self.assertEqual(points["T3"], [])
+
+    def test_build_event_sparklines_tick_fallback(self) -> None:
+        rows = [
+            {"ticker": "T1", "price_dollars": Decimal("0.2")},
+            {"ticker": "T1", "price_dollars": Decimal("1.5")},
+            {"ticker": "T2", "yes_bid_dollars": Decimal("0.1"), "yes_ask_dollars": Decimal("0.3")},
+        ]
+        conn = DummyRowsConn(rows)
+        prior_ready = portal_event_series._SPARKLINE_TABLE_READY
+        portal_event_series._SPARKLINE_TABLE_READY = False
+        try:
+            with patch.dict(os.environ, {"WEB_PORTAL_EVENT_SPARKLINE_POINTS": "4"}):
+                points = web_portal._build_event_sparklines(conn, ["T1", "T2"])
+        finally:
+            portal_event_series._SPARKLINE_TABLE_READY = prior_ready
+        self.assertEqual(points["T1"], [0.2, 1.0])
+        self.assertEqual(points["T2"], [0.2])
 
 
 class TestPortalForecastSeriesHelpers(unittest.TestCase):
@@ -1197,7 +1321,7 @@ class TestPortalEventDetail(unittest.TestCase):
 
 
 class TestPortalMarketDetail(unittest.TestCase):
-    def test_fetch_market_detail_updates_metadata(self) -> None:
+    def test_fetch_market_detail_does_not_write_metadata(self) -> None:
         now = datetime(2024, 1, 1, tzinfo=timezone.utc)
         row = {
             "ticker": "M1",
@@ -1308,8 +1432,8 @@ class TestPortalMarketDetail(unittest.TestCase):
         self.assertEqual(market["status_class"], "status-unknown")
         self.assertEqual(len(market["candles"]), 1)
         self.assertEqual(market["predictions"][0]["agent"], "agent / model")
-        update_market.assert_called_once()
-        update_event.assert_called_once()
+        update_market.assert_not_called()
+        update_event.assert_not_called()
 
 
 class TestPortalKalshiClient(unittest.TestCase):
@@ -1862,14 +1986,16 @@ class TestPortalUpdateHelpers(unittest.TestCase):
     def test_update_market_extras(self) -> None:
         cursor = DummyExecCursor()
         conn = DummyExecConn(cursor)
-        web_portal._update_market_extras(conn, "T1")
+        web_portal._update_market_extras(conn, "T1", web_portal.MarketExtrasPayload())
         self.assertEqual(cursor.calls, [])
         web_portal._update_market_extras(
             conn,
             "T1",
-            price_ranges={"a": 1},
-            custom_strike={"b": 2},
-            mve_selected_legs={"c": 3},
+            web_portal.MarketExtrasPayload(
+                price_ranges={"a": 1},
+                custom_strike={"b": 2},
+                mve_selected_legs={"c": 3},
+            ),
         )
         self.assertEqual(len(cursor.calls), 1)
         sql, params = cursor.calls[0]
@@ -1877,6 +2003,25 @@ class TestPortalUpdateHelpers(unittest.TestCase):
         self.assertIn("custom_strike", sql)
         self.assertIn("mve_selected_legs", sql)
         self.assertEqual(params["ticker"], "T1")
+
+    def test_update_market_extras_skips_unchanged(self) -> None:
+        cursor = DummyExecCursor()
+        conn = DummyExecConn(cursor)
+        web_portal._update_market_extras(
+            conn,
+            "T1",
+            web_portal.MarketExtrasPayload(
+                price_ranges={"a": 1},
+                custom_strike={"b": 2},
+                mve_selected_legs={"c": 3},
+            ),
+            existing=web_portal.MarketExtrasPayload(
+                price_ranges={"a": 1},
+                custom_strike={"b": 2},
+                mve_selected_legs={"c": 3},
+            ),
+        )
+        self.assertEqual(cursor.calls, [])
 
     def test_update_event_metadata(self) -> None:
         cursor = DummyExecCursor()
@@ -1888,6 +2033,17 @@ class TestPortalUpdateHelpers(unittest.TestCase):
         sql, params = cursor.calls[0]
         self.assertIn("product_metadata", sql)
         self.assertEqual(params["event_ticker"], "EV1")
+
+    def test_update_event_metadata_skips_unchanged(self) -> None:
+        cursor = DummyExecCursor()
+        conn = DummyExecConn(cursor)
+        web_portal._update_event_metadata(
+            conn,
+            "EV1",
+            {"a": 1},
+            existing_product_metadata={"a": 1},
+        )
+        self.assertEqual(cursor.calls, [])
 
 
 class DummyHealthCursor:
@@ -1921,11 +2077,11 @@ class DummyHealthConn:
 
 class TestPortalHealth(unittest.TestCase):
     def setUp(self) -> None:
-        self._ws_alert = web_portal._WS_LAG_LAST_ALERT
-        web_portal._WS_LAG_LAST_ALERT = 0.0
+        self._ws_alert = portal_health._WS_LAG_LAST_ALERT
+        portal_health._WS_LAG_LAST_ALERT = 0.0
 
     def tearDown(self) -> None:
-        web_portal._WS_LAG_LAST_ALERT = self._ws_alert
+        portal_health._WS_LAG_LAST_ALERT = self._ws_alert
 
     def test_fetch_state_rows(self) -> None:
         rows = [
@@ -2477,6 +2633,7 @@ class TestPortalRouteHandlers(unittest.TestCase):
         env = {
             "WEB_PORTAL_PASSWORD": "pw",
             "DATABASE_URL": "postgres://example",
+            "WEB_PORTAL_LAZY_LOAD": "0",
         }
         with patch.dict(os.environ, env, clear=True):
             with web_portal.app.test_request_context("/?category=Sports"):
@@ -2528,6 +2685,106 @@ class TestPortalRouteHandlers(unittest.TestCase):
         self.assertIsNone(payload["error"])
         self.assertEqual(payload["active_total"], 1)
         self.assertEqual(payload["category_filters"][0]["label"], "Sports")
+        self.assertTrue(payload["health"]["ok"])
+
+    def test_index_lazy_load_shell(self) -> None:
+        filters = web_portal.PortalFilters(
+            search=None,
+            categories=("Sports",),
+            strike_period=None,
+            close_window=None,
+            close_window_hours=None,
+            status=None,
+            sort=None,
+            order=None,
+        )
+
+        env = {
+            "WEB_PORTAL_PASSWORD": "pw",
+            "DATABASE_URL": "postgres://example",
+            "WEB_PORTAL_LAZY_LOAD": "1",
+            "STRIKE_PERIODS": "hour,day",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with web_portal.app.test_request_context("/?category=Sports"):
+                with patch.object(web_portal, "_parse_portal_filters", return_value=filters):
+                    with patch.object(web_portal, "describe_event_scope", return_value="scope"):
+                        with patch.object(web_portal, "is_authenticated", return_value=True):
+                            with patch.object(
+                                web_portal,
+                                "_fetch_portal_data",
+                                side_effect=AssertionError("lazy load should skip data fetch"),
+                            ):
+                                with patch.object(
+                                    web_portal,
+                                    "render_template",
+                                    side_effect=lambda *args, **kwargs: kwargs,
+                                ):
+                                    payload = web_portal.index()
+        self.assertTrue(payload["lazy_load"])
+        self.assertEqual(payload["active_total"], 0)
+        self.assertEqual(payload["strike_periods"], ["hour", "day"])
+        self.assertEqual(payload["category_filters"][0]["label"], "Sports")
+
+    def test_portal_data_missing_db(self) -> None:
+        with patch.object(web_portal, "_start_snapshot_polling"):
+            with patch.object(web_portal, "is_authenticated", return_value=True):
+                with patch.dict(os.environ, {"WEB_PORTAL_PASSWORD": "pw"}, clear=True):
+                    client = web_portal.app.test_client()
+                    resp = client.get("/portal/data")
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertEqual(payload["error"], "DATABASE_URL is not set.")
+
+    def test_portal_data_success(self) -> None:
+        filters = web_portal.PortalFilters(
+            search=None,
+            categories=("Sports",),
+            strike_period=None,
+            close_window=None,
+            close_window_hours=None,
+            status=None,
+            sort=None,
+            order=None,
+        )
+        data = web_portal.PortalData(
+            rows=web_portal.PortalRows(
+                active=[
+                    {
+                        "event_ticker": "EV1",
+                        "event_title": "Event One",
+                        "volume": "10",
+                        "time_remaining": "1h",
+                    }
+                ],
+                scheduled=[],
+                closed=[],
+            ),
+            totals=web_portal.PortalTotals(active=1, scheduled=0, closed=0),
+            strike_periods=[],
+            active_categories=["Sports"],
+            health={"ok": True},
+            error=None,
+        )
+        env = {
+            "WEB_PORTAL_PASSWORD": "pw",
+            "DATABASE_URL": "postgres://example",
+        }
+        with patch.object(web_portal, "_start_snapshot_polling"):
+            with patch.object(web_portal, "is_authenticated", return_value=True):
+                with patch.dict(os.environ, env, clear=True):
+                    with patch.object(web_portal, "_parse_portal_filters", return_value=filters):
+                        with patch.object(web_portal, "_fetch_portal_data", return_value=data):
+                            client = web_portal.app.test_client()
+                            resp = client.get("/portal/data?category=Sports")
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertIsNone(payload["error"])
+        self.assertEqual(payload["rows"]["active"][0]["event_ticker"], "EV1")
+        self.assertEqual(payload["totals"]["active"], 1)
+        self.assertEqual(payload["category_filters"][0]["label"], "Sports")
+        self.assertIn("load_more_links", payload)
+        self.assertIn("refreshed_at", payload)
         self.assertTrue(payload["health"]["ok"])
 
     def test_health_route(self) -> None:
@@ -2721,7 +2978,7 @@ class TestPortalRoutes(unittest.TestCase):
         with web_portal.app.test_request_context("/?category=Sports&limit=10"):
             with patch.dict(
                 os.environ,
-                {"WEB_PORTAL_PASSWORD": "pw", "DATABASE_URL": "db"},
+                {"WEB_PORTAL_PASSWORD": "pw", "DATABASE_URL": "db", "WEB_PORTAL_LAZY_LOAD": "0"},
                 clear=True,
             ):
                 with patch.object(web_portal, "_db_connection") as db_conn, \
@@ -3537,6 +3794,7 @@ class TestPortalIndexRoutes(unittest.TestCase):
                     {
                         "WEB_PORTAL_PASSWORD": "pw",
                         "DATABASE_URL": "postgres://example",
+                        "WEB_PORTAL_LAZY_LOAD": "0",
                     },
                     clear=True,
                 ):
@@ -3577,6 +3835,19 @@ class TestPortalHealthRoute(unittest.TestCase):
                         resp = client.get("/health")
         self.assertEqual(resp.status_code, 200)
         render.assert_called_once()
+
+    def test_health_data_route(self) -> None:
+        with patch.object(web_portal, "_start_snapshot_polling"):
+            with patch.object(web_portal, "is_authenticated", return_value=True):
+                with patch.object(web_portal, "_build_health_cards", return_value=[{"title": "ok"}]):
+                    with patch.object(web_portal, "fmt_ts", return_value="ts"):
+                        client = web_portal.app.test_client()
+                        resp = client.get("/health/data")
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertEqual(payload["status_cards"], [{"title": "ok"}])
+        self.assertEqual(payload["refreshed_at"], "ts")
+        self.assertTrue(payload["logged_in"])
 
 
 class TestPortalQueueStreamRoute(unittest.TestCase):
@@ -3651,6 +3922,74 @@ class TestPortalQueueStreamRoute(unittest.TestCase):
                             chunk = next(resp.response).decode("utf-8")
                             resp.close()
         self.assertIn("event: ping", chunk)
+
+    def test_queue_stream_ping_uses_stream_time(self) -> None:
+        class PingConn:
+            def __init__(self):
+                self.cursor_obj = DummyExecCursor()
+
+            def cursor(self, *args, **kwargs):
+                return self.cursor_obj
+
+            def notifies(self, timeout=1.0):
+                return iter([])
+
+        @contextmanager
+        def fake_db(*_args, **_kwargs):
+            yield PingConn()
+
+        with patch.object(web_portal, "_queue_stream_enabled", return_value=True):
+            with patch.dict(os.environ, {"DATABASE_URL": "postgres://example"}):
+                with patch.object(web_portal, "_db_connection", side_effect=fake_db):
+                    with patch.object(stream_routes.time, "monotonic", side_effect=[0.0, 20.0]):
+                        with web_portal.app.test_request_context("/stream/queue"):
+                            resp = stream_routes.queue_stream()
+                            chunk = next(resp.response)
+                            if isinstance(chunk, bytes):
+                                chunk = chunk.decode("utf-8")
+        self.assertIn("event: ping", chunk)
+
+    def test_queue_stream_ping_updates_last_ping(self) -> None:
+        class PingThenQueueConn:
+            def __init__(self):
+                self.cursor_obj = DummyExecCursor()
+                self.notify_calls = 0
+
+            def cursor(self, *args, **kwargs):
+                return self.cursor_obj
+
+            def notifies(self, timeout=1.0):
+                self.notify_calls += 1
+                if self.notify_calls == 1:
+                    return iter([])
+                return iter([SimpleNamespace(payload='{"ok":1}')])
+
+        @contextmanager
+        def fake_db(*_args, **_kwargs):
+            yield PingThenQueueConn()
+
+        with patch.object(web_portal, "_start_snapshot_polling"):
+            with patch.object(web_portal, "is_authenticated", return_value=True):
+                with patch.dict(
+                    os.environ,
+                    {
+                        "WEB_PORTAL_QUEUE_STREAM_ENABLE": "1",
+                        "DATABASE_URL": "postgres://example",
+                    },
+                ):
+                    with patch.object(web_portal, "_db_connection", side_effect=fake_db):
+                        with patch(
+                            "src.web_portal.time.monotonic",
+                            side_effect=itertools.chain([0.0], itertools.repeat(20.0)),
+                        ):
+                            client = web_portal.app.test_client()
+                            resp = client.get("/stream/queue")
+                            iterator = iter(resp.response)
+                            chunk1 = next(iterator).decode("utf-8")
+                            chunk2 = next(iterator).decode("utf-8")
+                            resp.close()
+        self.assertIn("event: ping", chunk1)
+        self.assertIn("event: queue", chunk2)
 
     def test_queue_stream_error_event(self) -> None:
         def raise_db(*_args, **_kwargs):
@@ -3822,6 +4161,7 @@ class TestPortalEventSnapshotRoute(unittest.TestCase):
                     {
                         "DATABASE_URL": "postgres://example",
                         "WEB_PORTAL_SNAPSHOT_POLL_DELAY_MS": "1",
+                        "WEB_PORTAL_EVENT_SNAPSHOT_LIMIT": "0",
                     },
                 ):
                     with patch.object(web_portal, "_db_connection", side_effect=fake_db):
@@ -4259,23 +4599,27 @@ class TestPortalMain(unittest.TestCase):
 class TestPortalModuleEntrypoint(unittest.TestCase):
     def test_module_entrypoint_runs_main(self) -> None:
         module_name = "src.web_portal"
-        sys.modules.pop(module_name, None)
+        original_module = sys.modules.pop(module_name, None)
         dummy_conn = DummyConn(autocommit=False)
-        with patch.dict(
-            os.environ,
-            {
-                "DATABASE_URL": "postgres://example",
-                "WEB_DB_POOL_ENABLE": "0",
-                "WEB_DB_POOL_PREWARM": "0",
-            },
-            clear=True,
-        ):
-            with patch("flask.app.Flask.run") as run:
-                with patch("psycopg.connect", return_value=dummy_conn):
-                    with patch("src.db.db.ensure_schema_compatible") as ensure_schema:
-                        runpy.run_module(module_name, run_name="__main__")
-        run.assert_called_once()
-        ensure_schema.assert_called_once()
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgres://example",
+                    "WEB_DB_POOL_ENABLE": "0",
+                    "WEB_DB_POOL_PREWARM": "0",
+                },
+                clear=True,
+            ):
+                with patch("flask.app.Flask.run") as run:
+                    with patch("psycopg.connect", return_value=dummy_conn):
+                        with patch("src.db.db.ensure_schema_compatible") as ensure_schema:
+                            runpy.run_module(module_name, run_name="__main__")
+            run.assert_called_once()
+            ensure_schema.assert_called_once()
+        finally:
+            if original_module is not None:
+                sys.modules[module_name] = original_module
 
 
 class TestPortalHealthHelpersExtra(unittest.TestCase):
@@ -4304,9 +4648,9 @@ class TestPortalHealthHelpersExtra(unittest.TestCase):
                 return DummyCursor((None,))
 
         conn = HealthConn({"pending": 2, "running": 1, "failed": 0, "workers": 3})
-        prior_alert = web_portal._WS_LAG_LAST_ALERT
+        prior_alert = portal_health._WS_LAG_LAST_ALERT
         try:
-            web_portal._WS_LAG_LAST_ALERT = 0.0
+            portal_health._WS_LAG_LAST_ALERT = 0.0
             with patch.object(web_portal, "_fetch_state_rows", return_value=state_rows):
                 with patch.object(web_portal.logger, "warning") as warn:
                     with patch("src.web_portal.time.monotonic", return_value=100.0):
@@ -4322,7 +4666,7 @@ class TestPortalHealthHelpersExtra(unittest.TestCase):
                         ):
                             payload = web_portal._load_portal_health(conn)
         finally:
-            web_portal._WS_LAG_LAST_ALERT = prior_alert
+            portal_health._WS_LAG_LAST_ALERT = prior_alert
         self.assertEqual(payload["queue"]["pending"], 2)
         self.assertEqual(payload["ws"]["status"], "stale")
         self.assertTrue(payload["ws"]["alert"])
@@ -4397,7 +4741,11 @@ class TestPortalIndexErrorHandling(unittest.TestCase):
             with patch.object(web_portal, "is_authenticated", return_value=True):
                 with patch.dict(
                     os.environ,
-                    {"WEB_PORTAL_PASSWORD": "pw", "DATABASE_URL": "postgres://example"},
+                    {
+                        "WEB_PORTAL_PASSWORD": "pw",
+                        "DATABASE_URL": "postgres://example",
+                        "WEB_PORTAL_LAZY_LOAD": "0",
+                    },
                 ):
                     with web_portal.app.test_request_context("/"):
                         with patch.object(web_portal, "_db_connection", side_effect=RuntimeError("boom")):
@@ -4478,3 +4826,1118 @@ class TestPortalBackfillStrikePeriodAllowed(unittest.TestCase):
         _, _, payload = enqueue.call_args[0]
         self.assertEqual(payload["market"]["open_time"], "2024-01-01T00:00:00+00:00")
         self.assertEqual(payload["market"]["close_time"], "2024-01-01T02:00:00+00:00")
+
+
+class TestOpportunityHelpers(unittest.TestCase):
+    def test_opportunity_defaults(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "WEB_PORTAL_OPPORTUNITY_MIN_GAP": "-1",
+                "WEB_PORTAL_OPPORTUNITY_MIN_CONF": "0.6",
+                "WEB_PORTAL_OPPORTUNITY_MAX_AGE_MINUTES": "90",
+                "WEB_PORTAL_OPPORTUNITY_MAX_TICK_AGE_MINUTES": "30",
+            },
+            clear=True,
+        ):
+            defaults = opportunities_routes._opportunity_defaults()
+        self.assertEqual(defaults.min_gap, 0.0)
+        self.assertEqual(defaults.min_conf, 0.6)
+        self.assertEqual(defaults.max_age, 90.0)
+        self.assertEqual(defaults.max_tick_age, 30.0)
+
+    def test_parse_float_arg_clamps(self) -> None:
+        opp = opportunities_routes
+        self.assertEqual(opp._parse_float_arg(None, 1.0), 1.0)
+        self.assertEqual(opp._parse_float_arg("", 2.0), 2.0)
+        self.assertEqual(opp._parse_float_arg("bad", 3.0), 3.0)
+        self.assertIsNone(opp._parse_float_arg(None, None))
+        self.assertEqual(opp._parse_float_arg("0.1", None, minimum=0.5), 0.5)
+        self.assertEqual(opp._parse_float_arg("2.5", None, maximum=1.5), 1.5)
+
+    def test_parse_opportunity_args_and_base_params(self) -> None:
+        opp = opportunities_routes
+        defaults = opp.OpportunityArgs(
+            min_gap=0.1,
+            min_conf=0.6,
+            max_age=120.0,
+            max_tick_age=30.0,
+        )
+        parsed = opp._parse_opportunity_args(
+            {
+                "min_gap": "2",
+                "min_conf": "-1",
+                "max_age": "",
+                "max_tick_age": "5",
+            },
+            defaults,
+        )
+        self.assertEqual(parsed.min_gap, 1.0)
+        self.assertEqual(parsed.min_conf, 0.0)
+        self.assertEqual(parsed.max_age, 120.0)
+        self.assertEqual(parsed.max_tick_age, 5.0)
+
+        filters = web_portal.PortalFilters(
+            search="q",
+            categories=("Sports",),
+            strike_period="hour",
+            close_window=None,
+            close_window_hours=None,
+            status=None,
+            sort=None,
+            order=None,
+        )
+        with patch.object(opp, "build_filter_params", return_value={"limit": "10"}):
+            params = opp._opportunity_base_params(10, filters, parsed)
+        self.assertEqual(float(params["min_gap"]), 1.0)
+        self.assertEqual(float(params["min_conf"]), 0.0)
+        self.assertEqual(float(params["max_age"]), 120.0)
+        self.assertEqual(float(params["max_tick_age"]), 5.0)
+
+    def test_fetch_opportunity_data_success_and_error(self) -> None:
+        opp = opportunities_routes
+        filters = web_portal.PortalFilters(
+            search=None,
+            categories=(),
+            strike_period=None,
+            close_window=None,
+            close_window_hours=None,
+            status=None,
+            sort=None,
+            order=None,
+        )
+
+        @contextmanager
+        def fake_db():
+            yield object()
+
+        with patch.object(opp, "_db_connection", side_effect=fake_db):
+            with patch.object(opp, "fetch_opportunities", return_value=[{"ticker": "T1"}]):
+                with patch.object(opp, "fetch_strike_periods", return_value=["hour"]):
+                    with patch.object(
+                        opp,
+                        "fetch_active_event_categories",
+                        return_value=["Sports"],
+                    ):
+                        data = opp._fetch_opportunity_data(5, filters, criteria=object())
+        self.assertEqual(data.rows, [{"ticker": "T1"}])
+        self.assertEqual(data.strike_periods, ["hour"])
+        self.assertEqual(data.active_categories, ["Sports"])
+        self.assertIsNone(data.error)
+
+        with patch.object(opp, "_db_connection", side_effect=fake_db):
+            with patch.object(opp, "fetch_opportunities", side_effect=RuntimeError("boom")):
+                data = opp._fetch_opportunity_data(5, filters, criteria=object())
+        self.assertEqual(data.rows, [])
+        self.assertEqual(data.strike_periods, [])
+        self.assertEqual(data.active_categories, [])
+        self.assertIn("boom", data.error or "")
+
+
+class TestOpportunityRoutes(unittest.TestCase):
+    def _filters(self):
+        return web_portal.PortalFilters(
+            search="q",
+            categories=("Sports",),
+            strike_period="hour",
+            close_window=None,
+            close_window_hours=None,
+            status=None,
+            sort=None,
+            order=None,
+        )
+
+    def _defaults(self):
+        return opportunities_routes.OpportunityArgs(
+            min_gap=0.2,
+            min_conf=0.7,
+            max_age=10.0,
+            max_tick_age=5.0,
+        )
+
+    def test_opportunities_missing_db(self) -> None:
+        opp = opportunities_routes
+        filters = self._filters()
+        with patch.dict(os.environ, {}, clear=True):
+            with web_portal.app.test_request_context("/opportunities"):
+                with patch.object(opp, "_parse_portal_filters", return_value=filters):
+                    with patch.object(opp, "_opportunity_defaults", return_value=self._defaults()):
+                        with patch.object(opp, "clamp_limit", return_value=7):
+                            with patch.object(opp, "build_opportunity_filters", return_value={}):
+                                with patch.object(
+                                    opp,
+                                    "render_template",
+                                    side_effect=lambda *args, **kwargs: kwargs,
+                                ):
+                                    payload = opp.opportunities()
+        self.assertEqual(payload["error"], "DATABASE_URL is not set.")
+        self.assertEqual(payload["opportunities"], [])
+        self.assertEqual(payload["category_filters"], [])
+        self.assertEqual(payload["selected_categories"], ["Sports"])
+        self.assertEqual(payload["limit"], 7)
+
+    def test_opportunities_success(self) -> None:
+        opp = opportunities_routes
+        filters = self._filters()
+        data = opp.OpportunityData(
+            rows=[{"ticker": "T1"}],
+            strike_periods=["hour"],
+            active_categories=["Sports"],
+            error=None,
+        )
+        with patch.dict(os.environ, {"DATABASE_URL": "postgres://example"}):
+            with web_portal.app.test_request_context("/opportunities?category=Sports"):
+                with patch.object(opp, "_parse_portal_filters", return_value=filters):
+                    with patch.object(opp, "_opportunity_defaults", return_value=self._defaults()):
+                        with patch.object(opp, "clamp_limit", return_value=5):
+                            with patch.object(opp, "build_opportunity_filters", return_value={"ok": True}):
+                                with patch.object(opp, "_fetch_opportunity_data", return_value=data):
+                                    with patch.object(
+                                        opp,
+                                        "build_category_filters",
+                                        return_value=[{"label": "Sports"}],
+                                    ):
+                                        with patch.object(
+                                            opp,
+                                            "render_template",
+                                            side_effect=lambda *args, **kwargs: kwargs,
+                                        ):
+                                            payload = opp.opportunities()
+        self.assertIsNone(payload["error"])
+        self.assertEqual(payload["opportunities"], [{"ticker": "T1"}])
+        self.assertEqual(payload["category_filters"][0]["label"], "Sports")
+        self.assertEqual(payload["strike_periods"], ["hour"])
+
+    def test_opportunities_data_missing_db(self) -> None:
+        opp = opportunities_routes
+        filters = self._filters()
+        with patch.dict(os.environ, {}, clear=True):
+            with web_portal.app.test_request_context("/opportunities/data"):
+                with patch.object(opp, "_parse_portal_filters", return_value=filters):
+                    with patch.object(opp, "_opportunity_defaults", return_value=self._defaults()):
+                        with patch.object(opp, "clamp_limit", return_value=9):
+                            with patch.object(opp, "build_opportunity_filters", return_value={}):
+                                with patch.object(opp, "is_authenticated", return_value=True):
+                                    resp = opp.opportunities_data()
+        payload = resp.get_json()
+        self.assertEqual(payload["error"], "DATABASE_URL is not set.")
+        self.assertEqual(payload["opportunities"], [])
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["limit"], 9)
+
+    def test_opportunities_data_success(self) -> None:
+        opp = opportunities_routes
+        filters = self._filters()
+        data = opp.OpportunityData(
+            rows=[{"ticker": "T1"}, {"ticker": "T2"}],
+            strike_periods=["hour", "day"],
+            active_categories=["Sports"],
+            error=None,
+        )
+        with patch.dict(os.environ, {"DATABASE_URL": "postgres://example"}):
+            with web_portal.app.test_request_context("/opportunities/data?category=Sports"):
+                with patch.object(opp, "_parse_portal_filters", return_value=filters):
+                    with patch.object(opp, "_opportunity_defaults", return_value=self._defaults()):
+                        with patch.object(opp, "clamp_limit", return_value=2):
+                            with patch.object(opp, "build_opportunity_filters", return_value={"ok": True}):
+                                with patch.object(opp, "_fetch_opportunity_data", return_value=data):
+                                    with patch.object(
+                                        opp,
+                                        "build_category_filters",
+                                        return_value=[{"label": "Sports"}],
+                                    ):
+                                        with patch.object(opp, "is_authenticated", return_value=False):
+                                            resp = opp.opportunities_data()
+        payload = resp.get_json()
+        self.assertIsNone(payload["error"])
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["category_filters"][0]["label"], "Sports")
+        self.assertEqual(payload["strike_periods"], ["hour", "day"])
+
+
+class TestEventRoutes(unittest.TestCase):
+    def test_event_detail_cache_helpers(self) -> None:
+        event_routes._EVENT_DETAIL_CACHE.clear()
+        with patch.object(event_routes, "_event_detail_cache_ttl", return_value=0):
+            self.assertIsNone(event_routes._load_event_detail_cache("EV1"))
+            event_routes._store_event_detail_cache("EV1", {"event_ticker": "EV1"})
+            self.assertEqual(event_routes._EVENT_DETAIL_CACHE, {})
+
+        event_routes._EVENT_DETAIL_CACHE.clear()
+        with patch.object(event_routes, "_event_detail_cache_ttl", return_value=5):
+            event_routes._store_event_detail_cache("EV1", {"event_ticker": "EV1"})
+            self.assertIn("EV1", event_routes._EVENT_DETAIL_CACHE)
+            event_routes._EVENT_DETAIL_CACHE["EV1"] = (0.0, {"event_ticker": "EV1"})
+            with patch("src.web_portal.routes.event.time.monotonic", return_value=10.0):
+                self.assertIsNone(event_routes._load_event_detail_cache("EV1"))
+            self.assertEqual(event_routes._EVENT_DETAIL_CACHE, {})
+            event_routes._EVENT_DETAIL_CACHE["EV1"] = (2.0, {"event_ticker": "EV1"})
+            with patch("src.web_portal.routes.event.time.monotonic", return_value=4.0):
+                cached = event_routes._load_event_detail_cache("EV1")
+            self.assertEqual(cached, {"event_ticker": "EV1"})
+
+    def test_snapshot_cursor_helpers(self) -> None:
+        self.assertEqual(event_routes._snapshot_cursor_key("EV1"), "portal_snapshot_cursor:EV1")
+        with patch.object(event_routes, "get_state", return_value="bad"):
+            self.assertEqual(event_routes._load_snapshot_cursor(object(), "EV1"), 0)
+        with patch.object(event_routes, "set_state", side_effect=RuntimeError("boom")):
+            event_routes._store_snapshot_cursor(object(), "EV1", 5)
+
+    def test_limit_snapshot_rows_round_robin(self) -> None:
+        rows = [{"ticker": "A"}, {"ticker": "B"}, {"ticker": "C"}]
+        conn = object()
+        with patch.object(event_routes, "_load_snapshot_cursor", return_value=1), \
+             patch.object(event_routes, "_store_snapshot_cursor") as store_cursor:
+            selected = event_routes._limit_snapshot_rows(conn, "EV1", rows, 2)
+        self.assertEqual(selected, [{"ticker": "B"}, {"ticker": "C"}])
+        store_cursor.assert_called_once_with(conn, "EV1", 3)
+
+    def test_snapshot_event_market_row_missing_ticker(self) -> None:
+        settings = event_routes.SnapshotSettings(
+            allow_closed=True,
+            delay_ms=0,
+            prefer_ticks_sec=0,
+            cooldown_sec=0,
+            max_markets=1,
+            now=datetime.now(timezone.utc),
+        )
+        handlers = event_routes.SnapshotHandlers(
+            prefer_tick_snapshot=lambda *_args, **_kwargs: None,
+            fetch_snapshot=lambda _ticker: ({}, None),
+            insert_tick=lambda *_args, **_kwargs: None,
+            set_backoff=lambda *_args, **_kwargs: None,
+        )
+        result = event_routes._snapshot_event_market_row(
+            conn=object(),
+            row={},
+            settings=settings,
+            handlers=handlers,
+        )
+        self.assertEqual(result, (0, 0, None, False))
+
+    def test_event_detail_cached_path(self) -> None:
+        cached = {"event_ticker": "EV1"}
+        with patch.dict(os.environ, {"DATABASE_URL": "postgres://example"}):
+            with web_portal.app.test_request_context("/event/EV1"):
+                with patch.object(event_routes, "_portal_func", side_effect=lambda _n, default: default):
+                    with patch.object(event_routes, "_load_event_detail_cache", return_value=cached):
+                        with patch.object(
+                            event_routes,
+                            "render_template",
+                            side_effect=lambda *args, **kwargs: kwargs,
+                        ):
+                            payload = event_routes.event_detail("EV1")
+        self.assertEqual(payload["event"], cached)
+        self.assertIsNone(payload["error"])
+
+    def test_event_detail_fetches_and_stores(self) -> None:
+        event = {"event_ticker": "EV1"}
+
+        @contextmanager
+        def fake_db():
+            yield object()
+
+        with patch.dict(os.environ, {"DATABASE_URL": "postgres://example"}):
+            with web_portal.app.test_request_context("/event/EV1"):
+                with patch.object(event_routes, "_portal_func", side_effect=lambda _n, default: default):
+                    with patch.object(event_routes, "_db_connection", side_effect=fake_db):
+                        with patch.object(event_routes, "fetch_event_detail", return_value=event):
+                            with patch.object(event_routes, "_store_event_detail_cache") as store_cache:
+                                with patch.object(
+                                    event_routes,
+                                    "render_template",
+                                    side_effect=lambda *args, **kwargs: kwargs,
+                                ):
+                                    payload = event_routes.event_detail("EV1")
+        self.assertEqual(payload["event"], event)
+        store_cache.assert_called_once_with("EV1", event)
+
+    def test_event_detail_fetch_exception(self) -> None:
+        @contextmanager
+        def bad_db():
+            raise RuntimeError("db fail")
+            yield  # pragma: no cover
+
+        with patch.dict(os.environ, {"DATABASE_URL": "postgres://example"}):
+            with web_portal.app.test_request_context("/event/EV1"):
+                with patch.object(event_routes, "_portal_func", side_effect=lambda _n, default: default):
+                    with patch.object(event_routes, "_db_connection", side_effect=bad_db):
+                        with patch.object(
+                            event_routes,
+                            "render_template",
+                            side_effect=lambda *args, **kwargs: kwargs,
+                        ):
+                            payload = event_routes.event_detail("EV1")
+        self.assertIn("db fail", payload["error"])
+
+    def test_event_snapshot_exception(self) -> None:
+        @contextmanager
+        def bad_db():
+            raise RuntimeError("boom")
+            yield  # pragma: no cover
+
+        with patch.dict(os.environ, {"DATABASE_URL": "postgres://example"}):
+            with web_portal.app.test_request_context("/event/EV1/snapshot"):
+                with patch.object(event_routes, "_portal_func", side_effect=lambda _n, default: default):
+                    with patch.object(event_routes, "_db_connection", side_effect=bad_db):
+                        with patch.object(
+                            event_routes,
+                            "_snapshot_settings",
+                            return_value=event_routes.SnapshotSettings(
+                                allow_closed=True,
+                                delay_ms=0,
+                                prefer_ticks_sec=0,
+                                cooldown_sec=0,
+                                max_markets=1,
+                                now=datetime.now(timezone.utc),
+                            ),
+                        ):
+                            resp, status = event_routes.event_snapshot("EV1")
+        self.assertEqual(status, 503)
+        self.assertIn("boom", resp.get_json().get("error", ""))
+
+
+class TestPortalPart2Coverage(unittest.TestCase):
+    def test_paging_as_params_and_parse(self) -> None:
+        paging = web_portal.PortalPaging(
+            limit=10,
+            active_page=1,
+            scheduled_page=2,
+            closed_page=3,
+            active_cursor="a",
+            scheduled_cursor="b",
+            closed_cursor="c",
+        )
+        params = paging.as_params()
+        self.assertEqual(params["active_after"], "a")
+        self.assertEqual(params["scheduled_after"], "b")
+        self.assertEqual(params["closed_after"], "c")
+
+        token = web_portal._encode_cursor_token(
+            web_portal.EventCursor(value=1, event_ticker="EV1")
+        )
+        args = {"active_page": 2, "active_after": token, "scheduled_page": 1, "closed_page": 1}
+        parsed = web_portal._parse_portal_paging(args, limit=10)
+        self.assertEqual(parsed.active_page, 2)
+        self.assertEqual(parsed.scheduled_page, 0)
+        self.assertEqual(parsed.closed_page, 0)
+
+    def test_cursor_token_roundtrip_and_invalid(self) -> None:
+        cursor = web_portal.EventCursor(value=123, event_ticker="EV1")
+        token = web_portal._encode_cursor_token(cursor)
+        decoded = web_portal._decode_cursor_token(token)
+        self.assertEqual(decoded.event_ticker, "EV1")
+        self.assertEqual(decoded.value, 123)
+        self.assertIsNone(web_portal._encode_cursor_token(web_portal.EventCursor(value=1, event_ticker="")))
+
+        bad_token = "not-base64"
+        self.assertIsNone(web_portal._decode_cursor_token(bad_token))
+        list_payload = base64.urlsafe_b64encode(json.dumps(["x"]).encode("utf-8")).decode("ascii").rstrip("=")
+        self.assertIsNone(web_portal._decode_cursor_token(list_payload))
+        empty_ticker = base64.urlsafe_b64encode(
+            json.dumps({"t": "", "v": 1}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        self.assertIsNone(web_portal._decode_cursor_token(empty_ticker))
+        bad_value = base64.urlsafe_b64encode(
+            json.dumps({"t": "EV1", "v": {"a": 1}}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        self.assertIsNone(web_portal._decode_cursor_token(bad_value))
+
+    def test_portal_data_cache_and_shell(self) -> None:
+        cache_key = ("k",)
+        payload = web_portal._empty_portal_data()
+        cache = web_portal._PORTAL_DATA_CACHE
+        cache.clear()
+        with patch.object(web_portal.time, "monotonic", return_value=100.0):
+            web_portal._store_portal_data_cache(cache_key, 10, payload)
+        with patch.object(web_portal.time, "monotonic", return_value=105.0):
+            self.assertIs(web_portal._load_portal_data_cache(cache_key, 10), payload)
+        with patch.object(web_portal.time, "monotonic", return_value=120.0):
+            self.assertIsNone(web_portal._load_portal_data_cache(cache_key, 10))
+        self.assertIsNone(web_portal._load_portal_data_cache(cache_key, 0))
+        web_portal._store_portal_data_cache(cache_key, 0, payload)
+        self.assertEqual(cache, {})
+
+        filters = web_portal.PortalFilters(
+            search=None,
+            categories=(),
+            strike_period="week",
+            close_window=None,
+            close_window_hours=None,
+            status=None,
+            sort=None,
+            order=None,
+        )
+        with patch.dict(os.environ, {"STRIKE_PERIODS": "hour,day"}):
+            shell = web_portal._portal_shell_data(filters)
+        self.assertIn("week", shell.strike_periods)
+
+    def test_snapshot_rows_and_data_from_snapshot(self) -> None:
+        filters = web_portal.PortalFilters(
+            search=None,
+            categories=(),
+            strike_period=None,
+            close_window=None,
+            close_window_hours=None,
+            status=None,
+            sort="missing",
+            order=None,
+        )
+        payload = {
+            "active_rows": [{"event_ticker": "EV1", "close_time": "2024-01-01T00:00:00Z"}],
+            "scheduled_rows": [{"event_ticker": "EV2", "open_time": "2024-01-01T00:00:00Z"}],
+            "closed_rows": [{"event_ticker": "EV3", "close_time": "2024-01-01T00:00:00Z"}],
+            "active_total": 1,
+            "scheduled_total": 1,
+            "closed_total": 1,
+            "strike_periods": ["hour"],
+            "active_categories": ["News"],
+            "health_raw": {"ok": True},
+        }
+        with patch.object(web_portal, "fmt_time_remaining", return_value="1h"):
+            rows, cursors = web_portal._snapshot_rows_and_cursors(payload, filters)
+        self.assertEqual(rows.active[0]["time_remaining"], "1h")
+        self.assertTrue(cursors.active)
+
+        with patch.object(
+            web_portal,
+            "build_portal_health_from_snapshot",
+            return_value={"health": "ok"},
+        ):
+            data = web_portal._portal_data_from_snapshot(payload, filters)
+        self.assertEqual(data.totals.active, 1)
+        self.assertEqual(data.health, {"health": "ok"})
+
+    def test_split_rows_and_cursor(self) -> None:
+        rows, cursor = web_portal._split_rows_and_cursor((["row"], "cursor"))
+        self.assertEqual(rows, ["row"])
+        self.assertEqual(cursor, "cursor")
+        rows, cursor = web_portal._split_rows_and_cursor(None)
+        self.assertEqual(rows, [])
+        self.assertIsNone(cursor)
+        rows, cursor = web_portal._split_rows_and_cursor(["row"])
+        self.assertEqual(rows, ["row"])
+        self.assertIsNone(cursor)
+
+    def test_fetch_portal_snapshot_data_and_cache(self) -> None:
+        filters = web_portal.PortalFilters(
+            search=None,
+            categories=(),
+            strike_period=None,
+            close_window=None,
+            close_window_hours=None,
+            status=None,
+            sort=None,
+            order=None,
+        )
+        paging = web_portal.PortalPaging(limit=10, active_page=0, scheduled_page=0, closed_page=0)
+
+        @contextmanager
+        def fake_conn():
+            yield object()
+
+        snapshot_payload = {"active_rows": [], "scheduled_rows": [], "closed_rows": []}
+        sentinel = web_portal._empty_portal_data()
+        with patch.object(web_portal, "_db_connection", return_value=fake_conn()):
+            with patch.object(web_portal, "fetch_portal_snapshot", return_value=snapshot_payload):
+                with patch.object(web_portal, "_portal_data_from_snapshot", return_value=sentinel):
+                    result = web_portal._fetch_portal_snapshot_data(
+                        10,
+                        filters,
+                        (None, None, None),
+                    )
+        self.assertIs(result, sentinel)
+
+        cache_key = web_portal._portal_data_cache_key(10, filters, paging)
+        web_portal._PORTAL_DATA_CACHE.clear()
+        with patch.object(web_portal, "_portal_data_cache_ttl", return_value=30):
+            with patch.object(web_portal, "_portal_db_snapshot_enabled", return_value=True):
+                with patch.object(web_portal, "_fetch_portal_snapshot_data", return_value=sentinel):
+                    data = web_portal._fetch_portal_data(10, filters, paging)
+        self.assertIs(data, sentinel)
+        self.assertIn(cache_key, web_portal._PORTAL_DATA_CACHE)
+
+        web_portal._PORTAL_DATA_CACHE.clear()
+        web_portal._PORTAL_DATA_CACHE[cache_key] = (0.0, sentinel)
+        with patch.object(web_portal, "_portal_data_cache_ttl", return_value=30):
+            with patch.object(web_portal.time, "monotonic", return_value=1.0):
+                cached = web_portal._fetch_portal_data(10, filters, paging)
+        self.assertIs(cached, sentinel)
+
+    def test_build_load_more_links(self) -> None:
+        filters = web_portal.PortalFilters(
+            search=None,
+            categories=(),
+            strike_period=None,
+            close_window=None,
+            close_window_hours=None,
+            status=None,
+            sort=None,
+            order=None,
+        )
+        paging = web_portal.PortalPaging(limit=10, active_page=0, scheduled_page=0, closed_page=0)
+        cursors = web_portal.PortalCursorTokens(active="tok", scheduled=None, closed=None)
+        with web_portal.app.test_request_context("/"):
+            with patch.object(web_portal, "url_for", return_value="/index") as url_for:
+                links = web_portal._build_load_more_links(
+                    limit=10,
+                    filters=filters,
+                    paging=paging,
+                    cursors=cursors,
+                )
+        self.assertEqual(links["active"], "/index")
+        url_for.assert_called()
+
+    def test_portal_data_password_error(self) -> None:
+        filters = web_portal.PortalFilters(
+            search=None,
+            categories=(),
+            strike_period=None,
+            close_window=None,
+            close_window_hours=None,
+            status=None,
+            sort=None,
+            order=None,
+        )
+        with patch.dict(os.environ, {"DATABASE_URL": "db"}):
+            with patch.object(web_portal, "require_password", side_effect=RuntimeError("boom")):
+                with patch.object(web_portal, "_parse_portal_filters", return_value=filters):
+                    with web_portal.app.test_request_context("/portal/data"):
+                        resp = web_portal.portal_data()
+        self.assertEqual(resp.get_json()["error"], "boom")
+
+    def test_main_schema_error_and_create_app(self) -> None:
+        @contextmanager
+        def fake_conn():
+            yield object()
+
+        with patch.dict(os.environ, {"DATABASE_URL": "db"}):
+            with patch.object(web_portal, "_db_connection", return_value=fake_conn()):
+                with patch.object(
+                    web_portal,
+                    "ensure_schema_compatible",
+                    side_effect=RuntimeError("boom"),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        web_portal.main()
+
+        with patch.dict(os.environ, {"DATABASE_URL": "db"}):
+            with patch.object(web_portal, "_db_connection", return_value=fake_conn()):
+                with patch.object(web_portal, "ensure_schema_compatible", return_value=3):
+                    fake_app = web_portal.Flask("test")
+                    with patch.object(web_portal, "_create_portal_app", return_value=fake_app) as create_app:
+                        with patch.object(fake_app, "run", return_value=None) as run:
+                            original_app = web_portal.app
+                            web_portal.app = object()
+                            try:
+                                web_portal.main()
+                            finally:
+                                web_portal.app = original_app
+                    create_app.assert_called_once()
+                    run.assert_called_once()
+
+    def test_create_portal_app_fallbacks(self) -> None:
+        with patch.dict(os.environ, {"WEB_PORTAL_DB_SNAPSHOT_REQUIRE": "1"}):
+            with patch.object(web_portal, "_wire_route_modules"):
+                with patch("importlib.import_module", side_effect=RuntimeError("boom")):
+                    with self.assertRaises(RuntimeError):
+                        web_portal._create_portal_app()
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(web_portal, "_wire_route_modules"):
+                with patch("importlib.import_module", side_effect=RuntimeError("boom")):
+                    with patch.object(web_portal.logger, "warning") as warn:
+                        with patch(
+                            "src.web_portal.routes.register_blueprints",
+                            side_effect=RuntimeError("bp"),
+                        ):
+                            with patch.object(
+                                web_portal,
+                                "register_routes",
+                                side_effect=RuntimeError("routes"),
+                            ):
+                                app = web_portal._create_portal_app()
+        self.assertIsInstance(app, web_portal.Flask)
+        warning_messages = [call.args[0] for call in warn.call_args_list]
+        self.assertTrue(
+            any("blueprint registration failed" in message for message in warning_messages)
+        )
+        self.assertTrue(
+            any("route registration failed" in message for message in warning_messages)
+        )
+
+    def test_run_module_main_guard(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(RuntimeError):
+                runpy.run_module("src.web_portal._portal_part2", run_name="__main__")
+
+
+class TestMarketMetadata(unittest.TestCase):
+    def test_portal_logger_and_metadata_changed(self) -> None:
+        logger = MagicMock()
+        with patch.object(market_metadata, "_portal_logger_util", return_value=logger):
+            self.assertIs(market_metadata._portal_logger(), logger)
+
+        self.assertFalse(market_metadata._metadata_changed(market_metadata._UNSET, None))
+        self.assertTrue(market_metadata._metadata_changed(market_metadata._UNSET, {"a": 1}))
+        self.assertFalse(market_metadata._metadata_changed({"a": 1}, {"a": 1}))
+
+    def test_extract_event_metadata(self) -> None:
+        self.assertIsNone(market_metadata._extract_event_metadata({}))
+        payload = {"product_metadata": {"a": 1}}
+        self.assertEqual(market_metadata._extract_event_metadata(payload), {"a": 1})
+        nested = {"event": {"event_metadata": {"b": 2}}}
+        self.assertEqual(market_metadata._extract_event_metadata(nested), {"b": 2})
+
+    def test_update_market_extras_updates_and_noop(self) -> None:
+        cursor = DummyExecCursor()
+        with patch.object(market_metadata, "timed_cursor", return_value=cursor):
+            market_metadata._update_market_extras(
+                conn=object(),
+                ticker="MK1",
+                price_ranges={"a": 1},
+                custom_strike={"b": 2},
+            )
+        self.assertEqual(len(cursor.calls), 1)
+        sql, params = cursor.calls[0]
+        self.assertIn("price_ranges", sql)
+        self.assertEqual(params["ticker"], "MK1")
+
+        cursor = DummyExecCursor()
+        with patch.object(market_metadata, "timed_cursor", return_value=cursor):
+            market_metadata._update_market_extras(
+                conn=object(),
+                ticker="MK1",
+                price_ranges={"a": 1},
+                existing_price_ranges={"a": 1},
+            )
+        self.assertEqual(cursor.calls, [])
+
+    def test_needs_market_metadata_and_fetch_payloads(self) -> None:
+        self.assertTrue(market_metadata._needs_market_metadata(None, 1))
+        self.assertFalse(market_metadata._needs_market_metadata(1, 2))
+
+        def fake_market_data(_ticker):
+            return {"ok": True}, None, 200
+
+        with patch.object(market_metadata, "_portal_func", return_value=fake_market_data):
+            data, err, status = market_metadata._fetch_market_metadata_payload("MK1")
+        self.assertEqual((data, err, status), ({"ok": True}, None, 200))
+
+        self.assertEqual(
+            market_metadata._fetch_event_metadata_payload(None),
+            (None, "Event metadata API unavailable."),
+        )
+
+    def test_log_market_metadata_error(self) -> None:
+        logger = MagicMock()
+        with patch.object(market_metadata, "_portal_logger", return_value=logger):
+            market_metadata._log_market_metadata_error(None, None)
+            market_metadata._log_market_metadata_error("err", 429)
+            market_metadata._log_market_metadata_error("err", 500)
+        warning_messages = [call.args[0] for call in logger.warning.call_args_list]
+        self.assertIn("market metadata fetch rate limited", warning_messages[0])
+        self.assertIn("market metadata fetch failed: %s", warning_messages[1])
+
+    def test_apply_market_metadata_and_resolve_price_ranges(self) -> None:
+        with patch.object(market_metadata, "_maybe_parse_json", return_value={"p": 1}):
+            price_ranges, custom_strike, mve, product = market_metadata._apply_market_metadata(
+                None,
+                None,
+                None,
+                None,
+                {
+                    "price_ranges": None,
+                    "price_level_structure": "raw",
+                    "custom_strike": {"c": 2},
+                    "mve_selected_legs": {"m": 3},
+                    "event": {"product_metadata": {"e": 4}},
+                },
+            )
+        self.assertEqual(price_ranges, {"p": 1})
+        self.assertEqual(custom_strike, {"c": 2})
+        self.assertEqual(mve, {"m": 3})
+        self.assertEqual(product, {"e": 4})
+
+        logger = MagicMock()
+        with patch.object(market_metadata, "_portal_logger", return_value=logger):
+            with patch.object(market_metadata, "_maybe_parse_json", return_value=None):
+                result = market_metadata._resolve_price_ranges(
+                    None,
+                    {"price_level_structure": "bad"},
+                    "MK1",
+                )
+        self.assertIsNone(result)
+        logger.warning.assert_called_once()
+
+    def test_resolve_market_metadata_fetch_and_event_error(self) -> None:
+        row = {
+            "price_ranges": None,
+            "custom_strike": None,
+            "mve_selected_legs": None,
+            "product_metadata": None,
+            "event_ticker": "EV1",
+        }
+        with patch.object(market_metadata, "_market_metadata_fetch_enabled", return_value=True):
+            with patch.object(market_metadata, "_event_metadata_fetch_enabled", return_value=True):
+                with patch.object(
+                    market_metadata,
+                    "_fetch_market_metadata_payload",
+                    return_value=({"price_ranges": {"a": 1}}, "err", 500),
+                ) as fetch_market:
+                    with patch.object(market_metadata, "_log_market_metadata_error") as log_market:
+                        with patch.object(
+                            market_metadata,
+                            "_apply_market_metadata",
+                            return_value=({"a": 1}, None, None, None),
+                        ):
+                            logger = MagicMock()
+                            with patch.object(market_metadata, "_portal_logger", return_value=logger):
+                                with patch.object(
+                                    market_metadata,
+                                    "_fetch_event_metadata_payload",
+                                    return_value=(None, "boom"),
+                                ):
+                                    market_metadata._resolve_market_metadata(row, "MK1")
+        fetch_market.assert_called_once()
+        log_market.assert_called_once_with("err", 500)
+        logger.warning.assert_called_once()
+
+
+class TestPortalHealthUtilsExtra(unittest.TestCase):
+    def test_rag_health_card_with_payload(self) -> None:
+        context = portal_health.PortalHealthContext(
+            db_url="db",
+            db_details=["db ok"],
+            db_error=None,
+            rag_error=None,
+            health_payload={
+                "rag": {
+                    "enabled": True,
+                    "label": "Running",
+                    "status": "ok",
+                    "age_text": "5m",
+                    "call_count": 3,
+                    "call_limit": 10,
+                    "stale_seconds": 120,
+                }
+            },
+        )
+        card = portal_health._rag_health_card(context)
+        self.assertEqual(card["level"], "ok")
+        self.assertIn("24h calls: 3 / 10", card["details"])
+        self.assertIn("Stale threshold: 120s", card["details"])
+
+    def test_rag_health_card_disabled(self) -> None:
+        context = portal_health.PortalHealthContext(
+            db_url="db",
+            db_details=["db ok"],
+            db_error=None,
+            rag_error=None,
+            health_payload={
+                "rag": {"enabled": False, "label": "Off", "status": "ok", "age_text": "1h"}
+            },
+        )
+        card = portal_health._rag_health_card(context)
+        self.assertEqual(card["level"], "warn")
+        self.assertEqual(card["label"], "Disabled")
+        self.assertEqual(card["summary"], "RAG predictions are disabled.")
+        self.assertIn("PREDICTION_ENABLE set: No", card["details"])
+
+    def test_rag_health_card_stale(self) -> None:
+        context = portal_health.PortalHealthContext(
+            db_url="db",
+            db_details=["db ok"],
+            db_error=None,
+            rag_error=None,
+            health_payload={
+                "rag": {"enabled": True, "label": "Stale", "status": "stale", "age_text": "2h"}
+            },
+        )
+        card = portal_health._rag_health_card(context)
+        self.assertEqual(card["level"], "warn")
+        self.assertEqual(card["label"], "Stale")
+        self.assertEqual(card["summary"], "RAG predictions are stale.")
+
+    def test_snapshot_poller_status_and_card_backoff_na(self) -> None:
+        level, label, _summary = portal_health._snapshot_poller_status(False, False, 0)
+        self.assertEqual((level, label), ("warn", "Disabled"))
+
+        def fake_portal_func(name, default):
+            mapping = {
+                "_snapshot_poll_enabled": lambda: True,
+                "_snapshot_poll_config": lambda: SimpleNamespace(interval=30, limit=25),
+                "_snapshot_backoff_remaining": lambda: "n/a",
+            }
+            return mapping.get(name, default)
+
+        with patch.object(portal_health, "_portal_func", side_effect=fake_portal_func):
+            with patch.object(portal_health, "_portal_attr", return_value=False):
+                card = portal_health._snapshot_poller_card()
+        self.assertEqual(card["label"], "Starting")
+        self.assertIn("Backoff remaining: N/A", card["details"])
+
+    def test_ws_ingest_status_and_details(self) -> None:
+        level, label, _summary = portal_health._ws_ingest_status(False, "ok", "OK", {})
+        self.assertEqual((level, label), ("warn", "Disabled"))
+
+        heartbeat = {"missing_subscriptions": 1, "stale_tick_count": 0}
+        level, label, summary = portal_health._ws_ingest_status(True, "ok", "OK", heartbeat)
+        self.assertEqual((level, label), ("warn", "Degraded"))
+        self.assertIn("missing subscriptions", summary)
+
+        level, label, summary = portal_health._ws_ingest_status(
+            True, "stale", "Stale", {"missing_subscriptions": None, "stale_tick_count": None}
+        )
+        self.assertEqual((level, label), ("warn", "Stale"))
+        self.assertEqual(summary, "WebSocket ingestion is stale.")
+
+        details = portal_health._ws_ingest_details(
+            True,
+            {"age_label": "2m"},
+            {
+                "age_text": "1m",
+                "active_tickers": 2,
+                "subscribed": 3,
+                "missing_subscriptions": 1,
+                "stale_tick_window_s": 60,
+                "stale_tick_count": 4,
+                "pending_subscriptions": 5,
+                "pending_updates": 6,
+            },
+        )
+        self.assertIn("Heartbeat: 1m", details)
+        self.assertIn("Pending updates: 6", details)
+        self.assertTrue(any("Stale ticks > 60s" in row for row in details))
+        details = portal_health._ws_ingest_details(True, {}, {})
+        self.assertIn("Heartbeat: missing", details)
+
+    def test_ws_ingest_payload_card_and_card(self) -> None:
+        payload = {
+            "ws": {"enabled": True, "status": "ok", "label": "Ready", "age_label": "1m"},
+            "ws_heartbeat": {"missing_subscriptions": 0, "stale_tick_count": 0},
+        }
+        level, label, summary, details = portal_health._ws_ingest_payload_card(payload)
+        self.assertEqual(level, "ok")
+        self.assertEqual(label, "Ready")
+        self.assertIn("healthy", summary)
+        self.assertTrue(details)
+        context = portal_health.PortalHealthContext(
+            db_url="db",
+            db_details=[],
+            db_error=None,
+            rag_error=None,
+            health_payload=payload,
+        )
+        card = portal_health._ws_ingest_card(context)
+        self.assertEqual(card["level"], level)
+
+    def test_fetch_latest_prediction_ts_handles_exception(self) -> None:
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        ts_value = now.isoformat()
+        calls = {"count": 0}
+
+        @contextmanager
+        def fake_timed_cursor(_conn):
+            class DummyCursor:
+                def execute(self, *_args, **_kwargs):
+                    calls["count"] += 1
+                    if calls["count"] == 1:
+                        raise RuntimeError("boom")
+
+                def fetchone(self):
+                    return (ts_value,)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            yield DummyCursor()
+
+        with patch.object(portal_health, "timed_cursor", side_effect=fake_timed_cursor):
+            with patch.object(portal_health.logger, "exception"):
+                result = portal_health._fetch_latest_prediction_ts(MagicMock())
+        self.assertEqual(result, portal_health._parse_ts(ts_value))
+
+    def test_snapshot_state_helpers(self) -> None:
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        self.assertIsNone(portal_health._snapshot_state_row({"x": "bad"}, "x"))
+
+        snapshot = {
+            "state_rows": {
+                "last_discovery_ts": {"value": now.isoformat()},
+                "last_min_close_ts": {"value": str(int(now.timestamp()) - 900)},
+                "last_tick_ts": {"value": None},
+                "last_ws_tick_ts": {"value": None},
+                "last_prediction_ts": {"value": (now - timedelta(hours=2)).isoformat()},
+                "ws_heartbeat": {"value": "{}"},
+                "rag_24h_calls": {"value": "{}"},
+            },
+            "latest_tick_ts": (now - timedelta(minutes=1)).isoformat(),
+            "latest_prediction_ts": (now - timedelta(minutes=1)).isoformat(),
+        }
+        state = portal_health._load_snapshot_state(snapshot)
+        self.assertIsNotNone(state.last_tick_ts)
+        self.assertEqual(state.last_ws_tick_ts, state.last_tick_ts)
+        self.assertGreater(state.last_prediction_ts, now - timedelta(hours=2))
+
+    def test_snapshot_queue_payload(self) -> None:
+        payload = portal_health._snapshot_queue_payload({"queue": {"pending": "2"}})
+        self.assertEqual(payload["pending"], 2)
+        self.assertEqual(payload["running"], 0)
+
+    def test_build_snapshot_health_payload(self) -> None:
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        state = portal_health.PortalSnapshotState(
+            discovery_ts=now,
+            backfill_ts=now,
+            last_tick_ts=now,
+            last_ws_tick_ts=now,
+            last_prediction_ts=now,
+            ws_heartbeat_row=None,
+            rag_call_row=None,
+        )
+        with patch.object(portal_health, "_load_snapshot_state", return_value=state):
+            with patch.object(portal_health, "_ws_health", return_value={"status": "ok"}):
+                with patch.object(
+                    portal_health, "_load_ws_heartbeat", return_value={"age_text": "1m"}
+                ):
+                    with patch.object(
+                        portal_health,
+                        "_rag_call_window_payload",
+                        return_value={"count": 1, "limit": 2, "remaining": 1},
+                    ):
+                        with patch.object(
+                            portal_health, "_rag_health_from_ts", return_value={"status": "ok"}
+                        ):
+                            with patch.object(
+                                portal_health, "_ingest_stale_seconds", return_value=(60, 120)
+                            ):
+                                with patch.object(
+                                    portal_health,
+                                    "_ingest_health_payload",
+                                    side_effect=[{"status": "ok"}, {"status": "stale"}],
+                                ):
+                                    payload = portal_health._build_snapshot_health_payload(
+                                        {"queue": {}},
+                                        now,
+                                    )
+        self.assertEqual(payload["ws"]["status"], "ok")
+        self.assertEqual(payload["rag"]["status"], "ok")
+        self.assertEqual(payload["discovery"]["status"], "ok")
+        self.assertEqual(payload["backfill"]["status"], "stale")
+
+    def test_fetch_state_timestamps_fallback(self) -> None:
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        state_rows = {
+            "last_discovery_ts": {"value": now.isoformat()},
+            "last_discovery_heartbeat_ts": {"value": now.isoformat()},
+            "last_min_close_ts": {"value": str(int(now.timestamp()))},
+            "last_prediction_ts": {"value": now.isoformat()},
+            "last_tick_ts": {"value": None},
+            "last_ws_tick_ts": {"value": None},
+            "ws_heartbeat": {"value": "{}"},
+        }
+        with patch.object(portal_health, "_portal_module", return_value=None):
+            with patch.object(portal_health, "_fetch_state_rows", return_value=state_rows):
+                with patch.object(
+                    portal_health, "_query_latest_tick_ts", return_value=now
+                ) as query_tick:
+                    timestamps = portal_health._fetch_state_timestamps(MagicMock())
+        query_tick.assert_called_once()
+        self.assertEqual(timestamps.last_tick_ts, now)
+        self.assertEqual(timestamps.last_ws_tick_ts, now)
+
+    def test_ws_alert_flag_below_threshold(self) -> None:
+        prior_alert = portal_health._WS_LAG_LAST_ALERT
+        portal_health._WS_LAG_LAST_ALERT = 0.0
+        try:
+            self.assertFalse(portal_health._ws_alert_flag(5, 10, 60))
+        finally:
+            portal_health._WS_LAG_LAST_ALERT = prior_alert
+
+    def test_rag_call_window_payload_invalid_values(self) -> None:
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        row = {
+            "value": json.dumps(
+                {"window_start": now.isoformat(), "count": "bad", "limit": "bad"}
+            )
+        }
+        payload = portal_health._rag_call_window_payload(row, now)
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["limit"], portal_health._RAG_CALL_LIMIT_DEFAULT)
+
+    def test_rag_call_window_payload_bad_json(self) -> None:
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        row = {"value": "{bad json"}
+        payload = portal_health._rag_call_window_payload(row, now)
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["limit"], portal_health._RAG_CALL_LIMIT_DEFAULT)
+        self.assertEqual(payload["remaining"], portal_health._RAG_CALL_LIMIT_DEFAULT)
+
+    def test_rag_call_window_payload_expired_window(self) -> None:
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        row = {
+            "value": json.dumps(
+                {
+                    "window_start": (now - timedelta(hours=25)).isoformat(),
+                    "count": 5,
+                    "limit": 0,
+                }
+            )
+        }
+        payload = portal_health._rag_call_window_payload(row, now)
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["limit"], portal_health._RAG_CALL_LIMIT_DEFAULT)
+
+    def test_rag_health_uses_portal_func_fallback(self) -> None:
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+        def fake_fetch_state_rows(_conn, _keys):
+            return {
+                portal_health._RAG_CALL_WINDOW_KEY: {
+                    "value": json.dumps(
+                        {"window_start": now.isoformat(), "count": 1, "limit": 2}
+                    )
+                }
+            }
+
+        with patch.object(portal_health, "_portal_module", return_value=None):
+            with patch.object(
+                portal_health, "_portal_func", return_value=fake_fetch_state_rows
+            ) as portal_func:
+                with patch.object(
+                    portal_health, "_rag_health_from_ts", return_value={"status": "ok"}
+                ) as rag_from_ts:
+                    payload = portal_health._rag_health(MagicMock(), now, None)
+        portal_func.assert_called_once()
+        rag_from_ts.assert_called_once()
+        self.assertEqual(payload["status"], "ok")
+
+    def test_rag_health_from_ts_default_call_payload(self) -> None:
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        with patch.dict(os.environ, {}, clear=True):
+            payload = portal_health._rag_health_from_ts(now, None, None)
+        self.assertEqual(payload["call_count"], 0)
+        self.assertEqual(payload["call_limit"], portal_health._RAG_CALL_LIMIT_DEFAULT)
+
+    def test_build_portal_health_from_snapshot(self) -> None:
+        self.assertIsNone(portal_health.build_portal_health_from_snapshot(None))
+        with patch.object(
+            portal_health, "_build_snapshot_health_payload", return_value={"ok": True}
+        ):
+            payload = portal_health.build_portal_health_from_snapshot({"state_rows": {}})
+        self.assertEqual(payload, {"ok": True})
+
+    def test_load_ws_heartbeat(self) -> None:
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        row = {"value": "bad", "updated_at": now.isoformat()}
+        self.assertIsNone(portal_health._load_ws_heartbeat(row, now))
+
+        row = {"value": json.dumps({"subscribed": 2}), "updated_at": now.isoformat()}
+        payload = portal_health._load_ws_heartbeat(row, now)
+        self.assertEqual(payload["subscribed"], 2)
+        self.assertIn("age_text", payload)
+        self.assertIn("age_minutes", payload)

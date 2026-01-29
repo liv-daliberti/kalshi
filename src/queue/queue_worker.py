@@ -11,22 +11,24 @@ from typing import Any, Optional
 
 import psycopg  # pylint: disable=import-error
 
-from src.jobs.backfill import BackfillConfig, MarketContext, backfill_market
-from src.jobs.backfill_config import build_backfill_config_from_settings
-from src.jobs.discover_market import discover_market
-from src.db.db import maybe_init_schema, set_state
-from src.core.env_utils import _env_int
-from src.core.guardrails import assert_service_role
-from src.core.logging_utils import configure_logging as configure_service_logging, parse_log_level
-from src.core.loop_utils import schema_path
-from src.core.service_utils import open_client_and_conn
-from src.core.settings import Settings, load_settings
-from src.queue.work_queue import (
+from ..jobs.backfill import BackfillConfig, MarketContext, backfill_market
+from ..jobs.backfill_config import build_backfill_config_from_settings
+from ..jobs.discover_market import discover_market
+from ..db.db import ensure_schema_compatible, maybe_init_schema, set_state
+from ..core.env_utils import _env_int
+from ..core.guardrails import assert_service_role
+from ..core.logging_utils import configure_logging as configure_service_logging, parse_log_level
+from ..core.loop_utils import schema_path
+from ..core.service_utils import load_private_key
+from ..core.settings import Settings, load_settings
+from ..kalshi.kalshi_sdk import make_client
+from .work_queue import (
     QueueConfig,
     WorkItem,
     claim_job_by_id,
     claim_next_job,
     cleanup_finished_jobs,
+    job_type_where_clause,
     load_queue_config,
     mark_done,
     mark_failed,
@@ -117,11 +119,7 @@ def _safe_close(handle) -> None:
 
 
 def _log_queue_metrics(conn: psycopg.Connection, queue_cfg: QueueConfig) -> None:
-    where_clause = ""
-    params = ()
-    if queue_cfg.job_types:
-        where_clause = "WHERE job_type = ANY(%s)"
-        params = (list(queue_cfg.job_types),)
+    where_clause, params = job_type_where_clause(queue_cfg.job_types)
     query = f"""
         SELECT
           COUNT(*) FILTER (
@@ -347,11 +345,12 @@ def run_worker(
         return
     if not queue_cfg.rabbitmq.publish or not queue_cfg.rabbitmq.url:
         logger.info("RabbitMQ disabled; worker will poll DB queue")
-    client, conn = open_client_and_conn(
-        settings,
-        private_key_pem=private_key_pem,
-        schema_path_override=schema_path(__file__),
-    )
+    if private_key_pem is None:
+        private_key_pem = load_private_key(settings.kalshi_private_key_pem_path)
+    client = make_client(settings.kalshi_host, settings.kalshi_api_key_id, private_key_pem)
+    conn = psycopg.connect(settings.database_url)
+    maybe_init_schema(conn, schema_path=schema_path(__file__))
+    ensure_schema_compatible(conn)
     cfg = build_backfill_config_from_settings(settings)
     logger.info(
         "Queue worker started id=%s queue=%s job_types=%s",

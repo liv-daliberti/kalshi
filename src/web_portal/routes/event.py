@@ -8,18 +8,19 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from flask import Blueprint, jsonify, render_template  # pylint: disable=import-error
 from psycopg.rows import dict_row  # pylint: disable=import-error
 
-from src.db.db import get_state, set_state
+from ...db.db import get_state, set_state
 
 from ..config import _env_int
 from ..db import _db_connection
 from ..db_details import fetch_event_detail
 from ..db_timing import timed_cursor
 from ..db_utils import insert_market_tick
+from ..portal_utils import portal_func as _portal_func
 from ..snapshot_utils import (
     _prefer_tick_snapshot,
     _set_snapshot_backoff,
@@ -73,6 +74,71 @@ class SnapshotSettings:
     now: datetime
 
 
+@dataclass(frozen=True)
+class SnapshotHandlers:
+    """Callable hooks used by event snapshot collection."""
+
+    prefer_tick_snapshot: Callable[..., dict[str, Any] | None]
+    fetch_snapshot: Callable[[str], tuple[dict[str, Any], dict[str, Any] | None]]
+    insert_tick: Callable[[Any, dict[str, Any]], None]
+    set_backoff: Callable[[int], None]
+
+
+def _snapshot_handlers() -> SnapshotHandlers:
+    return SnapshotHandlers(
+        prefer_tick_snapshot=_portal_func("_prefer_tick_snapshot", _prefer_tick_snapshot),
+        fetch_snapshot=_portal_func("fetch_live_snapshot", fetch_live_snapshot),
+        insert_tick=_portal_func("insert_market_tick", insert_market_tick),
+        set_backoff=_portal_func("_set_snapshot_backoff", _set_snapshot_backoff),
+    )
+
+
+def _snapshot_event_market_row(
+    conn: "psycopg.Connection",
+    row: dict[str, Any],
+    settings: SnapshotSettings,
+    handlers: SnapshotHandlers,
+) -> tuple[int, int, dict[str, str] | None, bool]:
+    ticker = row.get("ticker")
+    if not ticker:
+        return 0, 0, None, False
+    close_dt = row.get("close_time")
+    is_closed = close_dt is not None and close_dt <= settings.now
+    cached_payload = handlers.prefer_tick_snapshot(
+        conn,
+        ticker,
+        settings.prefer_ticks_sec,
+        allow_stale=is_closed,
+    )
+    if cached_payload is not None:
+        return 0, 1, None, False
+
+    updated = 0
+    cached = 0
+    error: dict[str, str] | None = None
+    stop = False
+    if is_closed and not settings.allow_closed:
+        error = {"ticker": ticker, "error": "Market is closed; snapshot skipped."}
+    else:
+        data, snapshot_tick = handlers.fetch_snapshot(ticker)
+        if data.get("rate_limited"):
+            handlers.set_backoff(settings.cooldown_sec)
+            error = {"ticker": ticker, "error": "Rate limited; snapshot halted."}
+            stop = True
+        elif "error" in data:
+            error = {"ticker": ticker, "error": data.get("error") or "Error"}
+        elif snapshot_tick:
+            try:
+                handlers.insert_tick(conn, snapshot_tick)
+                updated = 1
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.exception("live snapshot insert failed for %s", ticker)
+                error = {"ticker": ticker, "error": "Snapshot insert failed."}
+        else:
+            error = {"ticker": ticker, "error": "No snapshot data returned."}
+    return updated, cached, error, stop
+
+
 def _snapshot_cursor_key(event_ticker: str) -> str:
     return f"portal_snapshot_cursor:{event_ticker}"
 
@@ -86,24 +152,32 @@ def _load_snapshot_cursor(conn: "psycopg.Connection", event_ticker: str) -> int:
 
 
 def _store_snapshot_cursor(conn: "psycopg.Connection", event_ticker: str, value: int) -> None:
-    set_state(conn, _snapshot_cursor_key(event_ticker), str(max(0, value)))
+    try:
+        set_state(conn, _snapshot_cursor_key(event_ticker), str(max(0, value)))
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.warning("snapshot cursor update failed for %s", event_ticker)
 
 
 def _snapshot_settings() -> SnapshotSettings:
+    env_int = _portal_func("_env_int", _env_int)
+    snapshot_allows_closed = _portal_func(
+        "_snapshot_allows_closed",
+        _snapshot_allows_closed,
+    )
     return SnapshotSettings(
-        allow_closed=_snapshot_allows_closed(),
-        delay_ms=_env_int("WEB_PORTAL_SNAPSHOT_POLL_DELAY_MS", 0, minimum=0),
-        prefer_ticks_sec=_env_int(
+        allow_closed=snapshot_allows_closed(),
+        delay_ms=env_int("WEB_PORTAL_SNAPSHOT_POLL_DELAY_MS", 0, minimum=0),
+        prefer_ticks_sec=env_int(
             "WEB_PORTAL_SNAPSHOT_PREFER_TICKS_SEC",
             60,
             minimum=0,
         ),
-        cooldown_sec=_env_int(
+        cooldown_sec=env_int(
             "WEB_PORTAL_SNAPSHOT_POLL_COOLDOWN_SEC",
             30,
             minimum=5,
         ),
-        max_markets=_env_int("WEB_PORTAL_EVENT_SNAPSHOT_LIMIT", 3, minimum=0),
+        max_markets=env_int("WEB_PORTAL_EVENT_SNAPSHOT_LIMIT", 3, minimum=0),
         now=datetime.now(timezone.utc),
     )
 
@@ -189,48 +263,20 @@ def _snapshot_event_markets(
     updated = 0
     cached = 0
     errors: list[dict[str, str]] = []
+    handlers = _snapshot_handlers()
     for row in rows:
-        ticker = row.get("ticker")
-        if not ticker:
-            continue
-        close_dt = row.get("close_time")
-        is_closed = close_dt is not None and close_dt <= settings.now
-        cached_payload = _prefer_tick_snapshot(
+        updated_inc, cached_inc, error, stop = _snapshot_event_market_row(
             conn,
-            ticker,
-            settings.prefer_ticks_sec,
-            allow_stale=is_closed,
+            row,
+            settings,
+            handlers,
         )
-        if cached_payload is not None:
-            cached += 1
-            continue
-        if is_closed and not settings.allow_closed:
-            errors.append(
-                {"ticker": ticker, "error": "Market is closed; snapshot skipped."}
-            )
-            continue
-        data, snapshot_tick = fetch_live_snapshot(ticker)
-        if data.get("rate_limited"):
-            _set_snapshot_backoff(settings.cooldown_sec)
-            errors.append(
-                {
-                    "ticker": ticker,
-                    "error": "Rate limited; snapshot halted.",
-                }
-            )
+        updated += updated_inc
+        cached += cached_inc
+        if error:
+            errors.append(error)
+        if stop:
             break
-        if "error" in data:
-            errors.append({"ticker": ticker, "error": data.get("error") or "Error"})
-            continue
-        if snapshot_tick:
-            try:
-                insert_market_tick(conn, snapshot_tick)
-                updated += 1
-            except Exception:  # pylint: disable=broad-exception-caught
-                logger.exception("live snapshot insert failed for %s", ticker)
-                errors.append({"ticker": ticker, "error": "Snapshot insert failed."})
-        else:
-            errors.append({"ticker": ticker, "error": "No snapshot data returned."})
         if settings.delay_ms > 0:
             time.sleep(settings.delay_ms / 1000)
     return updated, cached, errors
@@ -239,9 +285,10 @@ def _snapshot_event_markets(
 @bp.get("/event/<event_ticker>")
 def event_detail(event_ticker: str):
     """Render the event detail view."""
+    render = _portal_func("render_template", render_template)
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
-        return render_template(
+        return render(
             "event_detail.html",
             error="DATABASE_URL is not set.",
             event=None,
@@ -249,7 +296,7 @@ def event_detail(event_ticker: str):
 
     cached = _load_event_detail_cache(event_ticker)
     if cached is not None:
-        return render_template(
+        return render(
             "event_detail.html",
             error=None,
             event=cached,
@@ -263,8 +310,10 @@ def event_detail(event_ticker: str):
     error = None
     event = None
     try:
-        with _db_connection() as conn:
-            event = fetch_event_detail(conn, event_ticker)
+        db_connection = _portal_func("_db_connection", _db_connection)
+        fetch_detail = _portal_func("fetch_event_detail", fetch_event_detail)
+        with db_connection() as conn:
+            event = fetch_detail(conn, event_ticker)
             if event is None:
                 error = "Event not found."
             else:
@@ -273,7 +322,7 @@ def event_detail(event_ticker: str):
         logger.exception("event detail query failed")
         error = str(exc)
 
-    return render_template(
+    return render(
         "event_detail.html",
         error=error,
         event=event,
@@ -290,7 +339,8 @@ def event_snapshot(event_ticker: str):
     settings = _snapshot_settings()
 
     try:
-        with _db_connection() as conn:
+        db_connection = _portal_func("_db_connection", _db_connection)
+        with db_connection() as conn:
             rows = _load_event_market_rows(conn, event_ticker, settings.allow_closed)
             if not rows:
                 payload, status = _missing_snapshot_response(

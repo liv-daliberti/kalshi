@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from src.core.time_utils import infer_strike_period_from_times
+from ..core.time_utils import infer_strike_period_from_times, normalize_strike_period
 
 
 @dataclass
@@ -112,7 +112,7 @@ def accept_event(
             return None
         stats.seen_events.add(event_ticker)
 
-    strike_period = (event.get("strike_period") or "").strip().lower()
+    strike_period = normalize_strike_period(event.get("strike_period")) or ""
     stats.strike_counts[strike_period] = stats.strike_counts.get(strike_period, 0) + 1
     if strike_period in strike_periods:
         return strike_period

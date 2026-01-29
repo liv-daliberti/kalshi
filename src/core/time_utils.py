@@ -3,11 +3,32 @@
 from __future__ import annotations
 
 import importlib
+import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 _ISOPARSE: Callable[[str], datetime] | None = None
 _ISOPARSE_CHECKED = False
+
+_STRIKE_MINUTE_RE = re.compile(r"^\s*\d+\s*(m|min|minute|minutes)\s*$", re.IGNORECASE)
+_STRIKE_HOUR_ALIASES = {"hour", "hourly", "hr", "hrs", "hours"}
+_STRIKE_DAY_ALIASES = {"day", "daily", "days", "d"}
+
+
+def normalize_strike_period(value: Any) -> Optional[str]:
+    """Normalize strike-period strings to canonical values (hour/day) when possible."""
+    if value is None:
+        return None
+    raw = str(value).strip().lower()
+    if not raw:
+        return None
+    if raw in _STRIKE_HOUR_ALIASES:
+        return "hour"
+    if raw in _STRIKE_DAY_ALIASES:
+        return "day"
+    if _STRIKE_MINUTE_RE.match(raw):
+        return "hour"
+    return raw
 
 
 def _resolve_isoparse() -> Callable[[str], datetime] | None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from src.jobs.backfill_config import BackfillConfig
+from ..jobs.backfill_config import BackfillConfig
 
 from .config import _env_int, _parse_csv
 

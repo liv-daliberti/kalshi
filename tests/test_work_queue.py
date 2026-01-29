@@ -3,13 +3,14 @@ import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
+import importlib
 
 from _test_utils import add_src_to_path, ensure_psycopg_stub
 
 ensure_psycopg_stub()
 add_src_to_path()
 
-import src.queue.work_queue as work_queue
+work_queue = importlib.import_module("src.queue.work_queue")
 
 
 class FakeCursor:
@@ -18,7 +19,7 @@ class FakeCursor:
         self.fail_on_notify = fail_on_notify
 
     def execute(self, sql, params=None):
-        if self.fail_on_notify and sql.strip().startswith("NOTIFY"):
+        if self.fail_on_notify and sql.strip().startswith("SELECT pg_notify"):
             raise RuntimeError("notify failed")
         self.conn.executes.append((sql, params))
 
@@ -101,6 +102,14 @@ class FakePikaModule:
 
 
 class TestQueueParsing(unittest.TestCase):
+    def test_job_type_where_clause_empty(self) -> None:
+        clause, params = work_queue.job_type_where_clause(None)
+        self.assertEqual(clause, "")
+        self.assertEqual(params, ())
+        clause, params = work_queue.job_type_where_clause(())
+        self.assertEqual(clause, "")
+        self.assertEqual(params, ())
+
     def test_parse_bool(self) -> None:
         self.assertFalse(work_queue._parse_bool(None))
         self.assertFalse(work_queue._parse_bool(""))
@@ -112,10 +121,56 @@ class TestQueueParsing(unittest.TestCase):
         self.assertEqual(work_queue._parse_int("10", 3), 10)
         self.assertEqual(work_queue._parse_int("nope", 3), 3)
 
+    def test_parse_csv(self) -> None:
+        self.assertEqual(work_queue._parse_csv(None), ())
+        self.assertEqual(work_queue._parse_csv("A, b,, C "), ("a", "b", "c"))
+
     def test_default_worker_id(self) -> None:
         with patch("src.queue.work_queue.socket.gethostname", return_value="host"), \
              patch("src.queue.work_queue.os.getpid", return_value=123):
             self.assertEqual(work_queue._default_worker_id(), "host-123")
+
+    def test_queue_name_for_job_type_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            name = work_queue.queue_name_for_job_type("", "queue.default")
+        self.assertEqual(name, "queue.default")
+
+    def test_default_queue_for_job_types_backfill_override(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"WORK_QUEUE_NAME_BACKFILL_MARKET": "queue.backfill"},
+            clear=True,
+        ):
+            name = work_queue._default_queue_for_job_types(
+                ("backfill_market", "discover_market")
+            )
+        self.assertEqual(name, "queue.backfill")
+
+    def test_default_queue_for_job_types_backfill_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            name = work_queue._default_queue_for_job_types(
+                ("backfill_market", "discover_market")
+            )
+        self.assertEqual(name, "kalshi.backfill")
+
+    def test_default_queue_for_job_types_cleanup(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            name = work_queue._default_queue_for_job_types(("cleanup_market",))
+        self.assertEqual(name, "kalshi.cleanup")
+
+    def test_default_queue_for_job_types_single_override(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"WORK_QUEUE_NAME_CLEANUP_MARKET": "queue.cleanup"},
+            clear=True,
+        ):
+            name = work_queue._default_queue_for_job_types(("cleanup_market",))
+        self.assertEqual(name, "queue.cleanup")
+
+    def test_default_queue_for_job_types_fallback(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            name = work_queue._default_queue_for_job_types(("other_job",))
+        self.assertEqual(name, "kalshi.ingest")
 
     def test_load_queue_config_env(self) -> None:
         env = {
@@ -274,8 +329,9 @@ class TestQueueDatabaseOps(unittest.TestCase):
         self.assertIn('"a":1', insert_params[1])
         self.assertEqual(insert_params[3], 5)
         notify_sql, notify_params = conn.executes[1]
-        self.assertTrue(notify_sql.strip().startswith("NOTIFY"))
-        self.assertIn('"job_id":7', notify_params[0])
+        self.assertTrue(notify_sql.strip().startswith("SELECT pg_notify"))
+        self.assertEqual(notify_params[0], "work_queue_update")
+        self.assertIn('"job_id":7', notify_params[1])
 
     def test_enqueue_job_notify_failure(self) -> None:
         conn = FakeConn(fetchone_queue=[(2,)], fail_on_notify=True)
@@ -293,6 +349,14 @@ class TestQueueDatabaseOps(unittest.TestCase):
         self.assertEqual(item.attempts, 2)
         self.assertEqual(item.max_attempts, 3)
 
+    def test_claim_job_by_id_with_job_types(self) -> None:
+        conn = FakeConn(fetchone_queue=[(5, "type", {"a": 1}, 2, 3)])
+        item = work_queue.claim_job_by_id(conn, 5, "worker", job_types=("a", "b"))
+        self.assertIsNotNone(item)
+        sql, params = conn.executes[0]
+        self.assertIn("job_type = ANY", sql)
+        self.assertEqual(params[-1], ["a", "b"])
+
     def test_claim_job_by_id_empty(self) -> None:
         conn = FakeConn(fetchone_queue=[None])
         self.assertIsNone(work_queue.claim_job_by_id(conn, 1, "worker"))
@@ -302,6 +366,14 @@ class TestQueueDatabaseOps(unittest.TestCase):
         item = work_queue.claim_next_job(conn, "worker")
         self.assertIsNotNone(item)
         self.assertEqual(item.payload, {"a": 1})
+
+    def test_claim_next_job_with_job_types(self) -> None:
+        conn = FakeConn(fetchone_queue=[(3, "type", {"a": 1}, 1, 4)])
+        item = work_queue.claim_next_job(conn, "worker", job_types=("x",))
+        self.assertIsNotNone(item)
+        sql, params = conn.executes[0]
+        self.assertIn("job_type = ANY", sql)
+        self.assertEqual(params[-1], ["x"])
 
     def test_claim_next_job_empty(self) -> None:
         conn = FakeConn(fetchone_queue=[None])

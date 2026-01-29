@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src.db.db import (
+from ..db.db import (
     SCHEMA_VERSION,
     _env_bool,
     _env_int,

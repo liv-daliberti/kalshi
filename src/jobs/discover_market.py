@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from src.db.db import upsert_event, upsert_market
-from src.kalshi.kalshi_sdk import (
+from ..db.db import upsert_event, upsert_market
+from ..kalshi.kalshi_sdk import (
     coerce_payload,
     extract_http_status,
     rest_register_rate_limit,

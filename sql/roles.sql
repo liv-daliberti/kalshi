@@ -35,29 +35,40 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
   events, markets, active_markets, market_candles, ingest_state
 TO kalshi_rest;
 GRANT SELECT, INSERT ON work_queue TO kalshi_rest;
+GRANT SELECT, INSERT, UPDATE ON market_candles_latest TO kalshi_rest;
+GRANT SELECT ON market_ticks_latest, market_predictions TO kalshi_rest;
+GRANT INSERT, UPDATE, DELETE ON portal_event_rollup TO kalshi_rest;
 
 -- WS
 GRANT SELECT, DELETE ON active_markets TO kalshi_ws;
+GRANT SELECT ON events TO kalshi_ws;
 GRANT SELECT, INSERT, UPDATE ON markets TO kalshi_ws;
 GRANT SELECT, INSERT ON market_ticks, lifecycle_events TO kalshi_ws;
+GRANT SELECT, INSERT, UPDATE ON market_ticks_latest TO kalshi_ws;
+GRANT INSERT, UPDATE, DELETE ON portal_event_rollup TO kalshi_ws;
+GRANT SELECT ON market_predictions TO kalshi_ws;
 GRANT SELECT, INSERT, UPDATE ON ingest_state TO kalshi_ws;
 
 -- Worker
 GRANT SELECT, INSERT ON market_candles TO kalshi_worker;
+GRANT SELECT, INSERT, UPDATE ON market_candles_latest TO kalshi_worker;
 GRANT SELECT, INSERT, UPDATE ON ingest_state TO kalshi_worker;
-GRANT SELECT, UPDATE ON work_queue TO kalshi_worker;
+GRANT SELECT, UPDATE, DELETE ON work_queue TO kalshi_worker;
 
 -- RAG
-GRANT SELECT ON events, markets, market_ticks, market_candles TO kalshi_rag;
+GRANT SELECT ON events, markets, market_ticks, market_ticks_latest, market_candles,
+  market_candles_latest TO kalshi_rag;
 GRANT SELECT, INSERT, UPDATE ON rag_documents TO kalshi_rag;
 GRANT SELECT, INSERT, UPDATE ON prediction_runs TO kalshi_rag;
 GRANT SELECT, INSERT, UPDATE ON market_predictions TO kalshi_rag;
 GRANT SELECT, INSERT, UPDATE ON ingest_state TO kalshi_rag;
+GRANT INSERT, UPDATE, DELETE ON portal_event_rollup TO kalshi_rag;
 
 -- Portal (read-only, insert on work_queue when queue-mode backfill is enabled).
 GRANT SELECT ON
-  events, markets, active_markets, market_ticks, lifecycle_events, market_candles,
-  ingest_state, work_queue, prediction_runs, market_predictions, rag_documents
+  events, markets, active_markets, market_ticks, market_ticks_latest,
+  lifecycle_events, market_candles, market_candles_latest, ingest_state, work_queue,
+  prediction_runs, market_predictions, rag_documents, portal_event_rollup
 TO kalshi_portal;
 GRANT INSERT ON work_queue TO kalshi_portal;
 

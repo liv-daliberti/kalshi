@@ -116,7 +116,17 @@ class PendingUpdate:
     sid: int | None
     tickers: tuple[str, ...]
     sid_field: str | None = None
+    update_style: str | None = None
+    include_channels: bool | None = None
     attempts: int = 0
+
+
+@dataclass
+class SubscriptionUpdateState:
+    """Mutable update_subscription state."""
+
+    sid_field: str | None = None
+    update_disabled: bool = False
 
 
 @dataclass
@@ -126,10 +136,10 @@ class SubscriptionState:
     subscribed: set[str]
     lock: asyncio.Lock
     request_id: Iterable[int]
-    sid_field: str | None = None
     sid_tickers: dict[int, set[str]] = field(default_factory=dict)
     pending_subscriptions: dict[int, set[str]] = field(default_factory=dict)
     pending_updates: dict[int, PendingUpdate] = field(default_factory=dict)
+    update_state: SubscriptionUpdateState = field(default_factory=SubscriptionUpdateState)
 
 
 @dataclass(frozen=True)

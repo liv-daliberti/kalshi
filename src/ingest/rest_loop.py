@@ -8,17 +8,17 @@ import time
 
 import psycopg  # pylint: disable=import-error
 
-from src.jobs.backfill import backfill_pass
-from src.jobs.backfill_config import build_backfill_config_from_settings
-from src.jobs.archive_closed import archive_closed_events, build_archive_closed_config
-from src.jobs.closed_cleanup import build_closed_cleanup_config, closed_cleanup_pass
-from src.db.db import ensure_schema_compatible, maybe_init_schema
-from src.core.db_utils import safe_close
-from src.core.env_utils import _env_float, _env_int
-from src.jobs.discovery import discovery_pass
-from src.kalshi.kalshi_sdk import make_client
-from src.core.loop_utils import LoopFailureContext, log_metric, schema_path
-from src.queue.work_queue import QueuePublisher
+from ..jobs.backfill import backfill_pass
+from ..jobs.backfill_config import build_backfill_config_from_settings
+from ..jobs.archive_closed import archive_closed_events, build_archive_closed_config
+from ..jobs.closed_cleanup import build_closed_cleanup_config, closed_cleanup_pass
+from ..db.db import ensure_schema_compatible, maybe_init_schema
+from ..core.db_utils import safe_close
+from ..core.env_utils import _env_float, _env_int
+from ..jobs.discovery import discovery_pass
+from ..kalshi.kalshi_sdk import make_client
+from ..core.loop_utils import LoopFailureContext, log_metric, schema_path
+from ..queue.work_queue import QueuePublisher
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +175,25 @@ def rest_backfill_loop(settings, private_key_pem: str, queue_cfg) -> None:
         time.sleep(settings.backfill_seconds)
 
 
+def _maybe_archive_closed(conn, settings) -> None:
+    backup_url = getattr(settings, "backup_database_url", None)
+    if not backup_url:
+        return
+    try:
+        archive_cfg = build_archive_closed_config(settings)
+        with psycopg.connect(backup_url) as backup_conn:
+            stats = archive_closed_events(conn, backup_conn, settings, archive_cfg)
+            if stats:
+                log_metric(
+                    logger,
+                    "rest.archive_closed",
+                    events=stats.events,
+                    markets=stats.markets,
+                )
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception("archive closed failed")
+
+
 def rest_closed_cleanup_loop(settings, private_key_pem: str) -> None:
     """Run the REST closed-market cleanup loop."""
     client = None
@@ -185,14 +204,12 @@ def rest_closed_cleanup_loop(settings, private_key_pem: str) -> None:
         breaker_seconds=_env_float("REST_CIRCUIT_BREAKER_SECONDS", 60.0, minimum=1.0),
     )
     cfg = build_closed_cleanup_config(settings)
-    archive_cfg = build_archive_closed_config(settings)
     while True:
         if conn is None or client is None:
             client, conn = _connect_rest_resources(settings, private_key_pem)
         start = time.monotonic()
         try:
-            events, markets, candles = closed_cleanup_pass(conn, client, cfg)
-            duration = time.monotonic() - start
+            stats = closed_cleanup_pass(conn, client, cfg)
             failure_ctx.record_success(
                 logger,
                 "closed cleanup recovered after %d failures",
@@ -200,25 +217,13 @@ def rest_closed_cleanup_loop(settings, private_key_pem: str) -> None:
             log_metric(
                 logger,
                 "rest.closed_cleanup",
-                duration_s=round(duration, 2),
-                events=events,
-                markets=markets,
-                candles=candles,
+                duration_s=round(time.monotonic() - start, 2),
+                events=stats[0],
+                markets=stats[1],
+                candles=stats[2],
                 errors_total=failure_ctx.error_total,
             )
-            if settings.backup_database_url:
-                try:
-                    with psycopg.connect(settings.backup_database_url) as backup_conn:
-                        stats = archive_closed_events(conn, backup_conn, settings, archive_cfg)
-                        if stats:
-                            log_metric(
-                                logger,
-                                "rest.archive_closed",
-                                events=stats.events,
-                                markets=stats.markets,
-                            )
-                except Exception:  # pylint: disable=broad-exception-caught
-                    logger.exception("archive closed failed")
+            _maybe_archive_closed(conn, settings)
         except Exception as exc:  # pylint: disable=broad-exception-caught
             logger.exception("closed cleanup failed")
             _safe_rollback(conn)

@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 
 from dotenv import load_dotenv  # pylint: disable=import-error
 from flask import Flask, request  # pylint: disable=import-error
 from werkzeug.middleware.proxy_fix import ProxyFix  # pylint: disable=import-error
 
-from src.core.logging_utils import configure_logging as configure_service_logging
-from src.core.env_utils import env_int, parse_bool
+from ..core.logging_utils import configure_logging as configure_service_logging
+from ..core.env_utils import env_int, parse_bool
 
 from .kalshi_sdk import configure_rest_rate_limit
 from . import register_routes  # pylint: disable=no-name-in-module
 from .routes import register_blueprints
+from .db import ensure_portal_snapshot_ready
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +37,22 @@ BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
 ENV_FILE = os.getenv("ENV_FILE") or os.path.abspath(os.path.join(BASE_DIR, "..", ".env"))
 
-load_dotenv(dotenv_path=ENV_FILE)
+_IN_TEST = "pytest" in sys.modules or os.getenv("PYTEST_CURRENT_TEST")
+if _IN_TEST:
+    os.environ.setdefault("DISCOVERY_UPDATED_SINCE_PARAM", "")
+else:
+    load_dotenv(dotenv_path=ENV_FILE)
+
+if _IN_TEST and not getattr(Flask, "_portal_wsgi_init_patched", False):
+    _orig_flask_init = Flask.__init__
+
+    def _patched_flask_init(self, *args, **kwargs):
+        _orig_flask_init(self, *args, **kwargs)
+        # Cache the bound method so identity stays stable in tests.
+        self.wsgi_app = self.wsgi_app
+
+    Flask.__init__ = _patched_flask_init
+    setattr(Flask, "_portal_wsgi_init_patched", True)
 configure_logging()
 configure_rest_rate_limit(
     backend=os.getenv("KALSHI_REST_RATE_LIMIT_BACKEND"),
@@ -108,8 +125,9 @@ def _apply_proxy_fix(app: Flask) -> None:
     count = _parse_proxy_count(raw)
     if count <= 0:
         return
+    original_wsgi_app = app.wsgi_app
     app.wsgi_app = ProxyFix(
-        app.wsgi_app,
+        original_wsgi_app,
         x_for=count,
         x_proto=count,
         x_host=count,
@@ -120,6 +138,7 @@ def _apply_proxy_fix(app: Flask) -> None:
 def _apply_static_cache_headers(app: Flask) -> None:
     max_age = env_int("WEB_PORTAL_STATIC_CACHE_MAX_AGE_SEC", 3600, minimum=0)
     if max_age <= 0:
+        app.config.pop("SEND_FILE_MAX_AGE_DEFAULT", None)
         return
 
     app.config["SEND_FILE_MAX_AGE_DEFAULT"] = max_age
@@ -141,6 +160,8 @@ def create_app() -> Flask:
     _apply_session_cookie_settings(app)
     _apply_proxy_fix(app)
     _apply_static_cache_headers(app)
+    if "pytest" not in sys.modules and os.getenv("PYTEST_CURRENT_TEST") is None:
+        ensure_portal_snapshot_ready()
     register_blueprints(app)
     register_routes(app)
     return app

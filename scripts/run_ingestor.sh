@@ -70,6 +70,25 @@ if [ -n "$CA_BUNDLE_HOST" ]; then
   CA_BUNDLE_ARGS+=(--env SSL_CERT_FILE="$CA_BUNDLE_CONTAINER")
 fi
 
+KEY_BIND_ARGS=()
+KEY_ENV_ARGS=()
+PRIMARY_KEY_DIR=""
+if [ -n "${KALSHI_PRIVATE_KEY_PEM_PATH:-}" ]; then
+  PRIMARY_KEY_DIR="$(dirname "$KALSHI_PRIVATE_KEY_PEM_PATH")"
+  KEY_BIND_ARGS+=(--bind "$PRIMARY_KEY_DIR:/secrets")
+  KEY_ENV_ARGS+=(--env KALSHI_PRIVATE_KEY_PEM_PATH="/secrets/$(basename "$KALSHI_PRIVATE_KEY_PEM_PATH")")
+fi
+if [ -n "${KALSHI_PRIVATE_KEY_PEM_PATH_2:-}" ]; then
+  SECONDARY_KEY_DIR="$(dirname "$KALSHI_PRIVATE_KEY_PEM_PATH_2")"
+  SECONDARY_KEY_BASE="$(basename "$KALSHI_PRIVATE_KEY_PEM_PATH_2")"
+  if [ -n "$PRIMARY_KEY_DIR" ] && [ "$SECONDARY_KEY_DIR" = "$PRIMARY_KEY_DIR" ]; then
+    KEY_ENV_ARGS+=(--env KALSHI_PRIVATE_KEY_PEM_PATH_2="/secrets/$SECONDARY_KEY_BASE")
+  else
+    KEY_BIND_ARGS+=(--bind "$SECONDARY_KEY_DIR:/secrets2")
+    KEY_ENV_ARGS+=(--env KALSHI_PRIVATE_KEY_PEM_PATH_2="/secrets2/$SECONDARY_KEY_BASE")
+  fi
+fi
+
 # Default PGDATA_HOST to a local folder if not set in the env file.
 if [ -z "${PGDATA_HOST:-}" ]; then
   export PGDATA_HOST="$ROOT/kalshi_pgdata"
@@ -150,6 +169,7 @@ REST_PID=""
 WS_PIDS=()
 WORKER_PIDS=()
 QUEUE_MAINT_PID=""
+SPARKLINE_REFRESH_PID=""
 PG_ALREADY_RUNNING=0
 PID_FILE="$PGDATA_HOST/postmaster.pid"
 terminate_postgres_pid () {
@@ -360,6 +380,10 @@ cleanup () {
     kill "$QUEUE_MAINT_PID" || true
     wait "$QUEUE_MAINT_PID" || true
   fi
+  if [ -n "$SPARKLINE_REFRESH_PID" ] && kill -0 "$SPARKLINE_REFRESH_PID" 2>/dev/null; then
+    kill "$SPARKLINE_REFRESH_PID" || true
+    wait "$SPARKLINE_REFRESH_PID" || true
+  fi
   if [ -n "$REST_PID" ] && kill -0 "$REST_PID" 2>/dev/null; then
     kill "$REST_PID" || true
     wait "$REST_PID" || true
@@ -422,12 +446,263 @@ fi
 
 # Ensure DATABASE_URL points to localhost on this node
 export DATABASE_URL="postgresql://${POSTGRES_USER}@127.0.0.1:${POSTGRES_PORT}/${POSTGRES_DB}"
-# Strip other DATABASE_URL_* vars to avoid guardrail noise inside services.
-unset DATABASE_URL_REST DATABASE_URL_WS DATABASE_URL_WORKER DATABASE_URL_RAG DATABASE_URL_PORTAL || true
 REST_DB_URL="${DATABASE_URL_REST:-$DATABASE_URL}"
 WS_DB_URL="${DATABASE_URL_WS:-$DATABASE_URL}"
 WORKER_DB_URL="${DATABASE_URL_WORKER:-$DATABASE_URL}"
+RAG_DB_URL="${DATABASE_URL_RAG:-$DATABASE_URL}"
+PORTAL_DB_URL="${DATABASE_URL_PORTAL:-$DATABASE_URL}"
 DB_INIT_SCHEMA="${DB_INIT_SCHEMA:-0}"
+MIGRATOR_ENABLE="${MIGRATOR_ENABLE:-1}"
+MIGRATOR_APPLY_REMOTE="${MIGRATOR_APPLY_REMOTE:-auto}"
+MIGRATOR_APPLY_REMOTE_RESOLVED=0
+case "$MIGRATOR_APPLY_REMOTE" in
+  1|true|t|yes|y|on)
+    MIGRATOR_APPLY_REMOTE_RESOLVED=1
+    ;;
+  0|false|f|no|n|off)
+    MIGRATOR_APPLY_REMOTE_RESOLVED=0
+    ;;
+  auto|AUTO|"")
+    if [ "$REST_DB_URL" != "$DATABASE_URL" ]; then
+      MIGRATOR_APPLY_REMOTE_RESOLVED=1
+    fi
+    if [ "$WS_DB_URL" != "$DATABASE_URL" ]; then
+      MIGRATOR_APPLY_REMOTE_RESOLVED=1
+    fi
+    if [ "$WORKER_DB_URL" != "$DATABASE_URL" ]; then
+      MIGRATOR_APPLY_REMOTE_RESOLVED=1
+    fi
+    if [ "$RAG_DB_URL" != "$DATABASE_URL" ]; then
+      MIGRATOR_APPLY_REMOTE_RESOLVED=1
+    fi
+    if [ "$PORTAL_DB_URL" != "$DATABASE_URL" ]; then
+      MIGRATOR_APPLY_REMOTE_RESOLVED=1
+    fi
+    ;;
+  *)
+    echo "Unknown MIGRATOR_APPLY_REMOTE=$MIGRATOR_APPLY_REMOTE (use 0/1/auto)." >&2
+    exit 1
+    ;;
+esac
+
+if [ "$MIGRATOR_ENABLE" != "0" ]; then
+  MIGRATOR_ENV_ARGS=()
+  if [[ "$ENV_FILE" == "$ROOT/"* ]]; then
+    MIGRATOR_ENV_ARGS+=(--env ENV_FILE="/app/${ENV_FILE#$ROOT/}")
+  fi
+
+  run_migrator() {
+    local url="$1"
+    local label="${2:-}"
+    local log_file="$LOG_DIR/migrator.log"
+    local label_msg=""
+    if [ -n "$label" ]; then
+      log_file="$LOG_DIR/migrator_${label}.log"
+      label_msg=" ($label)"
+    fi
+    echo "Running migrator (schema init/update)${label_msg}..." >&2
+    apptainer exec \
+      "${CA_BUNDLE_ARGS[@]}" \
+      "${APPTAINER_PY_ENV_ARGS[@]}" \
+      --bind "$ROOT":/app \
+      --pwd /app \
+      --env DATABASE_URL="$url" \
+      "${MIGRATOR_ENV_ARGS[@]}" \
+      "$ROOT/kalshi_ingestor.sif" \
+      python -m src.services.migrator > "$log_file" 2>&1 || {
+        echo "Migrator failed${label_msg}; see $log_file" >&2
+        exit 1
+      }
+  }
+
+  add_migrator_target() {
+    local url="$1"
+    local label="$2"
+    if [ -z "$url" ]; then
+      return
+    fi
+    for existing in "${MIGRATOR_URLS[@]}"; do
+      if [ "$existing" = "$url" ]; then
+        return
+      fi
+    done
+    MIGRATOR_URLS+=("$url")
+    MIGRATOR_LABELS+=("$label")
+  }
+
+  MIGRATOR_URLS=("$DATABASE_URL")
+  MIGRATOR_LABELS=("")
+  if [ "$MIGRATOR_APPLY_REMOTE_RESOLVED" -eq 1 ]; then
+    add_migrator_target "$REST_DB_URL" "rest"
+    add_migrator_target "$WS_DB_URL" "ws"
+    add_migrator_target "$WORKER_DB_URL" "worker"
+    add_migrator_target "$RAG_DB_URL" "rag"
+    add_migrator_target "$PORTAL_DB_URL" "portal"
+  fi
+
+  for idx in "${!MIGRATOR_URLS[@]}"; do
+    run_migrator "${MIGRATOR_URLS[$idx]}" "${MIGRATOR_LABELS[$idx]}"
+  done
+fi
+
+APPLY_ROLES="${APPLY_ROLES:-auto}"
+APPLY_ROLES_RESOLVED=0
+APPLY_ROLES_ENV_ARGS=()
+case "$APPLY_ROLES" in
+  1|true|t|yes|y|on)
+    APPLY_ROLES_RESOLVED=1
+    ;;
+  0|false|f|no|n|off)
+    APPLY_ROLES_RESOLVED=0
+    ;;
+  auto|AUTO|"")
+    if [ -n "${DATABASE_URL_REST:-}" ] && [ "$DATABASE_URL_REST" != "$DATABASE_URL" ]; then
+      APPLY_ROLES_RESOLVED=1
+    fi
+    if [ -n "${DATABASE_URL_WS:-}" ] && [ "$DATABASE_URL_WS" != "$DATABASE_URL" ]; then
+      APPLY_ROLES_RESOLVED=1
+    fi
+    if [ -n "${DATABASE_URL_WORKER:-}" ] && [ "$DATABASE_URL_WORKER" != "$DATABASE_URL" ]; then
+      APPLY_ROLES_RESOLVED=1
+    fi
+    if [ -n "${DATABASE_URL_RAG:-}" ] && [ "$DATABASE_URL_RAG" != "$DATABASE_URL" ]; then
+      APPLY_ROLES_RESOLVED=1
+    fi
+    if [ -n "${DATABASE_URL_PORTAL:-}" ] && [ "$DATABASE_URL_PORTAL" != "$DATABASE_URL" ]; then
+      APPLY_ROLES_RESOLVED=1
+    fi
+    ;;
+  *)
+    echo "Unknown APPLY_ROLES=$APPLY_ROLES (use 0/1/auto)." >&2
+    exit 1
+    ;;
+esac
+
+if [ "$APPLY_ROLES_RESOLVED" -eq 1 ]; then
+  if [[ "$ENV_FILE" == "$ROOT/"* ]]; then
+    APPLY_ROLES_ENV_ARGS+=(--env ENV_FILE="/app/${ENV_FILE#$ROOT/}")
+  fi
+  echo "Applying database roles and service users..." >&2
+  apptainer exec \
+    "${CA_BUNDLE_ARGS[@]}" \
+    "${APPTAINER_PY_ENV_ARGS[@]}" \
+    --bind "$ROOT":/app \
+    --pwd /app \
+    --env DATABASE_URL="$DATABASE_URL" \
+    --env DATABASE_URL_REST="$REST_DB_URL" \
+    --env DATABASE_URL_WS="$WS_DB_URL" \
+    --env DATABASE_URL_WORKER="$WORKER_DB_URL" \
+    --env DATABASE_URL_RAG="$RAG_DB_URL" \
+    --env DATABASE_URL_PORTAL="$PORTAL_DB_URL" \
+    "${APPLY_ROLES_ENV_ARGS[@]}" \
+    "$ROOT/kalshi_ingestor.sif" \
+    python /app/scripts/apply_roles.py > "$LOG_DIR/apply_roles.log" 2>&1 || {
+      echo "apply_roles.py failed; see $LOG_DIR/apply_roles.log (set APPLY_ROLES=0 to skip)." >&2
+      exit 1
+    }
+fi
+
+# Ensure portal rollup grants are available for service users that trigger rollup.
+ENSURE_PORTAL_ROLLUP_GRANTS="${ENSURE_PORTAL_ROLLUP_GRANTS:-1}"
+if [ "$ENSURE_PORTAL_ROLLUP_GRANTS" != "0" ]; then
+  echo "Ensuring portal rollup grants for service users..." >&2
+  apptainer exec \
+    "${CA_BUNDLE_ARGS[@]}" \
+    "${APPTAINER_PY_ENV_ARGS[@]}" \
+    --bind "$ROOT":/app \
+    --pwd /app \
+    --env DATABASE_URL="$DATABASE_URL" \
+    "${APPLY_ROLES_ENV_ARGS[@]}" \
+    "$ROOT/kalshi_ingestor.sif" \
+    python - <<'PY' > "$LOG_DIR/portal_rollup_grants.log" 2>&1 || {
+import os
+import psycopg
+
+dsn = os.environ["DATABASE_URL"]
+users = ("kalshi_rest_user", "kalshi_ws_user", "kalshi_rag_user")
+with psycopg.connect(dsn) as conn:
+    with conn.cursor() as cur:
+        existing = []
+        for user in users:
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (user,))
+            if cur.fetchone():
+                existing.append(user)
+                cur.execute(f"ALTER ROLE {user} INHERIT")
+        if existing:
+            user_list = ", ".join(existing)
+            cur.execute(
+                f"GRANT INSERT, UPDATE, DELETE ON portal_event_rollup TO {user_list}"
+            )
+            cur.execute(
+                f"GRANT SELECT ON market_ticks_latest, market_predictions TO {user_list}"
+            )
+    conn.commit()
+print("Portal rollup grants applied.")
+PY
+      echo "portal rollup grant step failed; see $LOG_DIR/portal_rollup_grants.log (set ENSURE_PORTAL_ROLLUP_GRANTS=0 to skip)." >&2
+      exit 1
+    }
+fi
+
+# Optionally purge all work queue jobs on restart to avoid stale backlog.
+WORK_QUEUE_PURGE_ON_START="${WORK_QUEUE_PURGE_ON_START:-1}"
+if [ "$WORK_QUEUE_PURGE_ON_START" != "0" ]; then
+  echo "Purging work queue (all job types)..." >&2
+  if PGPASSWORD="$POSTGRES_PASSWORD" apptainer exec "$ROOT/postgres_16.sif" \
+    psql -h 127.0.0.1 -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \
+    "SELECT to_regclass('public.work_queue')" | grep -q "work_queue"; then
+    purged_count="$(PGPASSWORD="$POSTGRES_PASSWORD" apptainer exec "$ROOT/postgres_16.sif" \
+      psql -h 127.0.0.1 -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \
+      "WITH deleted AS (DELETE FROM work_queue RETURNING 1) SELECT count(*) FROM deleted;")"
+    echo "Purged work_queue rows: ${purged_count:-0}" >&2
+  else
+    echo "work_queue table not found; skipping work_queue purge." >&2
+  fi
+
+  WORK_QUEUE_PURGE_RABBITMQ_ON_START="${WORK_QUEUE_PURGE_RABBITMQ_ON_START:-1}"
+  if [ "$WORK_QUEUE_PURGE_RABBITMQ_ON_START" != "0" ]; then
+    echo "Purging RabbitMQ queue (if enabled)..." >&2
+    apptainer exec \
+      "${CA_BUNDLE_ARGS[@]}" \
+      "${APPTAINER_PY_ENV_ARGS[@]}" \
+      --bind "$ROOT":/app \
+      --pwd /app \
+      "$ROOT/kalshi_ingestor.sif" \
+      python - <<'PY' || echo "RabbitMQ purge skipped or failed." >&2
+from src.queue import work_queue
+
+cfg = work_queue.load_queue_config()
+if not cfg.rabbitmq.publish or not cfg.rabbitmq.url:
+    raise SystemExit(0)
+
+if work_queue.PIKA is None:
+    raise SystemExit(0)
+
+params = work_queue.PIKA.URLParameters(cfg.rabbitmq.url)
+conn = work_queue.PIKA.BlockingConnection(params)
+try:
+    channel = conn.channel()
+    queue_names = {cfg.rabbitmq.queue_name}
+    for job_type in cfg.job_types:
+        queue_names.add(
+            work_queue.queue_name_for_job_type(job_type, cfg.rabbitmq.queue_name)
+        )
+    for queue_name in sorted(queue_names):
+        channel.queue_declare(queue=queue_name, durable=True)
+        purged = channel.queue_purge(queue=queue_name)
+        count = getattr(getattr(purged, "method", None), "message_count", purged)
+        print(f"Purged RabbitMQ queue={queue_name} messages={count}")
+finally:
+    try:
+        conn.close()
+    except Exception:
+        pass
+PY
+  fi
+fi
+
+# Strip other DATABASE_URL_* vars to avoid guardrail noise inside services.
+unset DATABASE_URL_REST DATABASE_URL_WS DATABASE_URL_WORKER DATABASE_URL_RAG DATABASE_URL_PORTAL || true
 
 INGESTOR_MODE="${INGESTOR_MODE:-all}"
 INGESTOR_MODE="$(echo "$INGESTOR_MODE" | tr '[:upper:]' '[:lower:]')"
@@ -476,14 +751,37 @@ fi
 
 PIDS=()
 
+SPARKLINE_REFRESH_ENABLE="${WEB_PORTAL_EVENT_SPARKLINE_REFRESH_ENABLE:-0}"
+if [ "$SPARKLINE_REFRESH_ENABLE" != "0" ]; then
+  if [ -z "${PORTAL_DB_URL:-}" ]; then
+    echo "WEB_PORTAL_EVENT_SPARKLINE_REFRESH_ENABLE=1 but PORTAL_DB_URL is empty; skipping sparkline refresher." >&2
+  else
+    SPARKLINE_ENV_ARGS=()
+    if [[ "$ENV_FILE" == "$ROOT/"* ]]; then
+      SPARKLINE_ENV_ARGS+=(--env ENV_FILE="/app/${ENV_FILE#$ROOT/}")
+    fi
+    apptainer exec \
+      "${CA_BUNDLE_ARGS[@]}" \
+      "${APPTAINER_PY_ENV_ARGS[@]}" \
+      --bind "$ROOT":/app \
+      --pwd /app \
+      --env DATABASE_URL="$PORTAL_DB_URL" \
+      "${SPARKLINE_ENV_ARGS[@]}" \
+      "$ROOT/kalshi_ingestor.sif" \
+      python /app/scripts/refresh_event_sparklines.py --loop &
+    SPARKLINE_REFRESH_PID=$!
+    PIDS+=("$SPARKLINE_REFRESH_PID")
+  fi
+fi
+
 if [ "$RUN_REST" -eq 1 ]; then
   apptainer exec \
     "${CA_BUNDLE_ARGS[@]}" \
     "${APPTAINER_PY_ENV_ARGS[@]}" \
     --bind "$ROOT":/app \
     --pwd /app \
-    --bind "$(dirname "$KALSHI_PRIVATE_KEY_PEM_PATH")":/secrets \
-    --env KALSHI_PRIVATE_KEY_PEM_PATH="/secrets/$(basename "$KALSHI_PRIVATE_KEY_PEM_PATH")" \
+    "${KEY_BIND_ARGS[@]}" \
+    "${KEY_ENV_ARGS[@]}" \
     --env KALSHI_HOST="$KALSHI_HOST" \
     --env DATABASE_URL="$REST_DB_URL" \
     --env BACKUP_DATABASE_URL="${BACKUP_DATABASE_URL:-}" \
@@ -509,8 +807,8 @@ if [ "$RUN_WS" -eq 1 ]; then
       "${APPTAINER_PY_ENV_ARGS[@]}" \
       --bind "$ROOT":/app \
       --pwd /app \
-      --bind "$(dirname "$KALSHI_PRIVATE_KEY_PEM_PATH")":/secrets \
-      --env KALSHI_PRIVATE_KEY_PEM_PATH="/secrets/$(basename "$KALSHI_PRIVATE_KEY_PEM_PATH")" \
+      "${KEY_BIND_ARGS[@]}" \
+      "${KEY_ENV_ARGS[@]}" \
       --env KALSHI_HOST="$KALSHI_HOST" \
       --env DATABASE_URL="$WS_DB_URL" \
       --env DB_INIT_SCHEMA="$DB_INIT_SCHEMA" \
@@ -537,8 +835,8 @@ if [ "$RUN_WORKER" -eq 1 ] && [ "${WORK_QUEUE_ENABLE:-0}" = "1" ]; then
         "${APPTAINER_PY_ENV_ARGS[@]}" \
         --bind "$ROOT":/app \
         --pwd /app \
-        --bind "$(dirname "$KALSHI_PRIVATE_KEY_PEM_PATH")":/secrets \
-        --env KALSHI_PRIVATE_KEY_PEM_PATH="/secrets/$(basename "$KALSHI_PRIVATE_KEY_PEM_PATH")" \
+        "${KEY_BIND_ARGS[@]}" \
+        "${KEY_ENV_ARGS[@]}" \
         --env KALSHI_HOST="$KALSHI_HOST" \
         --env DATABASE_URL="$WORKER_DB_URL" \
         --env DB_INIT_SCHEMA="$DB_INIT_SCHEMA" \

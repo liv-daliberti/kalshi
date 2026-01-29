@@ -16,17 +16,37 @@ def ensure_psycopg_stub() -> None:
     try:
         import psycopg  # noqa: F401
     except Exception:
-        class UndefinedTable(Exception):
+        class Error(Exception):
+            pass
+
+        class UndefinedTable(Error):
+            pass
+
+        class OperationalError(Error):
+            pass
+
+        class InterfaceError(Error):
+            pass
+
+        class InsufficientPrivilege(Error):
             pass
 
         rows_stub = types.SimpleNamespace(dict_row=object())
-        errors_stub = types.SimpleNamespace(UndefinedTable=UndefinedTable)
+        errors_stub = types.SimpleNamespace(
+            UndefinedTable=UndefinedTable,
+            OperationalError=OperationalError,
+            InterfaceError=InterfaceError,
+            InsufficientPrivilege=InsufficientPrivilege,
+        )
         sys.modules["psycopg.rows"] = rows_stub
         sys.modules["psycopg"] = types.SimpleNamespace(
             Connection=object,
             connect=lambda *args, **kwargs: None,
             rows=rows_stub,
             errors=errors_stub,
+            Error=Error,
+            OperationalError=OperationalError,
+            InterfaceError=InterfaceError,
         )
 
 

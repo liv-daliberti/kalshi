@@ -16,8 +16,6 @@ ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from src.queue import work_queue
-
 
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     raw = os.getenv(name)
@@ -36,9 +34,18 @@ def _load_env() -> None:
         load_dotenv(dotenv_path=env_file)
 
 
+def _load_work_queue():
+    if ROOT_DIR not in sys.path:
+        sys.path.insert(0, ROOT_DIR)
+    from src.queue import work_queue
+
+    return work_queue
+
+
 def _run_once(db_url: str) -> None:
     lock_timeout_seconds = _env_int("WORK_QUEUE_LOCK_TIMEOUT_SECONDS", 900, minimum=10)
     cleanup_done_hours = _env_int("WORK_QUEUE_CLEANUP_HOURS", 24, minimum=1)
+    work_queue = _load_work_queue()
     with psycopg.connect(db_url) as conn:
         stale = work_queue.requeue_stale_jobs(conn, lock_timeout_seconds)
         cleaned = work_queue.cleanup_finished_jobs(conn, cleanup_done_hours)

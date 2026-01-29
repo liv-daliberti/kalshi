@@ -4,33 +4,24 @@ from __future__ import annotations
 
 
 def last_tick_lateral_sql(columns: str | None = None) -> str:
-    """Return a lateral join for the latest market tick."""
+    """Return a join for the latest market tick."""
     if columns is None:
         columns = (
             "t.ts, t.implied_yes_mid, t.price_dollars, t.yes_bid_dollars, "
             "t.yes_ask_dollars, t.volume"
         )
-    return f"""
-    LEFT JOIN LATERAL (
-      SELECT {columns}
-      FROM market_ticks t
-      WHERE t.ticker = m.ticker
-      ORDER BY t.ts DESC, t.id DESC
-      LIMIT 1
-    ) t ON TRUE
+    _ = columns
+    return """
+    LEFT JOIN market_ticks_latest t
+      ON t.ticker = m.ticker
     """
 
 
 def last_candle_lateral_sql() -> str:
-    """Return a lateral join for the latest market candle."""
+    """Return a join for the latest market candle."""
     return """
-    LEFT JOIN LATERAL (
-      SELECT c.end_period_ts, c.close
-      FROM market_candles c
-      WHERE c.market_ticker = m.ticker
-      ORDER BY c.end_period_ts DESC
-      LIMIT 1
-    ) c ON TRUE
+    LEFT JOIN market_candles_latest c
+      ON c.market_ticker = m.ticker
     """
 
 

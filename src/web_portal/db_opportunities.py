@@ -10,8 +10,8 @@ from typing import Any
 import psycopg  # pylint: disable=import-error
 from psycopg.rows import dict_row  # pylint: disable=import-error
 
-from src.db.db import dec
-from src.db.sql_fragments import (
+from ..db.db import dec
+from ..db.sql_fragments import (
     event_core_columns_sql,
     last_prediction_lateral_sql,
     last_tick_lateral_sql,
@@ -21,7 +21,7 @@ from src.db.sql_fragments import (
 
 from .config import _env_int
 from .db_timing import timed_cursor
-from .filter_sql import build_filter_where
+from .filter_sql import build_filter_where, normalize_search
 from .formatters import (
     _derive_yes_price,
     _format_age_minutes,
@@ -77,15 +77,10 @@ def _build_opportunity_where(
     return build_filter_where(
         filters,
         [
-            "e.title",
-            "e.sub_title",
-            "e.event_ticker",
-            "e.category",
-            "m.title",
-            "m.subtitle",
-            "m.yes_sub_title",
-            "m.ticker",
+            "e.search_text",
+            "m.search_text",
         ],
+        search_override=normalize_search(filters.search),
     )
 
 

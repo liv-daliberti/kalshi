@@ -2,12 +2,13 @@ import os
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
+import importlib
 
 from _test_utils import add_src_to_path
 
 add_src_to_path()
 
-import src.jobs.event_filter as event_filter
+event_filter = importlib.import_module("src.jobs.event_filter")
 
 
 class TestEventScanStats(unittest.TestCase):

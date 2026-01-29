@@ -55,15 +55,22 @@ def main() -> None:
                     "SELECT 1 FROM pg_roles WHERE rolname = %s",
                     (user,),
                 )
-                if cur.fetchone():
-                    continue
+                exists = cur.fetchone() is not None
                 password = _password_from_url(url)
-                cur.execute(
-                    sql.SQL("CREATE USER {} WITH LOGIN PASSWORD {}").format(
-                        sql.Identifier(user),
-                        sql.Literal(password),
+                if exists:
+                    cur.execute(
+                        sql.SQL("ALTER ROLE {} WITH LOGIN PASSWORD {} INHERIT").format(
+                            sql.Identifier(user),
+                            sql.Literal(password),
+                        )
                     )
-                )
+                else:
+                    cur.execute(
+                        sql.SQL("CREATE USER {} WITH LOGIN PASSWORD {} INHERIT").format(
+                            sql.Identifier(user),
+                            sql.Literal(password),
+                        )
+                    )
             for user, role in role_map.items():
                 cur.execute(
                     sql.SQL("GRANT {} TO {}").format(

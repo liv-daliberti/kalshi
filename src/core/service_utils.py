@@ -6,9 +6,9 @@ from typing import Any
 
 import psycopg  # pylint: disable=import-error
 
-from src.db.db import ensure_schema_compatible, maybe_init_schema
-from src.core.loop_utils import schema_path
-from src.kalshi.kalshi_sdk import make_client
+from ..db.db import ensure_schema_compatible, maybe_init_schema
+from .loop_utils import schema_path
+from ..kalshi.kalshi_sdk import make_client
 
 
 def _default_schema_path() -> str:

@@ -6,6 +6,7 @@ import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, mock_open, patch
+import importlib
 
 from _test_utils import (
     add_src_to_path,
@@ -19,9 +20,9 @@ add_src_to_path()
 ensure_websockets_stub()
 ensure_cryptography_stub()
 
-import src.services.main as main
-import src.rag.rag_loop as rag_loop
-import src.ingest.rest_loop as rest_loop
+main = importlib.import_module("src.services.main")
+rag_loop = importlib.import_module("src.rag.rag_loop")
+rest_loop = importlib.import_module("src.ingest.rest_loop")
 
 
 def _settings(**overrides):

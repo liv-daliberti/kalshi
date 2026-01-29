@@ -10,22 +10,22 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from src.db.db import (
+from ...db.db import (
     delete_active_market,
     insert_lifecycle_events,
     insert_market_ticks,
     maybe_upsert_active_market_from_market,
     upsert_market,
 )
-from src.core.loop_utils import log_metric as _log_metric
-from src.ingest.ws.ws_ingest_db_utils import (
+from ...core.loop_utils import log_metric as _log_metric
+from .ws_ingest_db_utils import (
     _psycopg_error_type,
     _psycopg_privilege_error_type,
     _require_psycopg,
     _safe_rollback,
 )
-from src.ingest.ws.ws_ingest_models import WriterConfig, WriterStatus
-from src.ingest.ws.ws_ingest_utils import _extract_market_id, _resolve_market_ticker
+from .ws_ingest_models import WriterConfig, WriterStatus
+from .ws_ingest_utils import _extract_market_id, _resolve_market_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,38 @@ class _DbBatcher:
             _DB_WORK_TICK: now,
             _DB_WORK_LIFECYCLE: now,
         }
+
+    @property
+    def _tick_buffer(self) -> list[dict]:
+        return self._buffers[_DB_WORK_TICK]
+
+    @_tick_buffer.setter
+    def _tick_buffer(self, value: list[dict]) -> None:
+        self._buffers[_DB_WORK_TICK] = value
+
+    @property
+    def _lifecycle_buffer(self) -> list[dict]:
+        return self._buffers[_DB_WORK_LIFECYCLE]
+
+    @_lifecycle_buffer.setter
+    def _lifecycle_buffer(self, value: list[dict]) -> None:
+        self._buffers[_DB_WORK_LIFECYCLE] = value
+
+    @property
+    def _last_tick_flush(self) -> float:
+        return self._last_flush[_DB_WORK_TICK]
+
+    @_last_tick_flush.setter
+    def _last_tick_flush(self, value: float) -> None:
+        self._last_flush[_DB_WORK_TICK] = value
+
+    @property
+    def _last_lifecycle_flush(self) -> float:
+        return self._last_flush[_DB_WORK_LIFECYCLE]
+
+    @_last_lifecycle_flush.setter
+    def _last_lifecycle_flush(self, value: float) -> None:
+        self._last_flush[_DB_WORK_LIFECYCLE] = value
 
     def add_tick(self, tick: dict) -> None:
         """Buffer a tick and flush if the batch is full."""

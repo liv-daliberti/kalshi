@@ -9,6 +9,14 @@ from .config import CLOSE_WINDOW_HOURS, EVENT_SORT_SQL
 
 
 @dataclass(frozen=True)
+class SortOrder:
+    """Sort key and order."""
+
+    sort: str | None
+    order: str | None
+
+
+@dataclass(frozen=True, init=False)
 class PortalFilters:
     """Parsed filters for the main portal view."""
 
@@ -17,13 +25,41 @@ class PortalFilters:
     strike_period: str | None
     close_window: str | None
     status: str | None
-    sort: str | None
-    order: str | None
+    sort_order: SortOrder
+    close_window_hours: float | None = None
+
+    def __init__(
+        self,
+        *,
+        search: str | None,
+        categories: tuple[str, ...],
+        strike_period: str | None,
+        close_window: str | None,
+        status: str | None,
+        sort: str | None,
+        order: str | None,
+        close_window_hours: float | None = None,
+    ) -> None:
+        object.__setattr__(self, "search", search)
+        object.__setattr__(self, "categories", categories)
+        object.__setattr__(self, "strike_period", strike_period)
+        object.__setattr__(self, "close_window", close_window)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "sort_order", SortOrder(sort=sort, order=order))
+        if close_window_hours is None:
+            _, hours = _parse_close_window(close_window)
+            close_window_hours = hours
+        object.__setattr__(self, "close_window_hours", close_window_hours)
 
     @property
-    def close_window_hours(self) -> float | None:
-        """Return close-window hours derived from the filter token."""
-        return _parse_close_window(self.close_window)[1]
+    def sort(self) -> str | None:
+        """Return the selected sort key."""
+        return self.sort_order.sort
+
+    @property
+    def order(self) -> str | None:
+        """Return the selected sort order."""
+        return self.sort_order.order
 
 
 def _clean_filter_value(raw: str | None) -> str | None:
@@ -109,12 +145,13 @@ def _parse_portal_filters(args: dict[str, Any]) -> PortalFilters:
         status = status.lower()
     sort = _parse_sort_value(args.get("sort"))
     order = _parse_order_value(args.get("order"))
-    close_window = _parse_close_window(args.get("close_window"))[0]
+    close_window, close_window_hours = _parse_close_window(args.get("close_window"))
     return PortalFilters(
         search=search,
         categories=categories,
         strike_period=strike_period,
         close_window=close_window,
+        close_window_hours=close_window_hours,
         status=status,
         sort=sort,
         order=order,

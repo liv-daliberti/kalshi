@@ -8,29 +8,176 @@ import logging
 import os
 import pkgutil
 import random
+import threading
 import tempfile
 import time
 from dataclasses import dataclass
-import functools
 from collections.abc import Mapping
-from typing import Any, Callable, Iterable, Iterator, Optional, Tuple
+from typing import Any, Callable, Iterable, Optional, Tuple
 
-from src.core.loop_utils import log_metric as _log_metric
-from src.kalshi.kalshi_rest_rate_limit import (
-    _candlesticks_apply_cooldown,
-    _candlesticks_wait,
+from ..core.loop_utils import log_metric as _log_metric
+from .kalshi_rest_rate_limit import (
+    _candlesticks_apply_cooldown as _candlesticks_apply_cooldown_impl,
+    _candlesticks_wait as _candlesticks_wait_impl,
     _extract_retry_after,
     configure_rest_rate_limit as _configure_rest_rate_limit,
+    current_rest_key,
     rest_apply_cooldown,
     rest_backoff_remaining as _rest_backoff_remaining,
     rest_register_rate_limit as _rest_register_rate_limit,
+    select_rest_key,
+    set_current_rest_key,
+    set_rest_key_rotation,
     rest_wait,
+)
+from .kalshi_sdk_utils import (
+    _extract_items as _extract_items_impl,
+    _filter_kwargs as _filter_kwargs_impl,
+    _to_plain_dict as _to_plain_dict_impl,
+)
+from .kalshi_sdk_events import (
+    EventSdkHooks,
+    _prepare_cursor_kwargs as _prepare_cursor_kwargs_impl,
+    _resolve_events_method as _resolve_events_method_impl,
+    _iter_events_stream as _iter_events_stream_impl,
+    _iter_events_paged as _iter_events_paged_impl,
+    iter_events as _iter_events_impl,
+)
+from .kalshi_sdk_candles import (
+    CandlesSdkHooks,
+    _build_candlestick_kwargs as _build_candlestick_kwargs_impl,
+    _normalize_candlesticks_response as _normalize_candlesticks_response_impl,
+    _resolve_candlesticks_method as _resolve_candlesticks_method_impl,
+    get_market_candlesticks as _get_market_candlesticks_impl,
 )
 
 logger = logging.getLogger(__name__)
 
-_TEMP_KEY_PATH: Optional[str] = None
+_TEMP_KEY_PATH: dict[str, str] = {}
 _LAST_HOST_OVERRIDE: Optional[str] = None
+
+
+def _event_hooks() -> EventSdkHooks:
+    return EventSdkHooks(
+        ensure_method_host=_ensure_method_host,
+        call_with_retries=_call_with_retries,
+        load_retry_config=_load_retry_config,
+        kalshi_error=KalshiSdkError,
+    )
+
+
+def _candles_hooks() -> CandlesSdkHooks:
+    return CandlesSdkHooks(
+        ensure_method_host=_ensure_method_host,
+        call_with_retries=_call_with_retries,
+        load_retry_config=_load_retry_config,
+        candlesticks_wait=_candlesticks_wait,
+        candlesticks_apply_cooldown=_candlesticks_apply_cooldown,
+        kalshi_error=KalshiSdkError,
+    )
+
+
+def _extract_items(resp: Any) -> tuple[list[Any], Optional[str]]:
+    return _extract_items_impl(resp)
+
+
+def _filter_kwargs(func: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+    return _filter_kwargs_impl(func, kwargs)
+
+
+def _to_plain_dict(obj: Any) -> Any:
+    return _to_plain_dict_impl(obj)
+
+
+def _resolve_events_method(client):
+    return _resolve_events_method_impl(client)
+
+
+def _prepare_cursor_kwargs(
+    method: Callable[..., Any],
+    base_kwargs: dict[str, Any],
+    cursor: Optional[str],
+) -> dict[str, Any]:
+    return _prepare_cursor_kwargs_impl(method, base_kwargs, cursor)
+
+
+def _resolve_candlesticks_method(client):
+    return _resolve_candlesticks_method_impl(client)
+
+
+def _build_candlestick_kwargs(
+    method: Callable[..., Any],
+    series_ticker: str,
+    market_ticker: str,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    _ensure_method_host(method)
+    return _build_candlestick_kwargs_impl(method, series_ticker, market_ticker, kwargs)
+
+
+def _normalize_candlesticks_response(resp: Any) -> dict:
+    return _normalize_candlesticks_response_impl(resp)
+
+
+def _iter_events_stream(
+    method: Callable[..., Any],
+    kwargs: dict[str, Any],
+    retry_cfg: RetryConfig,
+    rate_limit_hook: Optional[Callable[[float], None]] = None,
+) -> Iterable[dict]:
+    return _iter_events_stream_impl(
+        method,
+        kwargs,
+        retry_cfg,
+        _event_hooks(),
+        rate_limit_hook=rate_limit_hook,
+    )
+
+
+def _iter_events_paged(
+    method: Callable[..., Any],
+    kwargs: dict[str, Any],
+    retry_cfg: RetryConfig,
+    rate_limit_hook: Optional[Callable[[float], None]] = None,
+) -> Iterable[dict]:
+    return _iter_events_paged_impl(
+        method,
+        kwargs,
+        retry_cfg,
+        _event_hooks(),
+        rate_limit_hook=rate_limit_hook,
+    )
+
+
+def iter_events(
+    client,
+    *,
+    rate_limit_hook: Optional[Callable[[float], None]] = None,
+    **kwargs,
+) -> Iterable[dict]:
+    """Iterate Kalshi events with shared retry/rate-limit hooks applied."""
+    return _iter_events_impl(
+        client,
+        rate_limit_hook=rate_limit_hook,
+        hooks=_event_hooks(),
+        **kwargs,
+    )
+
+
+def get_market_candlesticks(
+    client,
+    series_ticker: str,
+    market_ticker: str,
+    **kwargs,
+) -> dict:
+    """Fetch candlestick data for a market with shared hooks applied."""
+    return _get_market_candlesticks_impl(
+        client,
+        series_ticker,
+        market_ticker,
+        hooks=_candles_hooks(),
+        **kwargs,
+    )
 
 
 def configure_rest_rate_limit(
@@ -52,6 +199,16 @@ def rest_register_rate_limit(
 def rest_backoff_remaining() -> float:
     """Return remaining global REST backoff seconds."""
     return _rest_backoff_remaining()
+
+
+def _candlesticks_wait() -> None:
+    """Wait for the next allowed candlestick request."""
+    _candlesticks_wait_impl()
+
+
+def _candlesticks_apply_cooldown(cooldown_sec: float) -> None:
+    """Apply a cooldown to candlestick requests."""
+    _candlesticks_apply_cooldown_impl(cooldown_sec)
 
 
 def extract_http_status(exc: Exception) -> int | None:
@@ -130,12 +287,51 @@ def _write_temp_key(private_key_pem: str) -> str:
     :rtype: str
     """
     global _TEMP_KEY_PATH  # pylint: disable=global-statement
-    if _TEMP_KEY_PATH:
+    if _TEMP_KEY_PATH is None:
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+            temp_file.write(private_key_pem)
+            _TEMP_KEY_PATH = temp_file.name
         return _TEMP_KEY_PATH
+    if isinstance(_TEMP_KEY_PATH, str):
+        return _TEMP_KEY_PATH
+    if not isinstance(_TEMP_KEY_PATH, dict):
+        _TEMP_KEY_PATH = {}
+    existing = _TEMP_KEY_PATH.get(private_key_pem)
+    if existing:
+        return existing
     with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
         temp_file.write(private_key_pem)
-        _TEMP_KEY_PATH = temp_file.name
-    return _TEMP_KEY_PATH
+        _TEMP_KEY_PATH[private_key_pem] = temp_file.name
+    return _TEMP_KEY_PATH[private_key_pem]
+
+
+def _read_private_key(path: str) -> str:
+    path = os.path.expandvars(os.path.expanduser(path))
+    with open(path, "r", encoding="utf-8") as pem_file:
+        return pem_file.read()
+
+
+def _load_secondary_credentials() -> list[tuple[str, str]]:
+    import sys  # pylint: disable=import-outside-toplevel
+
+    if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+        return []
+    api_key_id = os.getenv("KALSHI_API_KEY_ID_2", "").strip()
+    pem_path = os.getenv("KALSHI_PRIVATE_KEY_PEM_PATH_2", "").strip()
+    if not api_key_id and not pem_path:
+        return []
+    if not api_key_id or not pem_path:
+        logger.warning(
+            "Secondary Kalshi credentials require both KALSHI_API_KEY_ID_2 and "
+            "KALSHI_PRIVATE_KEY_PEM_PATH_2; ignoring."
+        )
+        return []
+    try:
+        private_key_pem = _read_private_key(pem_path)
+    except OSError as exc:
+        logger.warning("Secondary Kalshi private key could not be read: %s", exc)
+        return []
+    return [(api_key_id, private_key_pem)]
 
 
 def _import_sdk():
@@ -441,6 +637,126 @@ def _extract_status(exc: Exception) -> Optional[int]:
     return None
 
 
+class _KalshiClientPool:
+    """Rotate across multiple Kalshi clients to avoid per-key rate limits."""
+
+    _kalshi_client_pool = True
+
+    def __init__(self, clients: list[Any], labels: list[str]):
+        if not clients:
+            raise KalshiSdkError("Kalshi client pool requires at least one client.")
+        self._clients = list(clients)
+        self._labels = list(labels)
+        self._key_index = {label: idx for idx, label in enumerate(self._labels)}
+        self._lock = threading.Lock()
+        self._cooldowns = [0.0 for _ in self._clients]
+        self._next_index = 0
+
+    def _default_cooldown(self) -> float:
+        try:
+            return float(os.getenv("KALSHI_KEY_COOLDOWN_SECONDS", "60"))
+        except ValueError:
+            return 60.0
+
+    def _mark_cooldown(self, idx: int, exc: Exception) -> None:
+        retry_after = _extract_retry_after(exc)
+        cooldown = retry_after if retry_after is not None else self._default_cooldown()
+        if cooldown <= 0:
+            return
+        until = time.monotonic() + cooldown
+        with self._lock:
+            if until > self._cooldowns[idx]:
+                self._cooldowns[idx] = until
+        label = self._labels[idx] if idx < len(self._labels) else f"key{idx+1}"
+        logger.warning(
+            "Kalshi key %s rate limited; cooling down for %.1fs",
+            label,
+            cooldown,
+        )
+
+    def _pick_index(self) -> int:
+        now = time.monotonic()
+        with self._lock:
+            client_count = len(self._clients)
+            for _ in range(client_count):
+                idx = self._next_index % client_count
+                self._next_index += 1
+                if self._cooldowns[idx] <= now:
+                    return idx
+            idx = self._next_index % client_count
+            self._next_index += 1
+            return idx
+
+    def _preferred_index(self) -> Optional[int]:
+        key_id = current_rest_key()
+        if not key_id:
+            key_id = select_rest_key()
+        if not key_id:
+            return None
+        idx = self._key_index.get(key_id)
+        if idx is None:
+            return None
+        now = time.monotonic()
+        if self._cooldowns[idx] > now:
+            return None
+        return idx
+
+    def _call_method(self, name: str, *args, **kwargs):
+        last_exc: Exception | None = None
+        client_count = len(self._clients)
+        preferred_idx = self._preferred_index()
+        attempted: set[int] = set()
+        if preferred_idx is not None:
+            idx_sequence = [preferred_idx]
+        else:
+            idx_sequence = []
+        while len(idx_sequence) < client_count:
+            idx_sequence.append(self._pick_index())
+        for idx in idx_sequence:
+            if idx in attempted:
+                continue
+            attempted.add(idx)
+            client = self._clients[idx]
+            method = getattr(client, name)
+            try:
+                if idx < len(self._labels):
+                    set_current_rest_key(self._labels[idx])
+                return method(*args, **kwargs)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                last_exc = exc
+                status = _extract_status(exc)
+                if status == 429:
+                    self._mark_cooldown(idx, exc)
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise KalshiSdkError("All Kalshi API keys are unavailable.")
+
+    def client_count(self) -> int:
+        """Return the number of clients in the pool."""
+        return len(self._clients)
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        sample = getattr(self._clients[0], name)
+        if not callable(sample):
+            return sample
+
+        def _wrapped(*args, **kwargs):
+            return self._call_method(name, *args, **kwargs)
+
+        _wrapped.__name__ = getattr(sample, "__name__", name)
+        _wrapped.__qualname__ = getattr(sample, "__qualname__", name)
+        _wrapped.__doc__ = getattr(sample, "__doc__", None)
+        try:
+            _wrapped.__signature__ = inspect.signature(sample)
+        except (TypeError, ValueError):
+            pass
+        return _wrapped
+
+
 
 
 def _load_retry_config(prefix: str) -> RetryConfig:
@@ -580,21 +896,12 @@ def _call_with_retries(
             attempt += 1
 
 
-def make_client(host: str, api_key_id: str, private_key_pem: str):
-    """Create a Kalshi API client.
-
-    :param host: Kalshi API base URL.
-    :type host: str
-    :param api_key_id: API key identifier.
-    :type api_key_id: str
-    :param private_key_pem: Private key PEM contents.
-    :type private_key_pem: str
-    :return: Initialized Kalshi SDK client.
-    :rtype: Any
-    :raises KalshiSdkError: If the client cannot be initialized.
-    """
-    sdk = _import_sdk()
-    _patch_sdk_models()
+def _make_single_client(
+    sdk,
+    host: str,
+    api_key_id: str,
+    private_key_pem: str,
+):
     last_err: Optional[Exception] = None
     for name, factory in _candidate_factories(sdk):
         try:
@@ -611,358 +918,44 @@ def make_client(host: str, api_key_id: str, private_key_pem: str):
     ) from last_err
 
 
-def _filter_kwargs(func: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Filter kwargs to the function signature.
+def make_client(host: str, api_key_id: str, private_key_pem: str):
+    """Create a Kalshi API client (optionally with key rotation).
 
-    :param func: Target callable.
-    :type func: collections.abc.Callable[..., Any]
-    :param kwargs: Keyword arguments to filter.
-    :type kwargs: dict[str, Any]
-    :return: Filtered kwargs compatible with the signature.
-    :rtype: dict[str, Any]
-    """
-    sig = inspect.signature(func)
-    if any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
-        return kwargs
-    return {k: v for k, v in kwargs.items() if k in sig.parameters}
-
-
-def _extract_items(resp: Any) -> Tuple[list[Any], Optional[str]]:
-    """Extract items and cursor from a response payload.
-
-    :param resp: API response payload.
-    :type resp: Any
-    :return: Tuple of (items, cursor).
-    :rtype: tuple[list[Any], str | None]
-    """
-    if isinstance(resp, dict):
-        items = resp.get("events") or resp.get("items") or resp.get("data") or []
-        cursor = resp.get("next_cursor") or resp.get("cursor") or resp.get("next")
-        return list(items or []), cursor
-    if isinstance(resp, (list, tuple)):
-        if len(resp) == 2 and isinstance(resp[0], list):
-            return resp[0], resp[1]
-        return list(resp), None
-    items = getattr(resp, "events", None) or getattr(resp, "items", None)
-    cursor = getattr(resp, "next_cursor", None) or getattr(resp, "cursor", None)
-    return list(items or []), cursor
-
-
-def _to_plain_dict(obj: Any) -> Any:
-    """Convert SDK objects to plain dictionaries when possible.
-
-    :param obj: SDK model or dict-like object.
-    :type obj: Any
-    :return: Plain dict or original object.
+    :param host: Kalshi API base URL.
+    :type host: str
+    :param api_key_id: API key identifier.
+    :type api_key_id: str
+    :param private_key_pem: Private key PEM contents.
+    :type private_key_pem: str
+    :return: Initialized Kalshi SDK client (or rotating pool).
     :rtype: Any
+    :raises KalshiSdkError: If the client cannot be initialized.
     """
-    if isinstance(obj, dict):
-        return obj
-    if hasattr(obj, "model_dump"):
+    sdk = _import_sdk()
+    _patch_sdk_models()
+    credentials = [(api_key_id, private_key_pem)]
+    credentials.extend(_load_secondary_credentials())
+
+    clients: list[Any] = []
+    labels: list[str] = []
+    last_err: Optional[Exception] = None
+    for idx, (key_id, key_pem) in enumerate(credentials):
         try:
-            return obj.model_dump(mode="json")
-        except TypeError:
-            return obj.model_dump()
-    if hasattr(obj, "to_dict"):
-        try:
-            return obj.to_dict()
-        except Exception:  # pylint: disable=broad-exception-caught
-            pass
-    if hasattr(obj, "__dict__"):
-        return dict(obj.__dict__)
-    return obj
+            client = _make_single_client(sdk, host, key_id, key_pem)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            last_err = exc
+            logger.warning("Kalshi client init failed for key %s: %s", key_id, exc)
+            continue
+        clients.append(client)
+        labels.append(key_id or f"key{idx+1}")
 
-
-def _resolve_events_method(client) -> Optional[Callable[..., Any]]:
-    """Resolve an events method from the client.
-
-    :param client: Kalshi API client.
-    :type client: Any
-    :return: Callable method or None.
-    :rtype: collections.abc.Callable[..., Any] | None
-    """
-    for name in ("get_events", "list_events", "events"):
-        if hasattr(client, name):
-            return getattr(client, name)
-    return None
-
-
-def _prepare_cursor_kwargs(
-    method: Callable[..., Any],
-    base_kwargs: dict[str, Any],
-    cursor: Optional[str],
-) -> dict[str, Any]:
-    """Prepare cursor-aware kwargs for a paged request.
-
-    :param method: Paged API method.
-    :type method: collections.abc.Callable[..., Any]
-    :param base_kwargs: Base keyword arguments.
-    :type base_kwargs: dict[str, Any]
-    :param cursor: Cursor token to include.
-    :type cursor: str | None
-    :return: Filtered kwargs including cursor fields.
-    :rtype: dict[str, Any]
-    """
-    call_kwargs = dict(base_kwargs)
-    if cursor is not None:
-        sig = inspect.signature(method)
-        if "cursor" in sig.parameters:
-            call_kwargs["cursor"] = cursor
-        elif "next_cursor" in sig.parameters:
-            call_kwargs["next_cursor"] = cursor
-    return _filter_kwargs(method, call_kwargs)
-
-
-def _iter_events_stream(
-    method: Callable[..., Any],
-    kwargs: dict[str, Any],
-    retry_cfg: RetryConfig,
-    rate_limit_hook: Optional[Callable[[float], None]] = None,
-) -> Iterator[dict]:
-    """Yield events using a streaming iter_events method.
-
-    :param method: iter_events-style method.
-    :type method: collections.abc.Callable[..., Any]
-    :param kwargs: API query parameters.
-    :type kwargs: dict[str, Any]
-    :param retry_cfg: Retry configuration.
-    :type retry_cfg: RetryConfig
-    :return: Event iterator.
-    :rtype: collections.abc.Iterator[dict]
-    """
-    _ensure_method_host(method)
-    call_kwargs = _filter_kwargs(method, kwargs)
-    logger.debug(
-        "iter_events: method=%s kwargs=%s",
-        getattr(method, "__name__", "iter_events"),
-        call_kwargs,
-    )
-    call = functools.partial(method, **call_kwargs)
-    success, response = _call_with_retries(
-        call,
-        retry_cfg,
-        "iter_events",
-        rate_limit_hook=rate_limit_hook,
-    )
-    if not success or response is None:
-        return
-    for event in response:
-        yield _to_plain_dict(event)
-
-
-def _iter_events_paged(
-    method: Callable[..., Any],
-    kwargs: dict[str, Any],
-    retry_cfg: RetryConfig,
-    rate_limit_hook: Optional[Callable[[float], None]] = None,
-) -> Iterator[dict]:
-    """Yield events using a paginated get_events-style method.
-
-    :param method: Paged events method.
-    :type method: collections.abc.Callable[..., Any]
-    :param kwargs: API query parameters.
-    :type kwargs: dict[str, Any]
-    :param retry_cfg: Retry configuration.
-    :type retry_cfg: RetryConfig
-    :return: Event iterator.
-    :rtype: collections.abc.Iterator[dict]
-    """
-    cursor = None
-    while True:
-        _ensure_method_host(method)
-        call_kwargs = _prepare_cursor_kwargs(method, kwargs, cursor)
-        logger.debug(
-            "iter_events: method=%s kwargs=%s cursor=%s",
-            getattr(method, "__name__", "events"),
-            call_kwargs,
-            cursor,
-        )
-        call = functools.partial(method, **call_kwargs)
-        success, response = _call_with_retries(
-            call,
-            retry_cfg,
-            "iter_events",
-            rate_limit_hook=rate_limit_hook,
-        )
-        if not success:
-            return
-        events, next_cursor = _extract_items(response)
-        logger.debug("iter_events: fetched=%d next_cursor=%s", len(events), next_cursor)
-        for event in events:
-            yield _to_plain_dict(event)
-        if not next_cursor or next_cursor == cursor:
-            break
-        cursor = next_cursor
-
-
-def iter_events(
-    client,
-    *,
-    rate_limit_hook: Optional[Callable[[float], None]] = None,
-    **kwargs,
-) -> Iterator[dict]:
-    """Yield events from the Kalshi API.
-
-    :param client: Kalshi API client.
-    :type client: Any
-    :param kwargs: API query parameters.
-    :type kwargs: Any
-    :return: Iterable of event payloads.
-    :rtype: collections.abc.Iterator[dict]
-    :raises KalshiSdkError: If the client lacks an events method.
-    """
-    retry_cfg = _load_retry_config("KALSHI_EVENTS")
-    if hasattr(client, "iter_events"):
-        method = getattr(client, "iter_events")
-        yield from _iter_events_stream(
-            method,
-            kwargs,
-            retry_cfg,
-            rate_limit_hook=rate_limit_hook,
-        )
-        return
-
-    method = _resolve_events_method(client)
-    if method is None:
-        raise KalshiSdkError("Client does not expose an events method.")
-    yield from _iter_events_paged(
-        method,
-        kwargs,
-        retry_cfg,
-        rate_limit_hook=rate_limit_hook,
-    )
-
-
-def _resolve_candlesticks_method(client) -> Optional[Callable[..., Any]]:
-    """Resolve a candlesticks method from the client.
-
-    :param client: Kalshi API client.
-    :type client: Any
-    :return: Callable method or None.
-    :rtype: collections.abc.Callable[..., Any] | None
-    """
-    for name in (
-        "get_market_candlesticks",
-        "get_market_candlestick",
-        "get_candlesticks",
-        "get_candles",
-    ):
-        if hasattr(client, name):
-            return getattr(client, name)
-    return None
-
-
-def _build_candlestick_kwargs(
-    method: Callable[..., Any],
-    series_ticker: str,
-    market_ticker: str,
-    extra_kwargs: dict[str, Any],
-) -> dict[str, Any]:
-    """Build keyword args for candlestick calls.
-
-    :param method: Candlesticks API method.
-    :type method: collections.abc.Callable[..., Any]
-    :param series_ticker: Series ticker symbol.
-    :type series_ticker: str
-    :param market_ticker: Market ticker symbol.
-    :type market_ticker: str
-    :param extra_kwargs: Additional query parameters.
-    :type extra_kwargs: dict[str, Any]
-    :return: Filtered kwargs for the API method.
-    :rtype: dict[str, Any]
-    """
-    period_minutes = extra_kwargs.get("period_interval_minutes")
-    if "period_interval" not in extra_kwargs and period_minutes is not None:
-        extra_kwargs = dict(extra_kwargs)
-        extra_kwargs["period_interval"] = period_minutes
-    call_kwargs = {
-        "series_ticker": series_ticker,
-        "market_ticker": market_ticker,
-        "series": series_ticker,
-        "ticker": market_ticker,
-        **extra_kwargs,
-    }
-    _ensure_method_host(method)
-    return _filter_kwargs(method, call_kwargs)
-
-
-def _normalize_candlesticks_response(resp: Any) -> dict:
-    """Normalize various candlesticks response shapes into a dict.
-
-    :param resp: Raw API response.
-    :type resp: Any
-    :return: Normalized candlesticks response.
-    :rtype: dict
-    """
-    if isinstance(resp, list):
-        return {"candlesticks": [_to_plain_dict(c) for c in resp]}
-    if isinstance(resp, dict):
-        if "candlesticks" in resp or "candles" in resp:
-            normalized = dict(resp)
-            candles = normalized.get("candlesticks")
-            if candles is None:
-                candles = normalized.pop("candles", None)
-            normalized["candlesticks"] = [
-                _to_plain_dict(c) for c in (candles or [])
-            ]
-            normalized.pop("candles", None)
-            return normalized
-        return resp
-    candles = getattr(resp, "candlesticks", None)
-    if candles is None:
-        candles = getattr(resp, "candles", None)
-    if candles is not None:
-        return {"candlesticks": [_to_plain_dict(c) for c in candles]}
-    return {"candlesticks": []}
-
-
-def get_market_candlesticks(
-    client,
-    series_ticker: str,
-    market_ticker: str,
-    **kwargs,
-):
-    """Fetch candlesticks for a market.
-
-    :param client: Kalshi API client.
-    :type client: Any
-    :param series_ticker: Series ticker symbol.
-    :type series_ticker: str
-    :param market_ticker: Market ticker symbol.
-    :type market_ticker: str
-    :param kwargs: API query parameters.
-    :type kwargs: Any
-    :return: API response payload with candlesticks.
-    :rtype: dict
-    :raises KalshiSdkError: If the client lacks a candlesticks method.
-    """
-    method = _resolve_candlesticks_method(client)
-    if method is None:
-        raise KalshiSdkError("Client does not expose a candlesticks method.")
-
-    call_kwargs = _build_candlestick_kwargs(
-        method,
-        series_ticker,
-        market_ticker,
-        kwargs,
-    )
-    logger.debug(
-        "candlesticks: method=%s kwargs=%s",
-        getattr(method, "__name__", "candlesticks"),
-        call_kwargs,
-    )
-    retry_cfg = _load_retry_config("KALSHI_CANDLE")
-
-    def _call_candlesticks():
-        _candlesticks_wait()
-        return method(**call_kwargs)
-
-    success, response = _call_with_retries(
-        _call_candlesticks,
-        retry_cfg,
-        "candlesticks",
-        rate_limit_hook=_candlesticks_apply_cooldown,
-    )
-    if not success:
-        return {"candlesticks": []}
-    return _normalize_candlesticks_response(response)
+    if not clients:
+        raise KalshiSdkError(
+            "Could not initialize Kalshi SDK client; update kalshi_python_sync or adjust adapters."
+        ) from last_err
+    if len(clients) == 1:
+        set_rest_key_rotation(False)
+        return clients[0]
+    set_rest_key_rotation(True)
+    logger.info("Kalshi SDK client pool initialized with %d keys.", len(clients))
+    return _KalshiClientPool(clients, labels)

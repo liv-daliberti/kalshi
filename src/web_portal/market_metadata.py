@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-import json
+from dataclasses import dataclass
 from typing import Any
 
+from ..core.json_utils import (
+    maybe_parse_json as _maybe_parse_json,
+    normalize_metadata_value as _normalize_metadata_value,
+)
 from .config import _env_bool
 from .db_utils import to_json_value
 from .kalshi import _get_event_metadata as _fetch_event_metadata
@@ -14,26 +18,29 @@ from .portal_utils import portal_logger as _portal_logger_util
 from .portal_types import PsycopgConnection
 from .db_timing import timed_cursor
 
+_UNSET = object()
+
+
+@dataclass(frozen=True)
+class MarketExtrasPayload:
+    """Payload for market metadata updates."""
+
+    price_ranges: Any | None = None
+    custom_strike: Any | None = None
+    mve_selected_legs: Any | None = None
+
 
 def _portal_logger():
     return _portal_logger_util(__name__)
 
 
-def _maybe_parse_json(value: Any) -> Any | None:
-    """Parse a JSON-encoded string value if possible."""
-    if value is None:
-        return None
-    if isinstance(value, (dict, list)):
-        return value
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            return json.loads(text)
-        except (TypeError, ValueError):
-            return None
-    return None
+def _metadata_changed(existing: Any | object, updated: Any | None) -> bool:
+    """Return True when an update would change the stored value."""
+    if updated is None:
+        return False
+    if existing is _UNSET:
+        return True
+    return _normalize_metadata_value(existing) != updated
 
 
 def _derive_custom_strike(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -67,24 +74,52 @@ def _extract_event_metadata(market_data: dict[str, Any]) -> Any | None:
 def _update_market_extras(
     conn: PsycopgConnection,
     ticker: str,
+    payload: MarketExtrasPayload | None = None,
+    existing: MarketExtrasPayload | object = _UNSET,
+    *,
     price_ranges: Any | None = None,
     custom_strike: Any | None = None,
     mve_selected_legs: Any | None = None,
+    existing_price_ranges: Any | object = _UNSET,
+    existing_custom_strike: Any | object = _UNSET,
+    existing_mve_selected_legs: Any | object = _UNSET,
 ) -> None:
     """Update extra JSON fields for a market without overwriting existing data."""
+    if payload is None:
+        payload = MarketExtrasPayload(
+            price_ranges=price_ranges,
+            custom_strike=custom_strike,
+            mve_selected_legs=mve_selected_legs,
+        )
+    existing_payload = existing if isinstance(existing, MarketExtrasPayload) else None
+    if existing_price_ranges is _UNSET:
+        existing_price_ranges = (
+            existing_payload.price_ranges if existing_payload else _UNSET
+        )
+    if existing_custom_strike is _UNSET:
+        existing_custom_strike = (
+            existing_payload.custom_strike if existing_payload else _UNSET
+        )
+    if existing_mve_selected_legs is _UNSET:
+        existing_mve_selected_legs = (
+            existing_payload.mve_selected_legs if existing_payload else _UNSET
+        )
     updates = []
     params: dict[str, Any] = {"ticker": ticker}
-    if price_ranges is not None:
-        updates.append("price_ranges = COALESCE(%(price_ranges)s, price_ranges)")
-        params["price_ranges"] = to_json_value(price_ranges)
-    if custom_strike is not None:
-        updates.append("custom_strike = COALESCE(%(custom_strike)s, custom_strike)")
-        params["custom_strike"] = to_json_value(custom_strike)
-    if mve_selected_legs is not None:
-        updates.append(
-            "mve_selected_legs = COALESCE(%(mve_selected_legs)s, mve_selected_legs)"
-        )
-        params["mve_selected_legs"] = to_json_value(mve_selected_legs)
+    if payload.price_ranges is not None:
+        if _metadata_changed(existing_price_ranges, payload.price_ranges):
+            updates.append("price_ranges = COALESCE(%(price_ranges)s, price_ranges)")
+            params["price_ranges"] = to_json_value(payload.price_ranges)
+    if payload.custom_strike is not None:
+        if _metadata_changed(existing_custom_strike, payload.custom_strike):
+            updates.append("custom_strike = COALESCE(%(custom_strike)s, custom_strike)")
+            params["custom_strike"] = to_json_value(payload.custom_strike)
+    if payload.mve_selected_legs is not None:
+        if _metadata_changed(existing_mve_selected_legs, payload.mve_selected_legs):
+            updates.append(
+                "mve_selected_legs = COALESCE(%(mve_selected_legs)s, mve_selected_legs)"
+            )
+            params["mve_selected_legs"] = to_json_value(payload.mve_selected_legs)
     if not updates:
         return
     updates.append("updated_at = NOW()")
@@ -101,10 +136,14 @@ def _update_event_metadata(
     conn: PsycopgConnection,
     event_ticker: str,
     product_metadata: Any | None,
+    existing_product_metadata: Any | object = _UNSET,
 ) -> None:
     """Update event metadata when available."""
     if product_metadata is None:
         return
+    if existing_product_metadata is not _UNSET:
+        if not _metadata_changed(existing_product_metadata, product_metadata):
+            return
     sql = """
     UPDATE events
     SET product_metadata = COALESCE(%(product_metadata)s, product_metadata),
@@ -128,6 +167,10 @@ def _needs_market_metadata(*values: Any) -> bool:
 
 def _market_metadata_fetch_enabled() -> bool:
     return _env_bool("WEB_PORTAL_MARKET_METADATA_FETCH", True)
+
+
+def _event_metadata_fetch_enabled() -> bool:
+    return _env_bool("WEB_PORTAL_EVENT_METADATA_FETCH", True)
 
 
 def _fetch_market_metadata_payload(
@@ -219,12 +262,12 @@ def _resolve_market_metadata(
                     market_data,
                 )
             )
-        if product_metadata is None:
-            metadata, meta_err = _fetch_event_metadata_payload(row.get("event_ticker"))
-            if meta_err:
-                _portal_logger().warning("event metadata fetch failed: %s", meta_err)
-            else:
-                product_metadata = metadata
+    if product_metadata is None and _event_metadata_fetch_enabled():
+        metadata, meta_err = _fetch_event_metadata_payload(row.get("event_ticker"))
+        if meta_err:
+            _portal_logger().warning("event metadata fetch failed: %s", meta_err)
+        else:
+            product_metadata = metadata
 
     price_ranges = _resolve_price_ranges(price_ranges, row, row_ticker)
     custom_strike = custom_strike or _derive_custom_strike(row)

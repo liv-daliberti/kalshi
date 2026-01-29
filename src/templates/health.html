@@ -287,12 +287,12 @@
           </p>
         </div>
         <div class="meta-row">
-          <div>Updated {{ refreshed_at }}</div>
-          <div>Logged in {{ "Yes" if logged_in else "No" }}</div>
+          <div id="health-refreshed">Updated {{ refreshed_at }}</div>
+          <div id="health-logged-in">Logged in {{ "Yes" if logged_in else "No" }}</div>
         </div>
       </header>
 
-      <section class="status-grid">
+      <section class="status-grid" id="health-status-grid">
         {% for card in status_cards %}
         <article class="status-card">
           <div class="card-header">

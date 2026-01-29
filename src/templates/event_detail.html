@@ -642,6 +642,9 @@
             </thead>
             <tbody>
               {% set visible_outcomes = (event.outcomes or []) | rejectattr("volume", "equalto", "N/A") | list %}
+              {% if event.event_is_open %}
+                {% set visible_outcomes = visible_outcomes | rejectattr("volume", "equalto", "0") | list %}
+              {% endif %}
               {% if visible_outcomes %}
                 {% for outcome in visible_outcomes %}
                 <tr class="row-link" data-href="{{ url_for('market.market_detail', ticker=outcome.market_ticker) }}">

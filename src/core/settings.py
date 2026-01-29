@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
-from src.core.env_utils import env_bool, env_float, env_int
+from .env_utils import env_bool, env_float, env_int
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 ENV_FILE = os.getenv("ENV_FILE") or os.path.abspath(os.path.join(BASE_DIR, "..", ".env"))

@@ -5,7 +5,8 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import mock_open, patch
+from unittest.mock import patch
+import importlib
 
 from _test_utils import add_src_to_path, ensure_kalshi_sdk_stub, ensure_psycopg_stub
 
@@ -13,7 +14,7 @@ ensure_psycopg_stub()
 add_src_to_path()
 ensure_kalshi_sdk_stub()
 
-import src.jobs.closed_cleanup as closed_cleanup
+closed_cleanup = importlib.import_module("src.jobs.closed_cleanup")
 
 
 class FakeCursor:
@@ -146,6 +147,23 @@ class TestClosedCleanupHelpers(unittest.TestCase):
         self.assertEqual(closed_cleanup._period_minutes("Hour", 1, 60), 1)
         self.assertEqual(closed_cleanup._period_minutes("day", 1, 60), 60)
         self.assertIsNone(closed_cleanup._period_minutes("week", 1, 60))
+
+    def test_min_close_ts_empty(self) -> None:
+        self.assertIsNone(closed_cleanup._min_close_ts({}))
+        missing = {
+            "M1": closed_cleanup.MissingMarket(
+                ticker="M1",
+                event_ticker="EV1",
+                series_ticker="SR1",
+                strike_period="hour",
+                open_time=None,
+                close_time=None,
+                period_minutes=1,
+                first_candle_end=None,
+                last_candle_end=None,
+            )
+        }
+        self.assertIsNone(closed_cleanup._min_close_ts(missing))
 
     def test_candles_missing_logic(self) -> None:
         open_time = datetime(2024, 1, 1, tzinfo=timezone.utc)
@@ -377,6 +395,50 @@ class TestClosedCleanupQueries(unittest.TestCase):
         self.assertEqual(upsert_event.call_count, 0)
         self.assertEqual(upsert_market.call_count, 0)
         self.assertEqual(len(iter_events.call_args_list), 1)
+
+    def test_backfill_market_candles_missing_tickers(self) -> None:
+        open_time = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        close_time = open_time + timedelta(hours=1)
+        cfg = closed_cleanup.ClosedCleanupConfig(
+            strike_periods=("hour",),
+            event_statuses=("closed",),
+            minutes_hour=1,
+            minutes_day=60,
+            lookback_hours=2,
+            grace_minutes=10,
+        )
+        conn = FakeConn()
+        market = closed_cleanup.MissingMarket(
+            ticker="",
+            event_ticker="EV1",
+            series_ticker="SR1",
+            strike_period="hour",
+            open_time=open_time,
+            close_time=close_time,
+            period_minutes=1,
+            first_candle_end=None,
+            last_candle_end=None,
+        )
+        with patch("src.jobs.closed_cleanup._build_candle_ranges") as build_ranges:
+            self.assertEqual(closed_cleanup._backfill_market_candles(conn, object(), cfg, market, 60), (0, 0))
+        build_ranges.assert_not_called()
+        self.assertEqual(conn.commits, 0)
+
+        market = closed_cleanup.MissingMarket(
+            ticker="M1",
+            event_ticker="EV1",
+            series_ticker="",
+            strike_period="hour",
+            open_time=open_time,
+            close_time=close_time,
+            period_minutes=1,
+            first_candle_end=None,
+            last_candle_end=None,
+        )
+        with patch("src.jobs.closed_cleanup._build_candle_ranges") as build_ranges:
+            self.assertEqual(closed_cleanup._backfill_market_candles(conn, object(), cfg, market, 60), (0, 0))
+        build_ranges.assert_not_called()
+        self.assertEqual(conn.commits, 0)
 
     def test_backfill_missing_candles_empty(self) -> None:
         cfg = closed_cleanup.ClosedCleanupConfig(
@@ -618,21 +680,34 @@ class TestClosedCleanupQueries(unittest.TestCase):
             closed_cleanup_grace_minutes=10,
         )
         conn = FakeConn()
+        client = object()
         with patch("src.jobs.closed_cleanup.load_settings", return_value=settings), \
              patch("src.jobs.closed_cleanup.configure_logging") as configure_logging, \
-             patch("builtins.open", mock_open(read_data="key")), \
-             patch("src.jobs.closed_cleanup.make_client", return_value=object()) as make_client, \
-             patch("psycopg.connect", return_value=conn, create=True) as connect, \
-             patch("src.jobs.closed_cleanup.maybe_init_schema") as init_schema, \
-             patch("src.jobs.closed_cleanup.ensure_schema_compatible"), \
+             patch(
+                 "src.jobs.closed_cleanup.open_client_and_conn",
+                 return_value=(client, conn),
+             ) as open_client_and_conn, \
              patch("src.jobs.closed_cleanup.closed_cleanup_pass") as cleanup_pass:
             closed_cleanup.run_once()
 
         self.assertEqual(configure_logging.call_count, 1)
-        self.assertEqual(make_client.call_count, 1)
-        self.assertEqual(connect.call_count, 1)
-        self.assertEqual(init_schema.call_count, 1)
+        self.assertEqual(open_client_and_conn.call_count, 1)
+        _, kwargs = open_client_and_conn.call_args
+        self.assertEqual(
+            kwargs.get("schema_path_override"),
+            closed_cleanup.schema_path(closed_cleanup.__file__),
+        )
         self.assertEqual(cleanup_pass.call_count, 1)
+        args = cleanup_pass.call_args[0]
+        self.assertIs(args[0], conn)
+        self.assertIs(args[1], client)
+        cfg = args[2]
+        self.assertEqual(cfg.strike_periods, settings.strike_periods)
+        self.assertEqual(cfg.event_statuses, settings.closed_cleanup_event_statuses)
+        self.assertEqual(cfg.minutes_hour, settings.candle_minutes_for_hour)
+        self.assertEqual(cfg.minutes_day, settings.candle_minutes_for_day)
+        self.assertEqual(cfg.lookback_hours, settings.candle_lookback_hours)
+        self.assertEqual(cfg.grace_minutes, settings.closed_cleanup_grace_minutes)
 
     def test_main_invokes_run_once(self) -> None:
         settings = SimpleNamespace(
@@ -656,10 +731,10 @@ class TestClosedCleanupQueries(unittest.TestCase):
                 return None
 
         with patch("src.core.settings.load_settings", return_value=settings), \
-             patch("builtins.open", mock_open(read_data="key")), \
-             patch("src.kalshi.kalshi_sdk.make_client", return_value=object()), \
-             patch("psycopg.connect", return_value=RunnerConn(), create=True), \
-             patch("src.db.db.init_schema"), \
+             patch(
+                 "src.core.service_utils.open_client_and_conn",
+                 return_value=(object(), RunnerConn()),
+             ) as open_client_and_conn, \
              patch("src.db.db.cleanup_active_markets", return_value=0):
             prev = sys.modules.pop("src.jobs.closed_cleanup", None)
             try:
@@ -667,3 +742,4 @@ class TestClosedCleanupQueries(unittest.TestCase):
             finally:
                 if prev is not None:
                     sys.modules["src.jobs.closed_cleanup"] = prev
+        self.assertEqual(open_client_and_conn.call_count, 1)

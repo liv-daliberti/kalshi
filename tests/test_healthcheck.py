@@ -1,16 +1,18 @@
 import io
 import os
+import runpy
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
+import importlib
 
 from _test_utils import add_src_to_path, ensure_psycopg_stub
 
 ensure_psycopg_stub()
 add_src_to_path()
 
-import src.services.healthcheck as healthcheck
+healthcheck = importlib.import_module("src.services.healthcheck")
 
 
 class FakeCursor:
@@ -157,7 +159,7 @@ class TestHealthcheckService(unittest.TestCase):
 
         with patch("src.services.healthcheck.datetime", FixedDatetime):
             with patch("src.services.healthcheck.psycopg.connect", return_value=FakeConn()) as connect:
-                with patch("src.services.healthcheck.ensure_schema_compatible", return_value=2):
+                with patch("src.services.healthcheck.ensure_schema_compatible", return_value=3):
                     with patch(
                         "src.services.healthcheck._load_service_timestamps",
                         return_value={"last_discovery_ts": fixed_now},
@@ -168,12 +170,12 @@ class TestHealthcheckService(unittest.TestCase):
                         ):
                             payload = healthcheck.check_service("rest", "db")
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["schema_version"], 3)
         connect.assert_called_once()
 
     def test_check_service_allow_missing(self) -> None:
         with patch("src.services.healthcheck.psycopg.connect", return_value=FakeConn()):
-            with patch("src.services.healthcheck.ensure_schema_compatible", return_value=2):
+            with patch("src.services.healthcheck.ensure_schema_compatible", return_value=3):
                 with patch(
                     "src.services.healthcheck._load_service_timestamps",
                     return_value={"last_discovery_ts": None},
@@ -296,3 +298,172 @@ class TestHealthcheckService(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=True):
                 with self.assertRaises(RuntimeError):
                     healthcheck.main()
+
+
+class TestHealthcheckServerHandler(unittest.TestCase):
+    def _make_handler(self, handler_cls, path):
+        handler = handler_cls.__new__(handler_cls)
+        handler.path = path
+        handler.requestline = f"GET {path} HTTP/1.1"
+        handler.wfile = io.BytesIO()
+        captured = {"status": None, "headers": [], "ended": False}
+
+        def send_response(code):
+            captured["status"] = code
+
+        def send_header(name, value):
+            captured["headers"].append((name, value))
+
+        def end_headers():
+            captured["ended"] = True
+
+        handler.send_response = send_response
+        handler.send_header = send_header
+        handler.end_headers = end_headers
+        return handler, captured
+
+    def test_handler_404_and_ok_and_error(self) -> None:
+        class FakeServer:
+            def __init__(self, addr, handler_cls):
+                self.handler_cls = handler_cls
+
+            def serve_forever(self):
+                return None
+
+            def server_close(self):
+                return None
+
+        class FakeThread:
+            def __init__(self, target, name, daemon):
+                self.target = target
+
+            def start(self):
+                return None
+
+        with patch.dict(
+            os.environ,
+            {
+                "DATABASE_URL": "db",
+                "HEALTH_CONNECT_TIMEOUT": "5",
+                "HEALTH_ALLOW_MISSING": "1",
+            },
+            clear=True,
+        ):
+            with patch("src.services.healthcheck.ThreadingHTTPServer", FakeServer):
+                with patch("src.services.healthcheck.threading.Thread", FakeThread):
+                    server = healthcheck.start_health_server("rest", host="127.0.0.1", port=8002)
+        handler_cls = server.handler_cls
+
+        handler, captured = self._make_handler(handler_cls, "/nope")
+        handler.do_GET()
+        self.assertEqual(captured["status"], 404)
+        self.assertTrue(captured["ended"])
+
+        handler, _captured = self._make_handler(handler_cls, "/health")
+        payloads = {}
+
+        def fake_response(_handler, payload):
+            payloads["payload"] = payload
+
+        with patch.object(healthcheck, "check_service", return_value={"ok": True}) as check_service:
+            with patch.object(healthcheck, "_health_http_response", side_effect=fake_response):
+                handler.do_GET()
+        self.assertTrue(payloads["payload"]["ok"])
+        check_service.assert_called_once_with(
+            "rest",
+            "db",
+            connect_timeout=5,
+            allow_missing=True,
+        )
+
+        handler, _captured = self._make_handler(handler_cls, "/healthz")
+        payloads.clear()
+        with patch.object(healthcheck, "check_service", side_effect=RuntimeError("boom")):
+            with patch.object(healthcheck, "_health_http_response", side_effect=fake_response):
+                handler.do_GET()
+        self.assertFalse(payloads["payload"]["ok"])
+        self.assertEqual(payloads["payload"]["error"], "boom")
+
+    def test_handler_log_request(self) -> None:
+        class FakeServer:
+            def __init__(self, addr, handler_cls):
+                self.handler_cls = handler_cls
+
+            def serve_forever(self):
+                return None
+
+            def server_close(self):
+                return None
+
+        class FakeThread:
+            def __init__(self, target, name, daemon):
+                self.target = target
+
+            def start(self):
+                return None
+
+        with patch.object(healthcheck.logger, "info") as log_info:
+            with patch.dict(os.environ, {"DATABASE_URL": "db"}, clear=True):
+                with patch("src.services.healthcheck.ThreadingHTTPServer", FakeServer):
+                    with patch("src.services.healthcheck.threading.Thread", FakeThread):
+                        server = healthcheck.start_health_server(
+                            "rest", host="127.0.0.1", port=8003
+                        )
+            handler_cls = server.handler_cls
+            handler = handler_cls.__new__(handler_cls)
+            handler.requestline = "GET /healthz HTTP/1.1"
+            handler.log_request(200, 12)
+        self.assertTrue(
+            any('healthz "' in call.args[0] for call in log_info.call_args_list)
+        )
+
+
+class TestHealthcheckServerRun(unittest.TestCase):
+    def test_server_thread_runs_and_closes(self) -> None:
+        class FakeServer:
+            def __init__(self, addr, handler_cls):
+                self.handler_cls = handler_cls
+                self.served = False
+                self.closed = False
+
+            def serve_forever(self):
+                self.served = True
+
+            def server_close(self):
+                self.closed = True
+
+        class ImmediateThread:
+            def __init__(self, target, name, daemon):
+                self.target = target
+                self.started = False
+
+            def start(self):
+                self.started = True
+                self.target()
+
+        with patch.dict(os.environ, {"DATABASE_URL": "db"}, clear=True):
+            with patch("src.services.healthcheck.ThreadingHTTPServer", FakeServer):
+                with patch("src.services.healthcheck.threading.Thread", ImmediateThread):
+                    server = healthcheck.start_health_server("rest", host="127.0.0.1", port=8004)
+        self.assertTrue(server.served)
+        self.assertTrue(server.closed)
+
+
+class TestHealthcheckMainExtra(unittest.TestCase):
+    def test_main_handles_exception(self) -> None:
+        args = SimpleNamespace(service="rest", database_url="db", json=True)
+        with patch("src.services.healthcheck.argparse.ArgumentParser.parse_args", return_value=args):
+            with patch("src.services.healthcheck.check_service", side_effect=RuntimeError("boom")):
+                with patch("builtins.print") as printer:
+                    with self.assertRaises(SystemExit) as exc:
+                        healthcheck.main()
+        self.assertEqual(exc.exception.code, 1)
+        printed = printer.call_args[0][0]
+        self.assertIn('"error"', printed)
+
+    def test_main_guard_runpy(self) -> None:
+        args = SimpleNamespace(service="rest", database_url=None, json=False)
+        with patch("argparse.ArgumentParser.parse_args", return_value=args):
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(RuntimeError):
+                    runpy.run_module("src.services.healthcheck", run_name="__main__")

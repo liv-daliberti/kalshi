@@ -10,7 +10,7 @@ from typing import Optional
 
 import psycopg  # pylint: disable=import-error
 
-from src.jobs.backfill import (
+from .backfill import (
     BackfillRangeRequest,
     _build_backfill_ranges,
     _fetch_candle_bounds,
@@ -18,20 +18,24 @@ from src.jobs.backfill import (
     _iter_time_chunks,
     _market_time_window,
 )
-from src.jobs.backfill_config import BackfillConfig
-from src.db.db import (
+from .backfill_config import BackfillConfig
+from ..db.db import (
     cleanup_active_markets,
     maybe_upsert_active_market_from_market,
     upsert_event,
     upsert_market,
 )
-from src.core.env_utils import _env_float
-from src.kalshi.kalshi_sdk import get_market_candlesticks, iter_events
-from src.core.logging_utils import configure_logging as configure_service_logging, parse_log_level
-from src.core.loop_utils import schema_path
-from src.core.service_utils import open_client_and_conn
-from src.core.settings import load_settings
-from src.core.time_utils import ensure_utc, infer_strike_period_from_times
+from ..core.env_utils import _env_float
+from ..kalshi.kalshi_sdk import get_market_candlesticks, iter_events
+from ..core.logging_utils import configure_logging as configure_service_logging, parse_log_level
+from ..core.loop_utils import schema_path
+from ..core.service_utils import open_client_and_conn
+from ..core.settings import load_settings
+from ..core.time_utils import (
+    ensure_utc,
+    infer_strike_period_from_times,
+    normalize_strike_period,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -293,10 +297,7 @@ def _settlement_missing(row: tuple) -> bool:
 
 
 def _normalize_strike_period(strike_period: Optional[str]) -> Optional[str]:
-    if not strike_period:
-        return None
-    normalized = strike_period.strip().lower()
-    return normalized or None
+    return normalize_strike_period(strike_period)
 
 
 def _resolve_period_minutes(

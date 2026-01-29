@@ -1,13 +1,14 @@
 import os
 import unittest
 from unittest.mock import patch
+import importlib
 
 from _test_utils import add_src_to_path, ensure_psycopg_stub
 
 ensure_psycopg_stub()
 add_src_to_path()
 
-import src.core.settings as settings
+settings = importlib.import_module("src.core.settings")
 
 
 class TestSettings(unittest.TestCase):

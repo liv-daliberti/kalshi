@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from src.kalshi.kalshi_rest_rate_limit import (
+from ..kalshi.kalshi_rest_rate_limit import (
     configure_rest_rate_limit,
     rest_apply_cooldown,
     rest_backoff_remaining,
     rest_register_rate_limit,
     rest_wait,
 )
-from src.kalshi.kalshi_sdk import (
+from ..kalshi.kalshi_sdk import (
     KalshiSdkError,
     coerce_payload,
     extract_http_status,

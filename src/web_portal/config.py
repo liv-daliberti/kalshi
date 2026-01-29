@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from src.core.env_utils import env_bool, env_float, env_int_fallback
+from ..core.env_utils import env_bool, env_float, env_int_fallback
 
 _env_bool = env_bool
 _env_float = env_float
 _env_int = env_int_fallback
 
-DEFAULT_LIMIT = 200
+DEFAULT_LIMIT = 75
 MAX_LIMIT = 2000
 
 EVENT_SORT_OPTIONS = [
@@ -55,6 +55,14 @@ EVENT_SORT_SQL = {
     "category": "e.category",
     "strike_period": "e.strike_period",
     "market_count": "COUNT(*)",
+}
+EVENT_SORT_COLUMNS = {
+    "close_time": "close_time",
+    "open_time": "open_time",
+    "title": "event_title",
+    "category": "event_category",
+    "strike_period": "strike_period",
+    "market_count": "market_count",
 }
 EVENT_STATUS_CASE = """
 CASE

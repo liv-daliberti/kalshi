@@ -13,7 +13,7 @@ from typing import Any
 import psycopg  # pylint: disable=import-error
 from psycopg.rows import dict_row  # pylint: disable=import-error
 
-from src.core.time_utils import age_seconds as _age_seconds
+from ..core.time_utils import age_seconds as _age_seconds
 
 from .config import _env_bool, _env_float, _env_int
 from .db import _db_connection, _fetch_state_rows
@@ -29,6 +29,7 @@ from .formatters import (
 from .kalshi import _load_kalshi_client
 from .portal_utils import portal_attr as _portal_attr
 from .portal_utils import portal_func as _portal_func
+from .portal_utils import portal_module as _portal_module
 from .snapshot_utils import _snapshot_backoff_remaining
 
 logger = logging.getLogger(__name__)
@@ -81,14 +82,20 @@ def _load_portal_health_context() -> PortalHealthContext:
     db_error = None
     rag_error = None
     health_payload = None
+    db_connection = _portal_func("_db_connection", _db_connection)
+    load_health = _portal_func("_load_portal_health", _load_portal_health)
     try:
-        with _db_connection(connect_timeout=3) as conn:
+        try:
+            conn_ctx = db_connection(connect_timeout=3)
+        except TypeError:
+            conn_ctx = db_connection()
+        with conn_ctx as conn:
             with timed_cursor(conn) as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
             server_version = _format_pg_version(conn.info.server_version)
             try:
-                health_payload = _load_portal_health(conn)
+                health_payload = load_health(conn)
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 rag_error = str(exc) or "RAG health query failed."
                 logger.exception("portal health state load failed")
@@ -182,7 +189,8 @@ def _rag_health_card(context: PortalHealthContext) -> dict[str, Any]:
 
 
 def _kalshi_health_card() -> dict[str, Any]:
-    client, err = _load_kalshi_client()
+    load_client = _portal_func("_load_kalshi_client", _load_kalshi_client)
+    client, err = load_client()
     kalshi_ok = err is None and client is not None
     kalshi_details = [
         f"KALSHI_API_KEY_ID set: {fmt_bool(bool(os.getenv('KALSHI_API_KEY_ID')))}",
@@ -222,15 +230,18 @@ def _snapshot_poller_card() -> dict[str, Any]:
     poll_enabled = _portal_func("_snapshot_poll_enabled", lambda: False)()
     poll_thread = bool(_portal_attr("_SNAPSHOT_THREAD_STARTED", False))
     config = _portal_func("_snapshot_poll_config", lambda: None)()
-    backoff = _snapshot_backoff_remaining()
+    backoff_fn = _portal_func("_snapshot_backoff_remaining", _snapshot_backoff_remaining)
+    backoff = backoff_fn()
     poll_details = [
         f"Enabled: {fmt_bool(poll_enabled)}",
         f"Thread started: {fmt_bool(poll_thread)}",
         f"Interval: {getattr(config, 'interval', 0)}s",
         f"Limit: {getattr(config, 'limit', 0)} tickers",
     ]
-    if backoff:
+    if isinstance(backoff, (int, float)):
         poll_details.append(f"Backoff remaining: {backoff:.1f}s")
+    else:
+        poll_details.append("Backoff remaining: N/A")
     poll_level, poll_label, poll_summary = _snapshot_poller_status(
         poll_enabled,
         poll_thread,
@@ -427,6 +438,11 @@ def _fetch_latest_prediction_ts(conn: psycopg.Connection) -> datetime | None:
     return latest_ts
 
 
+def fetch_latest_prediction_ts(conn: psycopg.Connection) -> datetime | None:
+    """Public wrapper for prediction timestamp lookup."""
+    return _fetch_latest_prediction_ts(conn)
+
+
 @dataclass(frozen=True)
 class PortalStateTimestamps:
     """Timestamp snapshot for portal health checks."""
@@ -560,7 +576,12 @@ def _query_latest_tick_ts(conn: psycopg.Connection) -> datetime | None:
 
 
 def _fetch_state_timestamps(conn: psycopg.Connection) -> PortalStateTimestamps:
-    state_rows = _fetch_state_rows(
+    portal = _portal_module()
+    if portal is not None and hasattr(portal, "_fetch_state_rows"):
+        fetch_state_rows = getattr(portal, "_fetch_state_rows")
+    else:
+        fetch_state_rows = _fetch_state_rows
+    state_rows = fetch_state_rows(
         conn,
         [
             "last_discovery_ts",
@@ -702,7 +723,7 @@ def _latest_prediction_ts(
     conn: psycopg.Connection,
     last_prediction_ts: datetime | None,
 ) -> datetime | None:
-    db_prediction_ts = _fetch_latest_prediction_ts(conn)
+    db_prediction_ts = fetch_latest_prediction_ts(conn)
     if db_prediction_ts is not None and (
         last_prediction_ts is None or db_prediction_ts > last_prediction_ts
     ):
@@ -754,8 +775,14 @@ def _rag_health(
     last_prediction_ts: datetime | None,
 ) -> dict[str, Any]:
     last_prediction_ts = _latest_prediction_ts(conn, last_prediction_ts)
+    portal = _portal_module()
+    if portal is not None and "_fetch_state_rows" in getattr(portal, "__dict__", {}):
+        fetch_state_rows = portal.__dict__["_fetch_state_rows"]
+    else:
+        fetch_state_rows = _portal_func("_fetch_state_rows", _fetch_state_rows)
+    state_rows = fetch_state_rows(conn, [_RAG_CALL_WINDOW_KEY]) or {}
     call_payload = _rag_call_window_payload(
-        _fetch_state_rows(conn, [_RAG_CALL_WINDOW_KEY]).get(_RAG_CALL_WINDOW_KEY),
+        state_rows.get(_RAG_CALL_WINDOW_KEY),
         now,
     )
     return _rag_health_from_ts(now, last_prediction_ts, call_payload)
@@ -886,6 +913,16 @@ def build_portal_health_from_snapshot(
         return None
     now = datetime.now(timezone.utc)
     return _build_snapshot_health_payload(snapshot, now)
+
+
+def load_portal_health(conn: psycopg.Connection) -> dict[str, Any]:
+    """Public wrapper for portal health loading."""
+    return _load_portal_health(conn)
+
+
+def build_health_cards() -> list[dict[str, Any]]:
+    """Public wrapper for portal health card construction."""
+    return _build_health_cards()
 
 
 def _load_ws_heartbeat(

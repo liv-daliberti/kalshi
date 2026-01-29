@@ -7,10 +7,10 @@ import time
 
 import psycopg  # pylint: disable=import-error
 
-from src.db.db import ensure_schema_compatible, maybe_init_schema
-from src.core.env_utils import _env_float, _env_int
-from src.core.loop_utils import LoopFailureContext, log_metric, schema_path
-from src.predictions.predictions import prediction_pass, resolve_prediction_handler
+from ..db.db import ensure_schema_compatible, maybe_init_schema
+from ..core.env_utils import _env_float, _env_int
+from ..core.loop_utils import LoopFailureContext, log_metric, schema_path
+from ..predictions.predictions import prediction_pass, resolve_prediction_handler
 
 logger = logging.getLogger(__name__)
 

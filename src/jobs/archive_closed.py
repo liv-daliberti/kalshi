@@ -6,8 +6,8 @@ import logging
 from dataclasses import dataclass
 
 import psycopg  # pylint: disable=import-error
-from src.db.db import ensure_schema_compatible
-from src.jobs.closed_cleanup import _load_missing_closed_markets, build_closed_cleanup_config
+from ..db.db import ensure_schema_compatible
+from .closed_cleanup import _load_missing_closed_markets, build_closed_cleanup_config
 
 logger = logging.getLogger(__name__)
 

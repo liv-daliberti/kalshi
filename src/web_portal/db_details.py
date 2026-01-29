@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
 
-from src.db.sql_fragments import (
+from ..db.sql_fragments import (
     last_candle_lateral_sql,
     last_prediction_lateral_sql,
     last_tick_lateral_sql,
@@ -39,6 +39,7 @@ from .formatters import (
     get_market_url,
 )
 from .market_metadata import (
+    MarketExtrasPayload,
     _resolve_market_metadata,
     _update_event_metadata,
     _update_market_extras,
@@ -55,10 +56,6 @@ def _fetch_event_market_rows(
     event_ticker: str,
 ) -> list[dict[str, Any]]:
     """Fetch market rows for an event with pricing context."""
-    tick_cols = (
-        "t.ts, t.implied_yes_mid, t.price_dollars, t.yes_bid_dollars, "
-        "t.yes_ask_dollars, t.volume, t.raw"
-    )
     with timed_cursor(conn, row_factory=DICT_ROW) as cur:
         cur.execute(
             f"""
@@ -76,7 +73,7 @@ def _fetch_event_market_rows(
               p.confidence AS prediction_confidence,
               p.created_at AS prediction_ts
             FROM markets m
-            {last_tick_lateral_sql(tick_cols)}
+            {last_tick_lateral_sql()}
             {last_candle_lateral_sql()}
             {last_prediction_lateral_sql()}
             WHERE m.event_ticker = %s
@@ -431,10 +428,6 @@ def _fetch_market_detail_row(
     ticker: str,
 ) -> dict[str, Any] | None:
     """Fetch the raw market detail row."""
-    tick_columns = (
-        "t.ts, t.implied_yes_mid, t.price_dollars, t.yes_bid_dollars, "
-        "t.yes_ask_dollars, t.volume, t.open_interest"
-    )
     with timed_cursor(conn, row_factory=DICT_ROW) as cur:
         cur.execute(
             f"""
@@ -500,7 +493,7 @@ def _fetch_market_detail_row(
             FROM markets m
             JOIN events e ON e.event_ticker = m.event_ticker
             LEFT JOIN active_markets am ON am.ticker = m.ticker
-            {last_tick_lateral_sql(tick_columns)}
+            {last_tick_lateral_sql()}
             {last_candle_lateral_sql()}
             WHERE m.ticker = %s
             """,
@@ -614,6 +607,206 @@ def _market_extra_fields(row: dict[str, Any]) -> list[tuple[str, str]]:
     ]
 
 
+def _market_prediction_limit() -> int:
+    return _env_int("WEB_PORTAL_MARKET_PREDICTION_LIMIT", 10, minimum=0)
+
+
+def _market_candle_limit() -> int:
+    return _env_int("WEB_PORTAL_MARKET_CANDLE_LIMIT", 200, minimum=0)
+
+
+def _prediction_agent_label(agent: Any, model: Any) -> str:
+    agent_text = str(agent).strip() if agent is not None else ""
+    model_text = str(model).strip() if model is not None else ""
+    if agent_text and model_text:
+        return f"{agent_text} / {model_text}"
+    return agent_text or model_text or "Unknown"
+
+
+def _format_candle_ts(value: Any) -> Any:
+    if isinstance(value, datetime):
+        ts_value = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return ts_value.isoformat()
+    return value
+
+
+def _format_candle_num(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_candle_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_market_candles(
+    conn: PsycopgConnection,
+    market_ticker: str,
+    limit: int,
+) -> tuple[list[dict[str, Any]], int | None]:
+    if limit <= 0:
+        return [], None
+    with timed_cursor(conn, row_factory=DICT_ROW) as cur:
+        cur.execute(
+            "SELECT period_interval_minutes FROM market_candles_latest WHERE market_ticker = %s",
+            (market_ticker,),
+        )
+        interval_row = cur.fetchone()
+        interval = interval_row.get("period_interval_minutes") if interval_row else None
+        if not interval:
+            return [], None
+        cur.execute(
+            """
+            SELECT end_period_ts, open, high, low, close, volume
+            FROM market_candles
+            WHERE market_ticker = %s AND period_interval_minutes = %s
+            ORDER BY end_period_ts ASC
+            LIMIT %s
+            """,
+            (market_ticker, interval, limit),
+        )
+        rows = cur.fetchall()
+    candles = []
+    for row in rows or []:
+        candles.append(
+            {
+                "ts": _format_candle_ts(row.get("end_period_ts")),
+                "open": _format_candle_num(row.get("open")),
+                "high": _format_candle_num(row.get("high")),
+                "low": _format_candle_num(row.get("low")),
+                "close": _format_candle_num(row.get("close")),
+                "volume": _format_candle_int(row.get("volume")),
+            }
+        )
+    return candles, interval
+
+
+def _fetch_market_predictions(
+    conn: PsycopgConnection,
+    market_ticker: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    with timed_cursor(conn, row_factory=DICT_ROW) as cur:
+        cur.execute(
+            """
+            SELECT
+              p.created_at,
+              p.predicted_yes_prob,
+              p.confidence,
+              p.rationale,
+              pr.agent,
+              pr.model
+            FROM market_predictions p
+            LEFT JOIN prediction_runs pr ON pr.id = p.run_id
+            WHERE p.market_ticker = %s
+            ORDER BY p.created_at DESC, p.id DESC
+            LIMIT %s
+            """,
+            (market_ticker, limit),
+        )
+        rows = cur.fetchall()
+    predictions = []
+    for row in rows or []:
+        predictions.append(
+            {
+                "ts": fmt_ts(row.get("created_at")),
+                "yes_prob": fmt_percent(row.get("predicted_yes_prob")),
+                "confidence": fmt_percent(row.get("confidence")),
+                "agent": _prediction_agent_label(row.get("agent"), row.get("model")),
+                "rationale": row.get("rationale"),
+            }
+        )
+    return predictions
+
+
+def _should_persist_metadata(row: dict[str, Any], status_class: str) -> bool:
+    if row.get("active_status"):
+        return True
+    return status_class in {"open", "paused", "scheduled"}
+
+
+def _market_status_labels(row: dict[str, Any]) -> tuple[str, str]:
+    status_label = row.get("status_label") or "Unknown"
+    status_class = row.get("status_class") or "status-unknown"
+    return status_label, status_class
+
+
+def _apply_market_metadata(
+    conn: PsycopgConnection,
+    row: dict[str, Any],
+    market_ticker: str,
+    status_class: str,
+) -> None:
+    existing_payload = MarketExtrasPayload(
+        price_ranges=row.get("price_ranges"),
+        custom_strike=row.get("custom_strike"),
+        mve_selected_legs=row.get("mve_selected_legs"),
+    )
+    existing_product_metadata = row.get("product_metadata")
+    price_ranges, custom_strike, mve_selected_legs, product_metadata = (
+        _resolve_market_metadata(row, market_ticker)
+    )
+
+    row["price_ranges"] = price_ranges
+    row["custom_strike"] = custom_strike
+    row["mve_selected_legs"] = mve_selected_legs
+    row["product_metadata"] = product_metadata
+
+    if not _should_persist_metadata(row, status_class):
+        return
+
+    update_market_extras = _portal_func("_update_market_extras", _update_market_extras)
+    if any(value is not None for value in (price_ranges, custom_strike, mve_selected_legs)):
+        update_market_extras(
+            conn,
+            market_ticker,
+            MarketExtrasPayload(
+                price_ranges=price_ranges,
+                custom_strike=custom_strike,
+                mve_selected_legs=mve_selected_legs,
+            ),
+            existing=existing_payload,
+        )
+    if row.get("event_ticker"):
+        update_event_metadata = _portal_func("_update_event_metadata", _update_event_metadata)
+        update_event_metadata(
+            conn,
+            row.get("event_ticker"),
+            product_metadata,
+            existing_product_metadata=existing_product_metadata,
+        )
+
+
+def _load_market_series(
+    conn: PsycopgConnection,
+    market_ticker: str,
+) -> tuple[list[dict[str, Any]], int | None, list[dict[str, Any]], int]:
+    candle_limit = _market_candle_limit()
+    candles, candle_interval_minutes = _fetch_market_candles(
+        conn,
+        market_ticker,
+        candle_limit,
+    )
+    prediction_limit = _market_prediction_limit()
+    predictions = _fetch_market_predictions(
+        conn,
+        market_ticker,
+        prediction_limit,
+    )
+    return candles, candle_interval_minutes, predictions, prediction_limit
+
+
 def fetch_market_detail(
     conn: PsycopgConnection,
     ticker: str,
@@ -625,29 +818,18 @@ def fetch_market_detail(
         return None
 
     market_ticker = row.get("ticker") or ticker
-    price_ranges, custom_strike, mve_selected_legs, product_metadata = (
-        _resolve_market_metadata(row, market_ticker)
-    )
-
-    _update_market_extras(
-        conn,
-        market_ticker,
-        price_ranges=price_ranges,
-        custom_strike=custom_strike,
-        mve_selected_legs=mve_selected_legs,
-    )
-    _update_event_metadata(conn, row.get("event_ticker"), product_metadata)
-
-    row["price_ranges"] = price_ranges
-    row["custom_strike"] = custom_strike
-    row["mve_selected_legs"] = mve_selected_legs
-    row["product_metadata"] = product_metadata
+    status_label, status_class = _market_status_labels(row)
+    _apply_market_metadata(conn, row, market_ticker, status_class)
     now = datetime.now(timezone.utc)
     market_open_dt, market_close_dt, market_is_open = _market_window(
         row,
         now,
         open_key="open_time",
         close_key="close_time",
+    )
+    candles, candle_interval_minutes, predictions, prediction_limit = _load_market_series(
+        conn,
+        market_ticker,
     )
     return {
         **row,
@@ -665,6 +847,8 @@ def fetch_market_detail(
             row.get("series_ticker"),
             row.get("event_title"),
         ),
+        "status_label": status_label,
+        "status_class": status_class,
         "event_fields": _market_event_fields(row),
         "market_fields": _market_detail_fields(row),
         "stats_fields": _market_stats_fields(row),
@@ -678,11 +862,11 @@ def fetch_market_detail(
             row.get("settlement_value_dollars"),
         ),
         "snapshot_active": False,
-        "predictions": [],
-        "prediction_limit": 0,
-        "candles": [],
-        "candles_json": "[]",
-        "candle_interval_minutes": None,
+        "predictions": predictions,
+        "prediction_limit": prediction_limit,
+        "candles": candles,
+        "candles_json": json.dumps(candles, ensure_ascii=True),
+        "candle_interval_minutes": candle_interval_minutes,
         "market_open_ts": market_open_dt.isoformat() if market_open_dt else None,
         "market_close_ts": market_close_dt.isoformat() if market_close_dt else None,
         "candle_auto_refresh_seconds": _env_int(

@@ -15,25 +15,25 @@ from typing import Any, Callable, Iterable, Optional
 import psycopg  # pylint: disable=import-error
 from psycopg.rows import dict_row  # pylint: disable=import-error
 
-from src.db.db import (
+from ..db.db import (
     PredictionRunSpec,
     insert_market_predictions,
     insert_prediction_run,
     set_state,
     update_prediction_run,
 )
-from src.core.env_utils import parse_bool, parse_int
-from src.core.guardrails import assert_service_role
-from src.core.number_utils import normalize_probability
-from src.predictions.prediction_utils import baseline_market_prob
-from src.rag.rag_documents import fetch_rag_documents
-from src.db.sql_fragments import (
+from ..core.env_utils import parse_bool, parse_int
+from ..core.guardrails import assert_service_role
+from ..core.number_utils import normalize_probability
+from .prediction_utils import baseline_market_prob
+from ..rag.rag_documents import fetch_rag_documents
+from ..db.sql_fragments import (
     last_candle_lateral_sql,
     last_tick_lateral_sql,
     market_identity_columns_sql,
     tick_columns_sql,
 )
-from src.core.time_utils import ensure_utc, infer_strike_period_from_times
+from ..core.time_utils import ensure_utc, infer_strike_period_from_times
 
 logger = logging.getLogger(__name__)
 
